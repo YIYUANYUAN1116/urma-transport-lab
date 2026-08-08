@@ -15,6 +15,7 @@ struct urma_lab_runtime {
     uint32_t eid_index;
     uint32_t jfc_count;
     uint32_t segment_count;
+    uint32_t jetty_count;
 };
 
 struct urma_lab_jfc {
@@ -27,6 +28,19 @@ struct urma_lab_segment {
     urma_target_seg_t *segment;
     void *memory;
     uint64_t length;
+};
+
+struct urma_lab_jetty {
+    urma_lab_runtime_t *runtime;
+    urma_jetty_t *jetty;
+    urma_target_jetty_t *target;
+    int bound;
+};
+
+struct urma_lab_descriptor {
+    urma_rjetty_t *rjetty;
+    uint32_t length;
+    urma_lab_jetty_descriptor_meta_t meta;
 };
 
 static int urma_lab_pointer_error(int fallback)
@@ -295,6 +309,274 @@ int urma_lab_segment_delete(urma_lab_segment_t *segment)
     return 0;
 }
 
+int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
+                          urma_lab_jfc_t *send_jfc,
+                          urma_lab_jfc_t *recv_jfc,
+                          const urma_lab_jetty_config_t *config,
+                          urma_lab_jetty_t **out)
+{
+    urma_jfs_cfg_t jfs_cfg = {0};
+    urma_jfr_cfg_t jfr_cfg = {0};
+    urma_jetty_cfg_t jetty_cfg = {0};
+    urma_lab_jetty_t *jetty;
+
+    if (runtime == NULL || runtime->context == NULL || send_jfc == NULL ||
+        recv_jfc == NULL || config == NULL || out == NULL ||
+        send_jfc->runtime != runtime || recv_jfc->runtime != runtime ||
+        send_jfc->jfc == NULL || recv_jfc->jfc == NULL ||
+        config->send_depth == 0 || config->recv_depth == 0 ||
+        config->max_send_sge == 0 || config->max_send_sge > UINT8_MAX ||
+        config->max_recv_sge == 0 || config->max_recv_sge > UINT8_MAX) {
+        return -EINVAL;
+    }
+    *out = NULL;
+
+    jetty = calloc(1, sizeof(*jetty));
+    if (jetty == NULL) {
+        return -ENOMEM;
+    }
+
+    jfs_cfg.depth = config->send_depth;
+    jfs_cfg.trans_mode = URMA_TM_RC;
+    jfs_cfg.priority = URMA_MAX_PRIORITY;
+    jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
+    jfs_cfg.max_rsge = 1;
+    jfs_cfg.max_inline_data = 0;
+    jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+    jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
+    jfs_cfg.jfc = send_jfc->jfc;
+
+    jfr_cfg.depth = config->recv_depth;
+    jfr_cfg.flag.value = 0;
+    jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
+    jfr_cfg.trans_mode = URMA_TM_RC;
+    jfr_cfg.max_sge = (uint8_t)config->max_recv_sge;
+    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+    jfr_cfg.jfc = recv_jfc->jfc;
+    jfr_cfg.token_value.token = config->token;
+
+    jetty_cfg.flag.value = 0;
+    jetty_cfg.flag.bs.share_jfr = URMA_NO_SHARE_JFR;
+    jetty_cfg.jfs_cfg = jfs_cfg;
+    jetty_cfg.jfr_cfg = &jfr_cfg;
+
+    errno = 0;
+    jetty->jetty = urma_create_jetty(runtime->context, &jetty_cfg);
+    if (jetty->jetty == NULL) {
+        int error = urma_lab_pointer_error(-EIO);
+        free(jetty);
+        return error;
+    }
+
+    jetty->runtime = runtime;
+    runtime->jetty_count++;
+    *out = jetty;
+    return 0;
+}
+
+int urma_lab_jetty_mark_error(urma_lab_jetty_t *jetty)
+{
+    urma_jetty_attr_t attr = {0};
+
+    if (jetty == NULL || jetty->jetty == NULL) {
+        return -EINVAL;
+    }
+    attr.mask = JETTY_STATE;
+    attr.state = URMA_JETTY_STATE_ERROR;
+    return (int)urma_modify_jetty(jetty->jetty, &attr);
+}
+
+int urma_lab_jetty_export_descriptor(urma_lab_jetty_t *jetty,
+                                     urma_lab_descriptor_t **out)
+{
+    urma_lab_descriptor_t *descriptor;
+    urma_status_t status;
+
+    if (jetty == NULL || jetty->jetty == NULL || out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    descriptor = calloc(1, sizeof(*descriptor));
+    if (descriptor == NULL) {
+        return -ENOMEM;
+    }
+
+    /*
+     * TODO(M2-verify): validate get_rjetty for non-shared JFR on the target
+     * provider. The baseline API is used as designed; Rust never reads it.
+     */
+    status = urma_get_rjetty(jetty->jetty, &descriptor->rjetty,
+                             &descriptor->length);
+    if (status != URMA_SUCCESS) {
+        free(descriptor);
+        return (int)status;
+    }
+    if (descriptor->rjetty == NULL || descriptor->length < sizeof(urma_rjetty_t)) {
+        urma_put_rjetty(descriptor->rjetty);
+        free(descriptor);
+        return -EPROTO;
+    }
+
+    descriptor->meta.transport_type = (uint32_t)jetty->runtime->device->type;
+    descriptor->meta.eid_index = jetty->runtime->eid_index;
+    descriptor->meta.jetty_id = descriptor->rjetty->jetty_id.id;
+    descriptor->meta.opaque_len = descriptor->length;
+    *out = descriptor;
+    return 0;
+}
+
+int urma_lab_descriptor_get_meta(const urma_lab_descriptor_t *descriptor,
+                                 urma_lab_jetty_descriptor_meta_t *out)
+{
+    if (descriptor == NULL || descriptor->rjetty == NULL || out == NULL) {
+        return -EINVAL;
+    }
+    *out = descriptor->meta;
+    return 0;
+}
+
+int urma_lab_descriptor_copy(const urma_lab_descriptor_t *descriptor,
+                             uint8_t *out, uint32_t capacity)
+{
+    if (descriptor == NULL || descriptor->rjetty == NULL || out == NULL) {
+        return -EINVAL;
+    }
+    if (capacity < descriptor->length) {
+        return -ENOSPC;
+    }
+    (void)memcpy(out, descriptor->rjetty, descriptor->length);
+    return 0;
+}
+
+void urma_lab_descriptor_free(urma_lab_descriptor_t *descriptor)
+{
+    if (descriptor == NULL) {
+        return;
+    }
+    urma_put_rjetty(descriptor->rjetty);
+    descriptor->rjetty = NULL;
+    free(descriptor);
+}
+
+int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
+                          const urma_lab_jetty_descriptor_meta_t *meta,
+                          const uint8_t *opaque_data, uint32_t opaque_len,
+                          uint32_t token)
+{
+    urma_rjetty_t *rjetty;
+    urma_token_t token_value = {0};
+
+    if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL ||
+        meta == NULL || opaque_data == NULL || opaque_len == 0 ||
+        opaque_len != meta->opaque_len || opaque_len < sizeof(urma_rjetty_t) ||
+        jetty->target != NULL ||
+        meta->transport_type != (uint32_t)jetty->runtime->device->type) {
+        return -EINVAL;
+    }
+
+    rjetty = malloc(opaque_len);
+    if (rjetty == NULL) {
+        return -ENOMEM;
+    }
+    (void)memcpy(rjetty, opaque_data, opaque_len);
+    if (rjetty->jetty_id.id != meta->jetty_id ||
+        rjetty->trans_mode != URMA_TM_RC || rjetty->type != URMA_JETTY) {
+        free(rjetty);
+        return -EPROTO;
+    }
+
+    token_value.token = token;
+    errno = 0;
+    jetty->target = urma_import_jetty(jetty->runtime->context, rjetty,
+                                      &token_value);
+    free(rjetty);
+    if (jetty->target == NULL) {
+        return urma_lab_pointer_error(-EIO);
+    }
+    return 0;
+}
+
+int urma_lab_jetty_bind(urma_lab_jetty_t *jetty)
+{
+    urma_status_t status;
+
+    if (jetty == NULL || jetty->jetty == NULL || jetty->target == NULL) {
+        return -EINVAL;
+    }
+    if (jetty->bound != 0) {
+        return 0;
+    }
+    status = urma_bind_jetty(jetty->jetty, jetty->target);
+    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+        return (int)status;
+    }
+    jetty->bound = 1;
+    return 0;
+}
+
+int urma_lab_jetty_unbind(urma_lab_jetty_t *jetty)
+{
+    urma_status_t status;
+
+    if (jetty == NULL || jetty->jetty == NULL) {
+        return -EINVAL;
+    }
+    if (jetty->bound == 0) {
+        return 0;
+    }
+    status = urma_unbind_jetty(jetty->jetty);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    jetty->bound = 0;
+    return 0;
+}
+
+int urma_lab_jetty_unimport(urma_lab_jetty_t *jetty)
+{
+    urma_status_t status;
+
+    if (jetty == NULL || jetty->jetty == NULL) {
+        return -EINVAL;
+    }
+    if (jetty->bound != 0) {
+        return -EBUSY;
+    }
+    if (jetty->target == NULL) {
+        return 0;
+    }
+    status = urma_unimport_jetty(jetty->target);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    jetty->target = NULL;
+    return 0;
+}
+
+int urma_lab_jetty_delete(urma_lab_jetty_t *jetty)
+{
+    urma_status_t status;
+    urma_lab_runtime_t *runtime;
+
+    if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL) {
+        return -EINVAL;
+    }
+    if (jetty->bound != 0 || jetty->target != NULL) {
+        return -EBUSY;
+    }
+    runtime = jetty->runtime;
+    status = urma_delete_jetty(jetty->jetty);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    if (runtime->jetty_count > 0) {
+        runtime->jetty_count--;
+    }
+    jetty->jetty = NULL;
+    free(jetty);
+    return 0;
+}
+
 int urma_lab_runtime_close(urma_lab_runtime_t *runtime)
 {
     int first_error = 0;
@@ -303,7 +585,8 @@ int urma_lab_runtime_close(urma_lab_runtime_t *runtime)
     if (runtime == NULL) {
         return -EINVAL;
     }
-    if (runtime->segment_count != 0 || runtime->jfc_count != 0) {
+    if (runtime->jetty_count != 0 || runtime->segment_count != 0 ||
+        runtime->jfc_count != 0) {
         return -EBUSY;
     }
 

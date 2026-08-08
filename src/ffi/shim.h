@@ -10,8 +10,10 @@ extern "C" {
 typedef struct urma_lab_runtime urma_lab_runtime_t;
 typedef struct urma_lab_jfc urma_lab_jfc_t;
 typedef struct urma_lab_segment urma_lab_segment_t;
+typedef struct urma_lab_jetty urma_lab_jetty_t;
+typedef struct urma_lab_descriptor urma_lab_descriptor_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 2U
+#define URMA_LAB_SHIM_ABI_VERSION 3U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
@@ -61,6 +63,21 @@ typedef struct urma_lab_device_capability {
     uint64_t page_size_cap;
 } urma_lab_device_capability_t;
 
+typedef struct urma_lab_jetty_config {
+    uint32_t send_depth;
+    uint32_t recv_depth;
+    uint32_t max_send_sge;
+    uint32_t max_recv_sge;
+    uint32_t token;
+} urma_lab_jetty_config_t;
+
+typedef struct urma_lab_jetty_descriptor_meta {
+    uint32_t transport_type;
+    uint32_t eid_index;
+    uint32_t jetty_id;
+    uint32_t opaque_len;
+} urma_lab_jetty_descriptor_meta_t;
+
 /*
  * Opens the smallest process-global chain: urma_init -> device -> context.
  * `device_name` must be NUL terminated and `out` must be a valid writable pointer.
@@ -85,6 +102,33 @@ int urma_lab_segment_create(urma_lab_runtime_t *runtime, uint64_t length,
 
 /* Unregisters the Segment before releasing its backing allocation. */
 int urma_lab_segment_delete(urma_lab_segment_t *segment);
+
+/* Creates one RC duplex Jetty with an embedded, non-shared JFR. */
+int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
+                          urma_lab_jfc_t *send_jfc,
+                          urma_lab_jfc_t *recv_jfc,
+                          const urma_lab_jetty_config_t *config,
+                          urma_lab_jetty_t **out);
+
+/* Optional M2/M3 shutdown transition; no CQ drain is performed here. */
+int urma_lab_jetty_mark_error(urma_lab_jetty_t *jetty);
+
+int urma_lab_jetty_export_descriptor(urma_lab_jetty_t *jetty,
+                                     urma_lab_descriptor_t **out);
+int urma_lab_descriptor_get_meta(const urma_lab_descriptor_t *descriptor,
+                                 urma_lab_jetty_descriptor_meta_t *out);
+int urma_lab_descriptor_copy(const urma_lab_descriptor_t *descriptor,
+                             uint8_t *out, uint32_t capacity);
+void urma_lab_descriptor_free(urma_lab_descriptor_t *descriptor);
+
+int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
+                          const urma_lab_jetty_descriptor_meta_t *meta,
+                          const uint8_t *opaque_data, uint32_t opaque_len,
+                          uint32_t token);
+int urma_lab_jetty_bind(urma_lab_jetty_t *jetty);
+int urma_lab_jetty_unbind(urma_lab_jetty_t *jetty);
+int urma_lab_jetty_unimport(urma_lab_jetty_t *jetty);
+int urma_lab_jetty_delete(urma_lab_jetty_t *jetty);
 
 /*
  * Destroys context before urma_uninit and frees the wrapper. The pointer must be

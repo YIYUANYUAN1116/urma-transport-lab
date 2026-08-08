@@ -22,7 +22,9 @@ impl Default for BufferPoolConfig {
 impl BufferPoolConfig {
     pub fn total_len(&self) -> Result<usize> {
         if self.slot_size == 0 {
-            return Err(Error::InvalidConfiguration("slot_size must be non-zero".into()));
+            return Err(Error::InvalidConfiguration(
+                "slot_size must be non-zero".into(),
+            ));
         }
         if self.tx_slot_count == 0 || self.rx_slot_count == 0 {
             return Err(Error::InvalidConfiguration(
@@ -84,17 +86,12 @@ mod native {
     }
 
     impl UrmaRegisteredSegment {
-        fn create(
-            runtime: &mut ffi::NativeRuntime,
-            len: usize,
-            alignment: usize,
-        ) -> Result<Self> {
+        fn create(runtime: &mut ffi::NativeRuntime, len: usize, alignment: usize) -> Result<Self> {
             let length = u64::try_from(len).map_err(|_| {
                 Error::InvalidConfiguration("registered length does not fit u64".into())
             })?;
-            let alignment = u64::try_from(alignment).map_err(|_| {
-                Error::InvalidConfiguration("alignment does not fit u64".into())
-            })?;
+            let alignment = u64::try_from(alignment)
+                .map_err(|_| Error::InvalidConfiguration("alignment does not fit u64".into()))?;
             let handle = ffi::SegmentHandle::create(runtime, length, alignment)
                 .map_err(|error| map_ffi_error("register_segment", error))?;
             Ok(Self {
@@ -125,11 +122,7 @@ mod native {
             config: BufferPoolConfig,
         ) -> Result<Self> {
             let total_len = config.total_len()?;
-            let segment = UrmaRegisteredSegment::create(
-                runtime,
-                total_len,
-                config.alignment,
-            )?;
+            let segment = UrmaRegisteredSegment::create(runtime, total_len, config.alignment)?;
             let mut slots = Vec::with_capacity(config.tx_slot_count + config.rx_slot_count);
             for index in 0..config.tx_slot_count {
                 slots.push(BufferSlot {

@@ -54,6 +54,21 @@ pub(crate) struct DeviceCapability {
     pub page_size_cap: u64,
 }
 
+pub(crate) struct JettyConfig {
+    pub send_depth: u32,
+    pub recv_depth: u32,
+    pub max_send_sge: u32,
+    pub max_recv_sge: u32,
+    pub token: u32,
+}
+
+pub(crate) struct JettyDescriptorData {
+    pub transport_type: u32,
+    pub eid_index: u32,
+    pub jetty_id: u32,
+    pub opaque_data: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FfiError {
     Contract(&'static str),
@@ -96,9 +111,8 @@ impl NativeRuntime {
         let mut raw = std::ptr::null_mut();
         // SAFETY: `device_name` is NUL terminated and valid for the call; `raw`
         // is writable and the returned pointer is checked before ownership.
-        let status = unsafe {
-            sys::urma_lab_runtime_open(device_name.as_ptr(), eid_index, &mut raw)
-        };
+        let status =
+            unsafe { sys::urma_lab_runtime_open(device_name.as_ptr(), eid_index, &mut raw) };
         if status != 0 {
             return Err(FfiError::Status(status));
         }
@@ -128,9 +142,8 @@ impl NativeRuntime {
         let mut raw = std::mem::MaybeUninit::<sys::urma_lab_device_capability_t>::uninit();
         // SAFETY: Both pointers are valid for the duration of the call and the
         // shim initializes the complete pointer-free DTO on success.
-        let status = unsafe {
-            sys::urma_lab_runtime_query_device(raw_runtime.as_ptr(), raw.as_mut_ptr())
-        };
+        let status =
+            unsafe { sys::urma_lab_runtime_query_device(raw_runtime.as_ptr(), raw.as_mut_ptr()) };
         if status != 0 {
             return Err(FfiError::Status(status));
         }
@@ -195,9 +208,7 @@ pub(crate) struct JfcHandle {
 
 impl JfcHandle {
     pub(crate) fn create(runtime: &mut NativeRuntime, depth: u32) -> Result<Self, FfiError> {
-        let raw_runtime = runtime
-            .raw
-            .ok_or(FfiError::Contract("runtime is closed"))?;
+        let raw_runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: The runtime pointer is live and `raw` is a valid out pointer.
         let status = unsafe { sys::urma_lab_jfc_create(raw_runtime.as_ptr(), depth, &mut raw) };
@@ -242,9 +253,7 @@ impl SegmentHandle {
         length: u64,
         alignment: u64,
     ) -> Result<Self, FfiError> {
-        let raw_runtime = runtime
-            .raw
-            .ok_or(FfiError::Contract("runtime is closed"))?;
+        let raw_runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
         let mut raw = std::ptr::null_mut();
         // SAFETY: The runtime pointer is live and `raw` is a valid out pointer.
         let status = unsafe {
@@ -277,5 +286,185 @@ impl SegmentHandle {
 impl Drop for SegmentHandle {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+pub(crate) struct JettyHandle {
+    raw: Option<NonNull<sys::urma_lab_jetty_t>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl JettyHandle {
+    pub(crate) fn create(
+        runtime: &mut NativeRuntime,
+        send_jfc: &JfcHandle,
+        recv_jfc: &JfcHandle,
+        config: &JettyConfig,
+    ) -> Result<Self, FfiError> {
+        let runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
+        let send_jfc = send_jfc
+            .raw
+            .ok_or(FfiError::Contract("send JFC is closed"))?;
+        let recv_jfc = recv_jfc
+            .raw
+            .ok_or(FfiError::Contract("recv JFC is closed"))?;
+        let raw_config = sys::urma_lab_jetty_config_t {
+            send_depth: config.send_depth,
+            recv_depth: config.recv_depth,
+            max_send_sge: config.max_send_sge,
+            max_recv_sge: config.max_recv_sge,
+            token: config.token,
+        };
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: All three owners are live and `raw` is a valid out pointer.
+        let status = unsafe {
+            sys::urma_lab_jetty_create(
+                runtime.as_ptr(),
+                send_jfc.as_ptr(),
+                recv_jfc.as_ptr(),
+                &raw_config,
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        let raw = NonNull::new(raw).ok_or(FfiError::NullHandle)?;
+        Ok(Self {
+            raw: Some(raw),
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    pub(crate) fn export_descriptor(&self) -> Result<JettyDescriptorData, FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: Jetty is live and descriptor is a valid out pointer.
+        let status =
+            unsafe { sys::urma_lab_jetty_export_descriptor(jetty.as_ptr(), &mut descriptor) };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        let descriptor = NonNull::new(descriptor).ok_or(FfiError::NullHandle)?;
+        let result = copy_descriptor(descriptor);
+        // SAFETY: descriptor is the unique allocation returned above.
+        unsafe { sys::urma_lab_descriptor_free(descriptor.as_ptr()) };
+        result
+    }
+
+    pub(crate) fn import(
+        &mut self,
+        descriptor: &JettyDescriptorData,
+        token: u32,
+    ) -> Result<(), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let opaque_len = u32::try_from(descriptor.opaque_data.len())
+            .map_err(|_| FfiError::Contract("descriptor length exceeds u32"))?;
+        let meta = sys::urma_lab_jetty_descriptor_meta_t {
+            transport_type: descriptor.transport_type,
+            eid_index: descriptor.eid_index,
+            jetty_id: descriptor.jetty_id,
+            opaque_len,
+        };
+        // SAFETY: Descriptor bytes are validated by the safe wire layer and
+        // remain live for the synchronous shim import call.
+        let status = unsafe {
+            sys::urma_lab_jetty_import(
+                jetty.as_ptr(),
+                &meta,
+                descriptor.opaque_data.as_ptr(),
+                opaque_len,
+                token,
+            )
+        };
+        status_result(status)
+    }
+
+    pub(crate) fn bind(&mut self) -> Result<(), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        // SAFETY: Jetty and its imported target are owned by this handle.
+        status_result(unsafe { sys::urma_lab_jetty_bind(jetty.as_ptr()) })
+    }
+
+    pub(crate) fn unbind(&mut self) -> Result<(), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        // SAFETY: Jetty is uniquely owned by this handle.
+        status_result(unsafe { sys::urma_lab_jetty_unbind(jetty.as_ptr()) })
+    }
+
+    pub(crate) fn unimport(&mut self) -> Result<(), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        // SAFETY: The imported target, if any, is uniquely owned by the shim.
+        status_result(unsafe { sys::urma_lab_jetty_unimport(jetty.as_ptr()) })
+    }
+
+    pub(crate) fn mark_error(&mut self) -> Result<(), FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        // SAFETY: Jetty is uniquely owned by this handle.
+        status_result(unsafe { sys::urma_lab_jetty_mark_error(jetty.as_ptr()) })
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), FfiError> {
+        let Some(jetty) = self.raw.take() else {
+            return Ok(());
+        };
+        // SAFETY: This consumes the unique local Jetty wrapper.
+        status_result(unsafe { sys::urma_lab_jetty_delete(jetty.as_ptr()) })
+    }
+}
+
+impl Drop for JettyHandle {
+    fn drop(&mut self) {
+        let _ = self.unbind();
+        let _ = self.unimport();
+        let _ = self.close();
+    }
+}
+
+fn copy_descriptor(
+    descriptor: NonNull<sys::urma_lab_descriptor_t>,
+) -> Result<JettyDescriptorData, FfiError> {
+    let mut meta = std::mem::MaybeUninit::<sys::urma_lab_jetty_descriptor_meta_t>::uninit();
+    // SAFETY: Both pointers are live for this call.
+    let status =
+        unsafe { sys::urma_lab_descriptor_get_meta(descriptor.as_ptr(), meta.as_mut_ptr()) };
+    if status != 0 {
+        return Err(FfiError::Status(status));
+    }
+    // SAFETY: A zero status initializes the complete integer-only DTO.
+    let meta = unsafe { meta.assume_init() };
+    let length = usize::try_from(meta.opaque_len)
+        .map_err(|_| FfiError::Contract("descriptor length does not fit usize"))?;
+    const MAX_NATIVE_DESCRIPTOR_LEN: usize = 64 * 1024;
+    if length == 0 || length > MAX_NATIVE_DESCRIPTOR_LEN {
+        return Err(FfiError::Contract(
+            "native descriptor length is zero or exceeds the M2 limit",
+        ));
+    }
+    let mut opaque_data = vec![0u8; length];
+    // SAFETY: The vector has exactly the capacity reported by the descriptor.
+    let status = unsafe {
+        sys::urma_lab_descriptor_copy(
+            descriptor.as_ptr(),
+            opaque_data.as_mut_ptr(),
+            meta.opaque_len,
+        )
+    };
+    if status != 0 {
+        return Err(FfiError::Status(status));
+    }
+    Ok(JettyDescriptorData {
+        transport_type: meta.transport_type,
+        eid_index: meta.eid_index,
+        jetty_id: meta.jetty_id,
+        opaque_data,
+    })
+}
+
+fn status_result(status: c_int) -> Result<(), FfiError> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(FfiError::Status(status))
     }
 }

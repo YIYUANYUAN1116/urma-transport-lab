@@ -17,11 +17,7 @@ fn main() {
     for name in TRACKED_ENV {
         println!("cargo:rerun-if-env-changed={name}");
     }
-    for source in [
-        "src/ffi/wrapper.h",
-        "src/ffi/shim.h",
-        "src/ffi/shim.c",
-    ] {
+    for source in ["src/ffi/wrapper.h", "src/ffi/shim.h", "src/ffi/shim.c"] {
         println!("cargo:rerun-if-changed={source}");
     }
 
@@ -56,19 +52,19 @@ fn build_urma() {
     }
 
     // Bindgen parses the installed public header through wrapper.h. Only the
-    // verified M0 liburma calls and the stable lab shim are emitted.
+    // verified Phase 0 liburma calls and the stable lab shim are emitted.
     let mut bindings = bindgen::Builder::default()
         .header("src/ffi/wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
         .allowlist_function(
-            "^urma_(init|uninit|get_device_by_name|create_context|delete_context|query_device|create_jfc|delete_jfc|register_seg|unregister_seg)$",
+            "^urma_(init|uninit|get_device_by_name|create_context|delete_context|query_device|create_jfc|delete_jfc|register_seg|unregister_seg|create_jetty|modify_jetty|delete_jetty|get_rjetty|put_rjetty|import_jetty|unimport_jetty|bind_jetty|unbind_jetty)$",
         )
         .allowlist_function("^urma_lab_.*")
         .allowlist_type(
-            "^urma_(init_attr|device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg|lab_.*)(_t)?$",
+            "^urma_(init_attr|device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg|jetty|jetty_cfg|jetty_attr|rjetty|target_jetty|lab_.*)(_t)?$",
         )
         .allowlist_var("^URMA_(SUCCESS|LAB_.*)$")
-        .opaque_type("^urma_(device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg)$")
+        .opaque_type("^urma_(device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg|jetty|jetty_cfg|jetty_attr|rjetty|target_jetty)$")
         .derive_debug(false)
         .derive_default(false)
         .layout_tests(true)
@@ -120,9 +116,7 @@ fn find_include_dir() -> PathBuf {
         PathBuf::from("/usr/local/include/ub/umdk/urma"),
     ];
     find_file_parent(&candidates, "urma_api.h").unwrap_or_else(|| {
-        panic!(
-            "cannot find urma_api.h; install UMDK development headers or set UMDK_INCLUDE_DIR"
-        )
+        panic!("cannot find urma_api.h; install UMDK development headers or set UMDK_INCLUDE_DIR")
     })
 }
 
@@ -130,13 +124,14 @@ fn find_include_dir() -> PathBuf {
 fn find_lib_dir() -> PathBuf {
     if let Some(configured) = env::var_os("UMDK_LIB_DIR") {
         let configured = PathBuf::from(configured);
-        return find_file_parent(std::slice::from_ref(&configured), "liburma.so")
-            .unwrap_or_else(|| {
+        return find_file_parent(std::slice::from_ref(&configured), "liburma.so").unwrap_or_else(
+            || {
                 panic!(
                     "UMDK_LIB_DIR={} does not contain the linker input liburma.so",
                     configured.display()
                 )
-            });
+            },
+        );
     }
 
     let arch = required_env("CARGO_CFG_TARGET_ARCH");

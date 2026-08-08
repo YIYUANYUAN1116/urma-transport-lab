@@ -40,6 +40,10 @@ impl UrmaJfc {
         self.depth
     }
 
+    pub(crate) fn handle(&self) -> &ffi::JfcHandle {
+        &self.handle
+    }
+
     pub(crate) fn close(&mut self) -> Result<()> {
         let operation = match self.kind {
             JfcKind::Send => "delete_send_jfc",

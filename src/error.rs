@@ -7,6 +7,11 @@ pub enum Error {
     FeatureDisabled,
     AlreadyInitialized,
     InvalidConfiguration(String),
+    Protocol(String),
+    Io {
+        operation: &'static str,
+        message: String,
+    },
     InvalidDeviceName,
     FfiContract {
         operation: &'static str,
@@ -19,8 +24,13 @@ pub enum Error {
     Shutdown {
         failures: Vec<String>,
     },
-    NullHandle { operation: &'static str },
-    Native { operation: &'static str, status: i32 },
+    NullHandle {
+        operation: &'static str,
+    },
+    Native {
+        operation: &'static str,
+        status: i32,
+    },
 }
 
 impl fmt::Display for Error {
@@ -31,6 +41,10 @@ impl fmt::Display for Error {
                 write!(f, "an URMA runtime already owns process-global liburma")
             }
             Self::InvalidConfiguration(detail) => write!(f, "invalid configuration: {detail}"),
+            Self::Protocol(detail) => write!(f, "protocol error: {detail}"),
+            Self::Io { operation, message } => {
+                write!(f, "I/O operation {operation} failed: {message}")
+            }
             Self::InvalidDeviceName => write!(f, "device name contains an interior NUL byte"),
             Self::FfiContract { operation, detail } => {
                 write!(f, "FFI contract violation during {operation}: {detail}")
@@ -53,7 +67,10 @@ impl fmt::Display for Error {
                 )
             }
             Self::Native { operation, status } => {
-                write!(f, "liburma operation {operation} failed with status {status}")
+                write!(
+                    f,
+                    "liburma operation {operation} failed with status {status}"
+                )
             }
         }
     }

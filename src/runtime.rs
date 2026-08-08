@@ -75,9 +75,11 @@ mod native {
     use super::*;
     use crate::{
         buffer::UrmaBufferPool,
+        connection::UrmaConnection,
         ffi,
+        jetty::UrmaJetty,
         jfc::{JfcKind, UrmaJfc},
-        SlotId, SlotKind, SlotState,
+        JettyConfig, SlotId, SlotKind, SlotState,
     };
     use std::{
         ffi::CString,
@@ -141,8 +143,8 @@ mod native {
         }
 
         fn start_inner(config: RuntimeConfig) -> Result<Self> {
-            let device = CString::new(config.device_name.as_str())
-                .map_err(|_| Error::InvalidDeviceName)?;
+            let device =
+                CString::new(config.device_name.as_str()).map_err(|_| Error::InvalidDeviceName)?;
             let mut native = ffi::NativeRuntime::open(&device, config.eid_index)
                 .map_err(|error| map_ffi_error("runtime_open", error))?;
 
@@ -157,33 +159,28 @@ mod native {
                 return Err(rollback_startup(primary, None, None, None, Some(native)));
             }
 
-            let send_jfc = match UrmaJfc::create(
-                &mut native,
-                JfcKind::Send,
-                config.send_jfc_depth,
-            ) {
+            let send_jfc = match UrmaJfc::create(&mut native, JfcKind::Send, config.send_jfc_depth)
+            {
                 Ok(jfc) => jfc,
                 Err(primary) => {
                     return Err(rollback_startup(primary, None, None, None, Some(native)));
                 }
             };
-            let recv_jfc = match UrmaJfc::create(
-                &mut native,
-                JfcKind::Receive,
-                config.recv_jfc_depth,
-            ) {
-                Ok(jfc) => jfc,
-                Err(primary) => {
-                    return Err(rollback_startup(
-                        primary,
-                        None,
-                        None,
-                        Some(send_jfc),
-                        Some(native),
-                    ));
-                }
-            };
-            let buffer_pool = match UrmaBufferPool::create(&mut native, config.buffer_pool.clone()) {
+            let recv_jfc =
+                match UrmaJfc::create(&mut native, JfcKind::Receive, config.recv_jfc_depth) {
+                    Ok(jfc) => jfc,
+                    Err(primary) => {
+                        return Err(rollback_startup(
+                            primary,
+                            None,
+                            None,
+                            Some(send_jfc),
+                            Some(native),
+                        ));
+                    }
+                };
+            let buffer_pool = match UrmaBufferPool::create(&mut native, config.buffer_pool.clone())
+            {
                 Ok(pool) => pool,
                 Err(primary) => {
                     return Err(rollback_startup(
@@ -250,6 +247,30 @@ mod native {
             self.buffer_pool.as_ref()?.slot_state(id)
         }
 
+        pub fn create_connection(&mut self, config: JettyConfig) -> Result<UrmaConnection<'_>> {
+            if !self.accepting {
+                return Err(Error::InvalidConfiguration(
+                    "runtime is no longer accepting operations".into(),
+                ));
+            }
+            validate_jetty_config(&config, &self.capability)?;
+            let capability = self.capability.clone();
+            let native = self
+                .native
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("runtime is closed".into()))?;
+            let send_jfc = self
+                .send_jfc
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("send JFC is closed".into()))?;
+            let recv_jfc = self
+                .recv_jfc
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
+            let jetty = UrmaJetty::create(native, send_jfc.handle(), recv_jfc.handle(), &config)?;
+            Ok(UrmaConnection::new(capability, jetty))
+        }
+
         pub fn shutdown(mut self) -> Result<()> {
             self.shutdown_inner()
         }
@@ -268,12 +289,6 @@ mod native {
             self.accepting = false;
             let mut failures = Vec::new();
 
-            if let Some(mut pool) = self.buffer_pool.take() {
-                pool.stop();
-                if let Err(error) = pool.close() {
-                    failures.push(error.to_string());
-                }
-            }
             if let Some(mut recv_jfc) = self.recv_jfc.take() {
                 if let Err(error) = recv_jfc.close() {
                     failures.push(error.to_string());
@@ -281,6 +296,12 @@ mod native {
             }
             if let Some(mut send_jfc) = self.send_jfc.take() {
                 if let Err(error) = send_jfc.close() {
+                    failures.push(error.to_string());
+                }
+            }
+            if let Some(mut pool) = self.buffer_pool.take() {
+                pool.stop();
+                if let Err(error) = pool.close() {
                     failures.push(error.to_string());
                 }
             }
@@ -337,6 +358,37 @@ mod native {
         }
         // TODO(M1-verify): decode page_size_cap for the target provider before
         // enforcing that the configured alignment is advertised.
+        Ok(())
+    }
+
+    fn validate_jetty_config(
+        config: &JettyConfig,
+        capability: &UrmaDeviceCapability,
+    ) -> Result<()> {
+        if capability.max_jetty == 0 || capability.max_jfs == 0 || capability.max_jfr == 0 {
+            return Err(Error::InvalidConfiguration(
+                "device does not advertise the resources required by a duplex Jetty".into(),
+            ));
+        }
+        for (name, value, maximum) in [
+            ("send_depth", config.send_depth, capability.max_jfs_depth),
+            ("recv_depth", config.recv_depth, capability.max_jfr_depth),
+            ("max_send_sge", config.max_send_sge, capability.max_jfs_sge),
+            ("max_recv_sge", config.max_recv_sge, capability.max_jfr_sge),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(Error::InvalidConfiguration(format!(
+                    "Jetty {name}={value} is outside 1..={maximum}"
+                )));
+            }
+        }
+        if capability.max_jfs_rsge == 0 {
+            return Err(Error::InvalidConfiguration(
+                "device does not advertise an RC remote-SGE capability".into(),
+            ));
+        }
+        // TODO(M2-verify): confirm the transport_modes RC bit interpretation
+        // against the target provider before enforcing it here.
         Ok(())
     }
 
@@ -475,7 +527,7 @@ mod tests {
     #[test]
     fn abi_baseline_matches_verified_m0_contract() {
         let baseline = abi_baseline().expect("C shim must return its ABI baseline");
-        assert_eq!(baseline.shim_abi_version, 2);
+        assert_eq!(baseline.shim_abi_version, 3);
         assert_eq!(baseline.pointer_size as usize, std::mem::size_of::<usize>());
         assert_eq!(baseline.status_size as usize, std::mem::size_of::<i32>());
         assert_eq!(baseline.success_value, 0);
@@ -484,5 +536,4 @@ mod tests {
         assert!(baseline.device_size > 0);
         assert!(baseline.context_size > 0);
     }
-
 }
