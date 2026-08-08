@@ -16,6 +16,7 @@ struct urma_lab_runtime {
     uint32_t jfc_count;
     uint32_t segment_count;
     uint32_t jetty_count;
+    uint32_t outstanding_wr_count;
 };
 
 struct urma_lab_jfc {
@@ -28,6 +29,7 @@ struct urma_lab_segment {
     urma_target_seg_t *segment;
     void *memory;
     uint64_t length;
+    uint32_t outstanding_wr_count;
 };
 
 struct urma_lab_jetty {
@@ -35,6 +37,16 @@ struct urma_lab_jetty {
     urma_jetty_t *jetty;
     urma_target_jetty_t *target;
     int bound;
+    uint32_t outstanding_wr_count;
+};
+
+struct urma_lab_wr {
+    urma_lab_runtime_t *runtime;
+    urma_lab_segment_t *segment;
+    urma_lab_jetty_t *jetty;
+    urma_sge_t sge;
+    urma_jfs_wr_t send_wr;
+    urma_jfr_wr_t recv_wr;
 };
 
 struct urma_lab_descriptor {
@@ -221,6 +233,9 @@ int urma_lab_jfc_delete(urma_lab_jfc_t *jfc)
         return -EINVAL;
     }
     runtime = jfc->runtime;
+    if (runtime->outstanding_wr_count != 0) {
+        return -EBUSY;
+    }
     status = urma_delete_jfc(jfc->jfc);
     if (status != URMA_SUCCESS) {
         return (int)status;
@@ -293,6 +308,9 @@ int urma_lab_segment_delete(urma_lab_segment_t *segment)
     if (segment == NULL || segment->segment == NULL || segment->runtime == NULL) {
         return -EINVAL;
     }
+    if (segment->outstanding_wr_count != 0) {
+        return -EBUSY;
+    }
     runtime = segment->runtime;
     status = urma_unregister_seg(segment->segment);
     if (status != URMA_SUCCESS) {
@@ -306,6 +324,37 @@ int urma_lab_segment_delete(urma_lab_segment_t *segment)
     free(segment->memory);
     segment->memory = NULL;
     free(segment);
+    return 0;
+}
+
+static int urma_lab_segment_range(const urma_lab_segment_t *segment,
+                                  uint64_t offset, uint32_t length)
+{
+    if (segment == NULL || segment->segment == NULL || segment->memory == NULL ||
+        length == 0 || offset > segment->length ||
+        (uint64_t)length > segment->length - offset) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+int urma_lab_segment_write(urma_lab_segment_t *segment, uint64_t offset,
+                           const uint8_t *data, uint32_t length)
+{
+    if (data == NULL || urma_lab_segment_range(segment, offset, length) != 0) {
+        return -EINVAL;
+    }
+    (void)memcpy((uint8_t *)segment->memory + offset, data, length);
+    return 0;
+}
+
+int urma_lab_segment_read(const urma_lab_segment_t *segment, uint64_t offset,
+                          uint8_t *out, uint32_t length)
+{
+    if (out == NULL || urma_lab_segment_range(segment, offset, length) != 0) {
+        return -EINVAL;
+    }
+    (void)memcpy(out, (const uint8_t *)segment->memory + offset, length);
     return 0;
 }
 
@@ -521,6 +570,9 @@ int urma_lab_jetty_unbind(urma_lab_jetty_t *jetty)
     if (jetty == NULL || jetty->jetty == NULL) {
         return -EINVAL;
     }
+    if (jetty->outstanding_wr_count != 0) {
+        return -EBUSY;
+    }
     if (jetty->bound == 0) {
         return 0;
     }
@@ -561,7 +613,8 @@ int urma_lab_jetty_delete(urma_lab_jetty_t *jetty)
     if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL) {
         return -EINVAL;
     }
-    if (jetty->bound != 0 || jetty->target != NULL) {
+    if (jetty->bound != 0 || jetty->target != NULL ||
+        jetty->outstanding_wr_count != 0) {
         return -EBUSY;
     }
     runtime = jetty->runtime;
@@ -577,6 +630,149 @@ int urma_lab_jetty_delete(urma_lab_jetty_t *jetty)
     return 0;
 }
 
+static int urma_lab_wr_create(urma_lab_jetty_t *jetty,
+                              urma_lab_segment_t *segment, uint64_t offset,
+                              uint32_t length, urma_lab_wr_t **out)
+{
+    urma_lab_wr_t *wr;
+
+    if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL ||
+        segment == NULL || segment->runtime != jetty->runtime || out == NULL ||
+        urma_lab_segment_range(segment, offset, length) != 0) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    wr = calloc(1, sizeof(*wr));
+    if (wr == NULL) {
+        return -ENOMEM;
+    }
+    wr->runtime = jetty->runtime;
+    wr->segment = segment;
+    wr->jetty = jetty;
+    wr->sge.addr = (uint64_t)(uintptr_t)((uint8_t *)segment->memory + offset);
+    wr->sge.len = length;
+    wr->sge.tseg = segment->segment;
+    wr->sge.user_tseg = NULL;
+    *out = wr;
+    return 0;
+}
+
+static void urma_lab_wr_posted(urma_lab_wr_t *wr)
+{
+    wr->runtime->outstanding_wr_count++;
+    wr->segment->outstanding_wr_count++;
+    wr->jetty->outstanding_wr_count++;
+}
+
+int urma_lab_post_send(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *segment, uint64_t offset,
+                       uint32_t length, uint64_t user_ctx,
+                       urma_lab_wr_t **out)
+{
+    urma_lab_wr_t *wr;
+    urma_jfs_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    int create_status;
+
+    if (jetty == NULL || jetty->target == NULL || jetty->bound == 0) {
+        return -ENOTCONN;
+    }
+    create_status = urma_lab_wr_create(jetty, segment, offset, length, &wr);
+    if (create_status != 0) {
+        return create_status;
+    }
+    wr->send_wr.opcode = URMA_OPC_SEND;
+    wr->send_wr.flag.value = 0;
+    wr->send_wr.flag.bs.complete_enable = 1;
+    wr->send_wr.tjetty = jetty->target;
+    wr->send_wr.user_ctx = user_ctx;
+    wr->send_wr.send.src.sge = &wr->sge;
+    wr->send_wr.send.src.num_sge = 1;
+    wr->send_wr.send.imm_data = 0;
+    wr->send_wr.next = NULL;
+    status = urma_post_jetty_send_wr(jetty->jetty, &wr->send_wr, &bad_wr);
+    if (status != URMA_SUCCESS) {
+        free(wr);
+        return (int)status;
+    }
+    urma_lab_wr_posted(wr);
+    *out = wr;
+    return 0;
+}
+
+int urma_lab_post_recv(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *segment, uint64_t offset,
+                       uint32_t length, uint64_t user_ctx,
+                       urma_lab_wr_t **out)
+{
+    urma_lab_wr_t *wr;
+    urma_jfr_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    int create_status = urma_lab_wr_create(jetty, segment, offset, length, &wr);
+
+    if (create_status != 0) {
+        return create_status;
+    }
+    wr->recv_wr.src.sge = &wr->sge;
+    wr->recv_wr.src.num_sge = 1;
+    wr->recv_wr.user_ctx = user_ctx;
+    wr->recv_wr.next = NULL;
+    status = urma_post_jetty_recv_wr(jetty->jetty, &wr->recv_wr, &bad_wr);
+    if (status != URMA_SUCCESS) {
+        free(wr);
+        return (int)status;
+    }
+    urma_lab_wr_posted(wr);
+    *out = wr;
+    return 0;
+}
+
+void urma_lab_wr_complete(urma_lab_wr_t *wr)
+{
+    if (wr == NULL) {
+        return;
+    }
+    if (wr->runtime->outstanding_wr_count > 0) {
+        wr->runtime->outstanding_wr_count--;
+    }
+    if (wr->segment->outstanding_wr_count > 0) {
+        wr->segment->outstanding_wr_count--;
+    }
+    if (wr->jetty->outstanding_wr_count > 0) {
+        wr->jetty->outstanding_wr_count--;
+    }
+    free(wr);
+}
+
+int urma_lab_jfc_poll(urma_lab_jfc_t *jfc, uint32_t capacity,
+                      urma_lab_completion_t *out)
+{
+    urma_cr_t cr[16] = {0};
+    uint32_t i;
+    int count;
+
+    if (jfc == NULL || jfc->jfc == NULL || out == NULL ||
+        capacity == 0 || capacity > 16) {
+        return -EINVAL;
+    }
+    count = urma_poll_jfc(jfc->jfc, (int)capacity, cr);
+    if (count <= 0) {
+        return count;
+    }
+    for (i = 0; i < (uint32_t)count; ++i) {
+        out[i].status = (int32_t)cr[i].status;
+        out[i].opcode = (uint32_t)cr[i].opcode;
+        out[i].user_ctx = cr[i].user_ctx;
+        out[i].completion_len = cr[i].completion_len;
+        out[i].is_recv = cr[i].flag.bs.s_r;
+        out[i].is_jetty = cr[i].flag.bs.jetty;
+        out[i].user_ctx_valid =
+            (cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
+             cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
+    }
+    return count;
+}
+
 int urma_lab_runtime_close(urma_lab_runtime_t *runtime)
 {
     int first_error = 0;
@@ -586,6 +782,7 @@ int urma_lab_runtime_close(urma_lab_runtime_t *runtime)
         return -EINVAL;
     }
     if (runtime->jetty_count != 0 || runtime->segment_count != 0 ||
+        runtime->outstanding_wr_count != 0 ||
         runtime->jfc_count != 0) {
         return -EBUSY;
     }

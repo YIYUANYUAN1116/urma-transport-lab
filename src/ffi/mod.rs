@@ -70,6 +70,17 @@ pub(crate) struct JettyDescriptorData {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompletionRecord {
+    pub status: i32,
+    pub opcode: u32,
+    pub user_ctx: u64,
+    pub completion_len: u32,
+    pub is_recv: bool,
+    pub is_jetty: bool,
+    pub user_ctx_valid: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FfiError {
     Contract(&'static str),
     NullHandle,
@@ -124,13 +135,14 @@ impl NativeRuntime {
     }
 
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
-        let Some(raw) = self.raw.take() else {
+        let Some(raw) = self.raw else {
             return Ok(());
         };
         // SAFETY: `raw` is the unique live allocation returned by the shim and
         // is consumed exactly once, regardless of the reported close status.
         let status = unsafe { sys::urma_lab_runtime_close(raw.as_ptr()) };
         if status == 0 {
+            self.raw = None;
             Ok(())
         } else {
             Err(FfiError::Status(status))
@@ -223,16 +235,55 @@ impl JfcHandle {
     }
 
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
-        let Some(raw) = self.raw.take() else {
+        let Some(raw) = self.raw else {
             return Ok(());
         };
         // SAFETY: This is the unique live shim JFC wrapper.
         let status = unsafe { sys::urma_lab_jfc_delete(raw.as_ptr()) };
         if status == 0 {
+            self.raw = None;
             Ok(())
         } else {
             Err(FfiError::Status(status))
         }
+    }
+
+    pub(crate) fn poll(&self, capacity: usize) -> Result<Vec<CompletionRecord>, FfiError> {
+        if capacity == 0 || capacity > 16 {
+            return Err(FfiError::Contract("poll capacity must be in 1..=16"));
+        }
+        let raw = self.raw.ok_or(FfiError::Contract("JFC is closed"))?;
+        let mut records: Vec<std::mem::MaybeUninit<sys::urma_lab_completion_t>> =
+            Vec::with_capacity(capacity);
+        records.resize_with(capacity, std::mem::MaybeUninit::uninit);
+        // SAFETY: `records` has `capacity` writable entries and the live JFC is
+        // only polled synchronously on its owner thread.
+        let count = unsafe {
+            sys::urma_lab_jfc_poll(raw.as_ptr(), capacity as u32, records.as_mut_ptr().cast())
+        };
+        if count < 0 {
+            return Err(FfiError::Status(count));
+        }
+        let count = usize::try_from(count)
+            .map_err(|_| FfiError::Contract("poll count does not fit usize"))?;
+        if count > capacity {
+            return Err(FfiError::Contract("provider returned too many completions"));
+        }
+        let mut out = Vec::with_capacity(count);
+        for record in records.into_iter().take(count) {
+            // SAFETY: the shim initializes exactly the first `count` entries.
+            let record = unsafe { record.assume_init() };
+            out.push(CompletionRecord {
+                status: record.status,
+                opcode: record.opcode,
+                user_ctx: record.user_ctx,
+                completion_len: record.completion_len,
+                is_recv: record.is_recv != 0,
+                is_jetty: record.is_jetty != 0,
+                user_ctx_valid: record.user_ctx_valid != 0,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -270,16 +321,43 @@ impl SegmentHandle {
     }
 
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
-        let Some(raw) = self.raw.take() else {
+        let Some(raw) = self.raw else {
             return Ok(());
         };
         // SAFETY: This is the unique live shim Segment wrapper.
         let status = unsafe { sys::urma_lab_segment_delete(raw.as_ptr()) };
         if status == 0 {
+            self.raw = None;
             Ok(())
         } else {
             Err(FfiError::Status(status))
         }
+    }
+
+    pub(crate) fn write(&self, offset: u64, data: &[u8]) -> Result<(), FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let length = u32::try_from(data.len())
+            .map_err(|_| FfiError::Contract("write length exceeds u32"))?;
+        if length == 0 {
+            return Err(FfiError::Contract("zero-length Segment write"));
+        }
+        // SAFETY: data remains valid for the synchronous copy into the Segment.
+        status_result(unsafe {
+            sys::urma_lab_segment_write(raw.as_ptr(), offset, data.as_ptr(), length)
+        })
+    }
+
+    pub(crate) fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        if length == 0 {
+            return Err(FfiError::Contract("zero-length Segment read"));
+        }
+        let mut out = vec![0u8; length as usize];
+        // SAFETY: out has exactly `length` writable bytes.
+        status_result(unsafe {
+            sys::urma_lab_segment_read(raw.as_ptr(), offset, out.as_mut_ptr(), length)
+        })?;
+        Ok(out)
     }
 }
 
@@ -404,12 +482,101 @@ impl JettyHandle {
         status_result(unsafe { sys::urma_lab_jetty_mark_error(jetty.as_ptr()) })
     }
 
+    pub(crate) fn post_send(
+        &mut self,
+        segment: &SegmentHandle,
+        offset: u64,
+        length: u32,
+        user_ctx: u64,
+    ) -> Result<WrHandle, FfiError> {
+        self.post(segment, offset, length, user_ctx, true)
+    }
+
+    pub(crate) fn post_recv(
+        &mut self,
+        segment: &SegmentHandle,
+        offset: u64,
+        length: u32,
+        user_ctx: u64,
+    ) -> Result<WrHandle, FfiError> {
+        self.post(segment, offset, length, user_ctx, false)
+    }
+
+    fn post(
+        &mut self,
+        segment: &SegmentHandle,
+        offset: u64,
+        length: u32,
+        user_ctx: u64,
+        send: bool,
+    ) -> Result<WrHandle, FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: Jetty and Segment are live, range validation is repeated by
+        // the shim, and raw is a valid out pointer.
+        let status = unsafe {
+            if send {
+                sys::urma_lab_post_send(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    offset,
+                    length,
+                    user_ctx,
+                    &mut raw,
+                )
+            } else {
+                sys::urma_lab_post_recv(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    offset,
+                    length,
+                    user_ctx,
+                    &mut raw,
+                )
+            }
+        };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        Ok(WrHandle {
+            raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
+            _not_send_sync: PhantomData,
+        })
+    }
+
     pub(crate) fn close(&mut self) -> Result<(), FfiError> {
-        let Some(jetty) = self.raw.take() else {
+        let Some(jetty) = self.raw else {
             return Ok(());
         };
         // SAFETY: This consumes the unique local Jetty wrapper.
-        status_result(unsafe { sys::urma_lab_jetty_delete(jetty.as_ptr()) })
+        let result = status_result(unsafe { sys::urma_lab_jetty_delete(jetty.as_ptr()) });
+        if result.is_ok() {
+            self.raw = None;
+        }
+        result
+    }
+}
+
+/// Owns C WR/SGE metadata until the matching CQE is consumed.
+pub(crate) struct WrHandle {
+    raw: Option<NonNull<sys::urma_lab_wr_t>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl WrHandle {
+    pub(crate) fn complete(mut self) {
+        if let Some(raw) = self.raw.take() {
+            // SAFETY: Completion routing guarantees one call for the unique WR.
+            unsafe { sys::urma_lab_wr_complete(raw.as_ptr()) };
+        }
+    }
+}
+
+impl Drop for WrHandle {
+    fn drop(&mut self) {
+        // A posted WR cannot be freed safely without its CQE. Deliberately leak
+        // it; shim outstanding counters prevent teardown of dependent objects.
     }
 }
 

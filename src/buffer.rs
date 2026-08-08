@@ -59,10 +59,24 @@ pub enum SlotState {
     Posted,
     Completed,
     Leased,
+    PostedRecv,
+    RecvCompleted,
+    SendPosted,
+    SendCompleted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SlotId(usize);
+
+impl SlotId {
+    pub fn index(self) -> usize {
+        self.0
+    }
+
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+}
 
 #[cfg(feature = "urma")]
 #[derive(Clone, Debug)]
@@ -169,9 +183,12 @@ mod native {
             let slot = self.slots.get_mut(id.0).ok_or_else(|| {
                 Error::InvalidConfiguration("slot id is outside this buffer pool".into())
             })?;
-            if slot.state != SlotState::Allocated {
+            if !matches!(
+                slot.state,
+                SlotState::Allocated | SlotState::RecvCompleted | SlotState::SendCompleted
+            ) {
                 return Err(Error::InvalidConfiguration(
-                    "only an allocated slot can be released in M1".into(),
+                    "slot cannot be released while a WR may still reference it".into(),
                 ));
             }
             slot.state = SlotState::Free;
@@ -184,6 +201,143 @@ mod native {
 
         pub fn slot_layout(&self, id: SlotId) -> Option<(usize, usize)> {
             self.slots.get(id.0).map(|slot| (slot.offset, slot.len))
+        }
+
+        pub(crate) fn segment_handle(&self) -> Result<&ffi::SegmentHandle> {
+            self.segment
+                .as_ref()
+                .map(|segment| &segment.handle)
+                .ok_or_else(|| Error::InvalidConfiguration("registered Segment is closed".into()))
+        }
+
+        pub(crate) fn write_tx(&mut self, id: SlotId, data: &[u8]) -> Result<(u64, u32)> {
+            let (offset, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Tx || state != SlotState::Allocated {
+                return Err(Error::InvalidConfiguration(
+                    "TX write requires an allocated TX slot".into(),
+                ));
+            }
+            if data.is_empty() || data.len() > capacity {
+                return Err(Error::InvalidConfiguration(format!(
+                    "TX message length {} is outside 1..={capacity}",
+                    data.len()
+                )));
+            }
+            let offset = u64::try_from(offset)
+                .map_err(|_| Error::InvalidConfiguration("slot offset exceeds u64".into()))?;
+            self.segment_handle()?
+                .write(offset, data)
+                .map_err(|error| map_ffi_error("write_tx_slot", error))?;
+            let length = u32::try_from(data.len())
+                .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
+            Ok((offset, length))
+        }
+
+        pub(crate) fn recv_post_layout(&self, id: SlotId) -> Result<(u64, u32)> {
+            let (offset, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Rx || state != SlotState::Allocated {
+                return Err(Error::InvalidConfiguration(
+                    "RECV post requires an allocated RX slot".into(),
+                ));
+            }
+            Ok((
+                u64::try_from(offset)
+                    .map_err(|_| Error::InvalidConfiguration("slot offset exceeds u64".into()))?,
+                u32::try_from(capacity)
+                    .map_err(|_| Error::InvalidConfiguration("slot size exceeds u32".into()))?,
+            ))
+        }
+
+        pub(crate) fn mark_posted(&mut self, id: SlotId, kind: SlotKind) -> Result<()> {
+            let expected_kind = self
+                .slots
+                .get(id.0)
+                .ok_or_else(|| Error::Protocol("completion slot is outside buffer pool".into()))?
+                .kind;
+            if expected_kind != kind {
+                return Err(Error::Protocol(
+                    "WR operation does not match slot kind".into(),
+                ));
+            }
+            self.transition(
+                id,
+                SlotState::Allocated,
+                match kind {
+                    SlotKind::Tx => SlotState::SendPosted,
+                    SlotKind::Rx => SlotState::PostedRecv,
+                },
+            )
+        }
+
+        pub(crate) fn rollback_post(&mut self, id: SlotId, kind: SlotKind) -> Result<()> {
+            self.transition(
+                id,
+                match kind {
+                    SlotKind::Tx => SlotState::SendPosted,
+                    SlotKind::Rx => SlotState::PostedRecv,
+                },
+                SlotState::Allocated,
+            )
+        }
+
+        pub(crate) fn complete_send(&mut self, id: SlotId) -> Result<()> {
+            self.transition(id, SlotState::SendPosted, SlotState::SendCompleted)
+        }
+
+        pub(crate) fn complete_error(
+            &mut self,
+            id: SlotId,
+            operation: crate::wr::OperationType,
+        ) -> Result<()> {
+            let (from, to) = match operation {
+                crate::wr::OperationType::Send => (SlotState::SendPosted, SlotState::SendCompleted),
+                crate::wr::OperationType::Recv => (SlotState::PostedRecv, SlotState::RecvCompleted),
+            };
+            self.transition(id, from, to)
+        }
+
+        pub(crate) fn complete_recv(&mut self, id: SlotId, length: u32) -> Result<Vec<u8>> {
+            let (offset, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Rx || state != SlotState::PostedRecv {
+                return Err(Error::Protocol(
+                    "RECV CQE does not match a posted RX slot".into(),
+                ));
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
+            if length == 0 || length > capacity {
+                return Err(Error::Protocol(format!(
+                    "RECV completion length {length} is outside 1..={capacity}"
+                )));
+            }
+            let bytes = self
+                .segment_handle()?
+                .read(offset as u64, length as u32)
+                .map_err(|error| map_ffi_error("read_rx_slot", error))?;
+            self.transition(id, SlotState::PostedRecv, SlotState::RecvCompleted)?;
+            Ok(bytes)
+        }
+
+        fn slot_fields(&self, id: SlotId) -> Result<(usize, usize, SlotKind, SlotState)> {
+            self.slots
+                .get(id.0)
+                .map(|slot| (slot.offset, slot.len, slot.kind, slot.state))
+                .ok_or_else(|| Error::InvalidConfiguration("slot id is outside buffer pool".into()))
+        }
+
+        fn transition(&mut self, id: SlotId, from: SlotState, to: SlotState) -> Result<()> {
+            let slot = self
+                .slots
+                .get_mut(id.0)
+                .ok_or_else(|| Error::Protocol("completion slot is outside buffer pool".into()))?;
+            if slot.state != from {
+                return Err(Error::Protocol(format!(
+                    "slot {} state {:?}, expected {:?}",
+                    id.0, slot.state, from
+                )));
+            }
+            slot.state = to;
+            Ok(())
         }
 
         pub(crate) fn stop(&mut self) {

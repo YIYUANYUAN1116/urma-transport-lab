@@ -8,6 +8,14 @@ pub enum Error {
     AlreadyInitialized,
     InvalidConfiguration(String),
     Protocol(String),
+    Timeout {
+        operation: &'static str,
+    },
+    Completion {
+        status: i32,
+        opcode: u32,
+        user_ctx: u64,
+    },
     Io {
         operation: &'static str,
         message: String,
@@ -42,6 +50,15 @@ impl fmt::Display for Error {
             }
             Self::InvalidConfiguration(detail) => write!(f, "invalid configuration: {detail}"),
             Self::Protocol(detail) => write!(f, "protocol error: {detail}"),
+            Self::Timeout { operation } => write!(f, "operation {operation} timed out"),
+            Self::Completion {
+                status,
+                opcode,
+                user_ctx,
+            } => write!(
+                f,
+                "completion failed: status={status}, opcode={opcode}, user_ctx={user_ctx}"
+            ),
             Self::Io { operation, message } => {
                 write!(f, "I/O operation {operation} failed: {message}")
             }

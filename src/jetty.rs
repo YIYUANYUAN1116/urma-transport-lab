@@ -208,6 +208,30 @@ mod native {
                 .map_err(|error| map_ffi_error("modify_jetty_error", error))
         }
 
+        pub(crate) fn post_send(
+            &mut self,
+            segment: &ffi::SegmentHandle,
+            offset: u64,
+            length: u32,
+            user_ctx: u64,
+        ) -> Result<ffi::WrHandle> {
+            self.handle
+                .post_send(segment, offset, length, user_ctx)
+                .map_err(|error| map_ffi_error("post_jetty_send_wr", error))
+        }
+
+        pub(crate) fn post_recv(
+            &mut self,
+            segment: &ffi::SegmentHandle,
+            offset: u64,
+            length: u32,
+            user_ctx: u64,
+        ) -> Result<ffi::WrHandle> {
+            self.handle
+                .post_recv(segment, offset, length, user_ctx)
+                .map_err(|error| map_ffi_error("post_jetty_recv_wr", error))
+        }
+
         pub(crate) fn close(&mut self) -> Result<()> {
             let mut failures = Vec::new();
             if self.bound {

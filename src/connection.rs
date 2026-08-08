@@ -9,6 +9,7 @@ pub enum ConnectionState {
     DescriptorExchanged,
     Bound,
     Ready,
+    Draining,
     Failed,
     Closed,
 }
@@ -16,27 +17,53 @@ pub enum ConnectionState {
 #[cfg(feature = "urma")]
 mod native {
     use super::*;
-    use crate::{jetty::UrmaJetty, JettyDescriptor, UrmaDeviceCapability};
-    use std::marker::PhantomData;
+    use crate::{
+        buffer::UrmaBufferPool,
+        completion::{
+            check_deadline, deadline_after, CompletionEvent, CompletionPoller, CompletionStats,
+        },
+        ffi,
+        jetty::UrmaJetty,
+        message::Message,
+        wr::{OperationType, ReceiveCredit, WrToken},
+        JettyDescriptor, SlotKind, UrmaDeviceCapability,
+    };
+    use std::{thread, time::Duration};
 
     /// M2 control-plane owner. It intentionally exposes no data-plane API.
     pub struct UrmaConnection<'runtime> {
         state: ConnectionState,
         capability: UrmaDeviceCapability,
         jetty: UrmaJetty,
-        _runtime: PhantomData<&'runtime mut crate::UrmaRuntime>,
+        buffer_pool: &'runtime mut UrmaBufferPool,
+        send_jfc: &'runtime ffi::JfcHandle,
+        recv_jfc: &'runtime ffi::JfcHandle,
+        poller: CompletionPoller,
+        receive_credit: ReceiveCredit,
     }
 
     impl<'runtime> UrmaConnection<'runtime> {
-        pub(crate) fn new(capability: UrmaDeviceCapability, jetty: UrmaJetty) -> Self {
+        pub(crate) fn new(
+            capability: UrmaDeviceCapability,
+            jetty: UrmaJetty,
+            buffer_pool: &'runtime mut UrmaBufferPool,
+            send_jfc: &'runtime ffi::JfcHandle,
+            recv_jfc: &'runtime ffi::JfcHandle,
+            connection_id: u16,
+            generation: u8,
+        ) -> Result<Self> {
             let mut connection = Self {
                 state: ConnectionState::ContextReady,
                 capability,
                 jetty,
-                _runtime: PhantomData,
+                buffer_pool,
+                send_jfc,
+                recv_jfc,
+                poller: CompletionPoller::new(connection_id, generation, 16)?,
+                receive_credit: ReceiveCredit::default(),
             };
             connection.transition(ConnectionState::JettyCreated);
-            connection
+            Ok(connection)
         }
 
         pub fn state(&self) -> ConnectionState {
@@ -48,14 +75,26 @@ mod native {
         }
 
         pub(crate) fn export_descriptor(&mut self) -> Result<JettyDescriptor> {
-            self.require(ConnectionState::JettyCreated)?;
+            if !matches!(
+                self.state,
+                ConnectionState::JettyCreated | ConnectionState::DescriptorExchanged
+            ) {
+                return Err(self.state_error("export descriptor"));
+            }
             let descriptor = self.jetty.export_descriptor()?;
-            self.transition(ConnectionState::DescriptorExchanged);
+            if self.state == ConnectionState::JettyCreated {
+                self.transition(ConnectionState::DescriptorExchanged);
+            }
             Ok(descriptor)
         }
 
         pub(crate) fn import_and_bind(&mut self, descriptor: &JettyDescriptor) -> Result<()> {
-            self.require(ConnectionState::JettyCreated)?;
+            if !matches!(
+                self.state,
+                ConnectionState::JettyCreated | ConnectionState::DescriptorExchanged
+            ) {
+                return Err(self.state_error("import descriptor"));
+            }
             let local_transport = u32::try_from(self.capability.transport_type)
                 .map_err(|_| Error::Protocol("local transport type is negative".into()))?;
             if descriptor.transport_type != local_transport {
@@ -64,15 +103,11 @@ mod native {
                     descriptor.transport_type, local_transport
                 )));
             }
-            self.transition(ConnectionState::DescriptorExchanged);
+            if self.state == ConnectionState::JettyCreated {
+                self.transition(ConnectionState::DescriptorExchanged);
+            }
             self.jetty.import(descriptor)?;
             self.jetty.bind()?;
-            self.transition(ConnectionState::Bound);
-            Ok(())
-        }
-
-        pub(crate) fn peer_bound(&mut self) -> Result<()> {
-            self.require(ConnectionState::DescriptorExchanged)?;
             self.transition(ConnectionState::Bound);
             Ok(())
         }
@@ -81,6 +116,138 @@ mod native {
             self.require(ConnectionState::Bound)?;
             self.transition(ConnectionState::Ready);
             Ok(())
+        }
+
+        pub fn recv_ready(&mut self) -> Result<()> {
+            if !matches!(self.state, ConnectionState::Bound | ConnectionState::Ready) {
+                return Err(self.state_error("post receive"));
+            }
+            let slot = self
+                .buffer_pool
+                .allocate(SlotKind::Rx)
+                .ok_or_else(|| Error::InvalidConfiguration("no free RX slot".into()))?;
+            let (offset, length) = self.buffer_pool.recv_post_layout(slot)?;
+            let token = WrToken {
+                connection_id: self.poller.connection_id(),
+                generation: self.poller.generation(),
+                operation: OperationType::Recv,
+                slot,
+            };
+            let user_ctx = token.encode()?;
+            self.buffer_pool.mark_posted(slot, SlotKind::Rx)?;
+            let result =
+                self.jetty
+                    .post_recv(self.buffer_pool.segment_handle()?, offset, length, user_ctx);
+            let wr = match result {
+                Ok(wr) => wr,
+                Err(error) => {
+                    self.buffer_pool.rollback_post(slot, SlotKind::Rx)?;
+                    self.buffer_pool.release(slot)?;
+                    return Err(error);
+                }
+            };
+            self.poller.track(user_ctx, OperationType::Recv, wr)?;
+            self.receive_credit.posted();
+            Ok(())
+        }
+
+        pub fn send(&mut self, message: &Message) -> Result<()> {
+            self.require(ConnectionState::Ready)?;
+            self.receive_credit.require_before_send()?;
+            let bytes = message.encode()?;
+            let slot = self
+                .buffer_pool
+                .allocate(SlotKind::Tx)
+                .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
+            let (offset, length) = match self.buffer_pool.write_tx(slot, &bytes) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    self.buffer_pool.release(slot)?;
+                    return Err(error);
+                }
+            };
+            let token = WrToken {
+                connection_id: self.poller.connection_id(),
+                generation: self.poller.generation(),
+                operation: OperationType::Send,
+                slot,
+            };
+            let user_ctx = token.encode()?;
+            self.buffer_pool.mark_posted(slot, SlotKind::Tx)?;
+            let result =
+                self.jetty
+                    .post_send(self.buffer_pool.segment_handle()?, offset, length, user_ctx);
+            let wr = match result {
+                Ok(wr) => wr,
+                Err(error) => {
+                    self.buffer_pool.rollback_post(slot, SlotKind::Tx)?;
+                    self.buffer_pool.release(slot)?;
+                    return Err(error);
+                }
+            };
+            self.poller.track(user_ctx, OperationType::Send, wr)
+        }
+
+        pub fn poll_once(&mut self) -> Result<Vec<CompletionEvent>> {
+            self.require(ConnectionState::Ready)?;
+            let events = match self
+                .poller
+                .poll_once(self.send_jfc, self.recv_jfc, self.buffer_pool)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    self.fail();
+                    return Err(error);
+                }
+            };
+            for event in &events {
+                if matches!(event, CompletionEvent::RecvCompleted { .. }) {
+                    self.receive_credit.completed();
+                }
+            }
+            Ok(events)
+        }
+
+        pub fn wait_for_message(&mut self, timeout: Duration) -> Result<Message> {
+            let deadline = deadline_after(timeout);
+            let mut received = None;
+            loop {
+                check_deadline(deadline, "wait_for_message")?;
+                for event in self.poll_once()? {
+                    if let CompletionEvent::RecvCompleted { bytes, .. } = event {
+                        if received.is_some() {
+                            return Err(Error::Protocol(
+                                "multiple messages completed while waiting for one".into(),
+                            ));
+                        }
+                        received = Some(Message::decode(&bytes)?);
+                    }
+                }
+                if received.is_some() && self.poller.outstanding_send() == 0 {
+                    return Ok(received.expect("checked above"));
+                }
+                thread::yield_now();
+            }
+        }
+
+        pub fn drain_completions(&mut self, timeout: Duration) -> Result<()> {
+            let deadline = deadline_after(timeout);
+            while self.poller.outstanding_send() != 0 {
+                check_deadline(deadline, "drain completions")?;
+                for event in self.poll_once()? {
+                    if matches!(event, CompletionEvent::RecvCompleted { .. }) {
+                        return Err(Error::Protocol(
+                            "unexpected receive while draining send completions".into(),
+                        ));
+                    }
+                }
+                thread::yield_now();
+            }
+            Ok(())
+        }
+
+        pub fn stats(&self) -> CompletionStats {
+            self.poller.stats()
         }
 
         pub(crate) fn fail(&mut self) {
@@ -96,6 +263,33 @@ mod native {
         fn close_inner(&mut self) -> Result<()> {
             if self.state == ConnectionState::Closed {
                 return Ok(());
+            }
+            if self.poller.outstanding() != 0 {
+                self.transition(ConnectionState::Draining);
+                let mut failures = Vec::new();
+                if let Err(error) = self.jetty.mark_error() {
+                    failures.push(error.to_string());
+                }
+                let deadline = deadline_after(Duration::from_secs(1));
+                while self.poller.outstanding() != 0 && check_deadline(deadline, "drain WR").is_ok()
+                {
+                    match self
+                        .poller
+                        .poll_once(self.send_jfc, self.recv_jfc, self.buffer_pool)
+                    {
+                        Ok(_) => {}
+                        Err(Error::Completion { .. }) => {}
+                        Err(error) => failures.push(error.to_string()),
+                    }
+                    thread::yield_now();
+                }
+                if self.poller.outstanding() != 0 {
+                    failures.push("timed out draining outstanding WRs".into());
+                }
+                if !failures.is_empty() {
+                    self.transition(ConnectionState::Failed);
+                    return Err(Error::Shutdown { failures });
+                }
             }
             let result = self.jetty.close();
             if result.is_ok() {
@@ -115,6 +309,13 @@ mod native {
                     self.state, expected
                 )))
             }
+        }
+
+        fn state_error(&self, operation: &str) -> Error {
+            Error::Protocol(format!(
+                "cannot {operation} while connection is {:?}",
+                self.state
+            ))
         }
 
         fn transition(&mut self, state: ConnectionState) {

@@ -12,8 +12,9 @@ typedef struct urma_lab_jfc urma_lab_jfc_t;
 typedef struct urma_lab_segment urma_lab_segment_t;
 typedef struct urma_lab_jetty urma_lab_jetty_t;
 typedef struct urma_lab_descriptor urma_lab_descriptor_t;
+typedef struct urma_lab_wr urma_lab_wr_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 3U
+#define URMA_LAB_SHIM_ABI_VERSION 4U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
@@ -78,6 +79,18 @@ typedef struct urma_lab_jetty_descriptor_meta {
     uint32_t opaque_len;
 } urma_lab_jetty_descriptor_meta_t;
 
+/* Pointer-free completion DTO copied from urma_cr_t by the C shim. */
+typedef struct urma_lab_completion {
+    int32_t status;
+    uint32_t opcode;
+    uint64_t user_ctx;
+    uint32_t completion_len;
+    uint8_t is_recv;
+    uint8_t is_jetty;
+    uint8_t user_ctx_valid;
+    uint8_t reserved;
+} urma_lab_completion_t;
+
 /*
  * Opens the smallest process-global chain: urma_init -> device -> context.
  * `device_name` must be NUL terminated and `out` must be a valid writable pointer.
@@ -102,6 +115,10 @@ int urma_lab_segment_create(urma_lab_runtime_t *runtime, uint64_t length,
 
 /* Unregisters the Segment before releasing its backing allocation. */
 int urma_lab_segment_delete(urma_lab_segment_t *segment);
+int urma_lab_segment_write(urma_lab_segment_t *segment, uint64_t offset,
+                           const uint8_t *data, uint32_t length);
+int urma_lab_segment_read(const urma_lab_segment_t *segment, uint64_t offset,
+                          uint8_t *out, uint32_t length);
 
 /* Creates one RC duplex Jetty with an embedded, non-shared JFR. */
 int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
@@ -129,6 +146,24 @@ int urma_lab_jetty_bind(urma_lab_jetty_t *jetty);
 int urma_lab_jetty_unbind(urma_lab_jetty_t *jetty);
 int urma_lab_jetty_unimport(urma_lab_jetty_t *jetty);
 int urma_lab_jetty_delete(urma_lab_jetty_t *jetty);
+
+/*
+ * These functions build bitfield/union-bearing UMDK WR/SGE objects in C.
+ * The returned owner must remain alive until its CQE is consumed.
+ */
+int urma_lab_post_send(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *segment, uint64_t offset,
+                       uint32_t length, uint64_t user_ctx,
+                       urma_lab_wr_t **out);
+int urma_lab_post_recv(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *segment, uint64_t offset,
+                       uint32_t length, uint64_t user_ctx,
+                       urma_lab_wr_t **out);
+void urma_lab_wr_complete(urma_lab_wr_t *wr);
+
+/* Non-blocking poll. Returns a count in [0, capacity], or a negative error. */
+int urma_lab_jfc_poll(urma_lab_jfc_t *jfc, uint32_t capacity,
+                      urma_lab_completion_t *out);
 
 /*
  * Destroys context before urma_uninit and frees the wrapper. The pointer must be

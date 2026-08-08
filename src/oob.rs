@@ -4,7 +4,7 @@ use crate::{Error, Result};
 use std::io::{Read, Write};
 
 pub const OOB_MAGIC: u32 = 0x5552_4d41;
-pub const OOB_VERSION: u16 = 1;
+pub const OOB_VERSION: u16 = 2;
 pub const MAX_OOB_PAYLOAD_LEN: usize = 128 * 1024;
 #[cfg(any(feature = "urma", test))]
 const HEADER_LEN: usize = 12;
@@ -254,11 +254,27 @@ mod native {
         connection: &mut UrmaConnection<'_>,
     ) -> Result<()> {
         let hello = expect_frame(stream, MessageType::Hello)?;
-        let peer_capability = decode_role_capability(&hello.payload, Role::Child)?;
+        if hello.payload.len() <= 1 + CapabilityWire::LEN {
+            return Err(Error::Protocol(
+                "HELLO lacks a Child Jetty descriptor".into(),
+            ));
+        }
+        let peer_capability =
+            decode_role_capability(&hello.payload[..1 + CapabilityWire::LEN], Role::Child)?;
         validate_peer_capability(connection, &peer_capability)?;
         eprintln!("parent: HELLO received and capability validated");
+        let child_descriptor =
+            JettyDescriptor::deserialize(&hello.payload[1 + CapabilityWire::LEN..])?;
+        if child_descriptor.eid_index != peer_capability.eid_index {
+            return Err(Error::Protocol(
+                "Child descriptor EID index disagrees with capability".into(),
+            ));
+        }
 
         let descriptor = connection.export_descriptor()?;
+        connection.import_and_bind(&child_descriptor)?;
+        connection.recv_ready()?;
+        eprintln!("parent: Child descriptor imported, Bound, RX posted");
         let mut payload = encode_role_capability(Role::Parent, connection);
         payload.extend_from_slice(&descriptor.serialize()?);
         Frame {
@@ -270,7 +286,6 @@ mod native {
 
         let ready = expect_frame(stream, MessageType::Ready)?;
         expect_role_only(&ready.payload, Role::Child)?;
-        connection.peer_bound()?;
         eprintln!("parent: child reported Bound");
         Frame {
             message_type: MessageType::ReadyAck,
@@ -285,9 +300,12 @@ mod native {
         stream: &mut TcpStream,
         connection: &mut UrmaConnection<'_>,
     ) -> Result<()> {
+        let descriptor = connection.export_descriptor()?;
+        let mut hello_payload = encode_role_capability(Role::Child, connection);
+        hello_payload.extend_from_slice(&descriptor.serialize()?);
         Frame {
             message_type: MessageType::Hello,
-            payload: encode_role_capability(Role::Child, connection),
+            payload: hello_payload,
         }
         .write_to(stream)?;
         eprintln!("child: HELLO sent");
@@ -307,7 +325,8 @@ mod native {
         }
         eprintln!("child: descriptor received and validated");
         connection.import_and_bind(&descriptor)?;
-        eprintln!("child: descriptor imported; Jetty Bound");
+        connection.recv_ready()?;
+        eprintln!("child: descriptor imported; Jetty Bound; RX posted");
         Frame {
             message_type: MessageType::Ready,
             payload: vec![Role::Child as u8],

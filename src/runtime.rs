@@ -114,6 +114,7 @@ mod native {
         native: Option<ffi::NativeRuntime>,
         accepting: bool,
         poisoned: bool,
+        next_connection_id: u16,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
@@ -204,6 +205,7 @@ mod native {
                 native: Some(native),
                 accepting: true,
                 poisoned: false,
+                next_connection_id: 1,
                 _not_send_sync: PhantomData,
             })
         }
@@ -255,6 +257,14 @@ mod native {
             }
             validate_jetty_config(&config, &self.capability)?;
             let capability = self.capability.clone();
+            let connection_id = self.next_connection_id;
+            self.next_connection_id = self
+                .next_connection_id
+                .checked_add(1)
+                .filter(|id| *id != 0)
+                .ok_or_else(|| {
+                    Error::InvalidConfiguration("connection id space exhausted".into())
+                })?;
             let native = self
                 .native
                 .as_mut()
@@ -267,8 +277,20 @@ mod native {
                 .recv_jfc
                 .as_ref()
                 .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
+            let buffer_pool = self
+                .buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?;
             let jetty = UrmaJetty::create(native, send_jfc.handle(), recv_jfc.handle(), &config)?;
-            Ok(UrmaConnection::new(capability, jetty))
+            UrmaConnection::new(
+                capability,
+                jetty,
+                buffer_pool,
+                send_jfc.handle(),
+                recv_jfc.handle(),
+                connection_id,
+                1,
+            )
         }
 
         pub fn shutdown(mut self) -> Result<()> {
@@ -527,7 +549,7 @@ mod tests {
     #[test]
     fn abi_baseline_matches_verified_m0_contract() {
         let baseline = abi_baseline().expect("C shim must return its ABI baseline");
-        assert_eq!(baseline.shim_abi_version, 3);
+        assert_eq!(baseline.shim_abi_version, 4);
         assert_eq!(baseline.pointer_size as usize, std::mem::size_of::<usize>());
         assert_eq!(baseline.status_size as usize, std::mem::size_of::<i32>());
         assert_eq!(baseline.success_value, 0);
