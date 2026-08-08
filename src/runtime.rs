@@ -1,9 +1,12 @@
-use crate::{Error, Result};
+use crate::{BufferPoolConfig, Error, Result};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeConfig {
     pub device_name: String,
     pub eid_index: u32,
+    pub send_jfc_depth: u32,
+    pub recv_jfc_depth: u32,
+    pub buffer_pool: BufferPoolConfig,
 }
 
 impl RuntimeConfig {
@@ -11,6 +14,9 @@ impl RuntimeConfig {
         Self {
             device_name: device_name.into(),
             eid_index,
+            send_jfc_depth: 64,
+            recv_jfc_depth: 64,
+            buffer_pool: BufferPoolConfig::default(),
         }
     }
 }
@@ -30,6 +36,35 @@ pub struct AbiBaseline {
     pub success_value: i32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceEid {
+    pub index: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Rust-owned snapshot copied from `urma_device_attr_t` and the EID list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UrmaDeviceCapability {
+    pub device_name: String,
+    pub transport_type: i32,
+    pub selected_eid_index: u32,
+    pub eids: Vec<DeviceEid>,
+    pub max_jfc: u32,
+    pub max_jfs: u32,
+    pub max_jfr: u32,
+    pub max_jetty: u32,
+    pub max_jfc_depth: u32,
+    pub max_jfs_depth: u32,
+    pub max_jfr_depth: u32,
+    pub max_jfs_inline_len: u32,
+    pub max_jfs_sge: u32,
+    pub max_jfs_rsge: u32,
+    pub max_jfr_sge: u32,
+    pub max_msg_size: u64,
+    pub transport_modes: u16,
+    pub page_size_cap: u64,
+}
+
 /// Returns the ABI fingerprint compiled into the C shim.
 pub fn abi_baseline() -> Result<AbiBaseline> {
     native::abi_baseline()
@@ -38,7 +73,12 @@ pub fn abi_baseline() -> Result<AbiBaseline> {
 #[cfg(feature = "urma")]
 mod native {
     use super::*;
-    use crate::ffi;
+    use crate::{
+        buffer::UrmaBufferPool,
+        ffi,
+        jfc::{JfcKind, UrmaJfc},
+        SlotId, SlotKind, SlotState,
+    };
     use std::{
         ffi::CString,
         marker::PhantomData,
@@ -62,18 +102,21 @@ mod native {
         })
     }
 
-    /// Unique process-level owner of liburma and its device context.
-    ///
-    /// `Rc` in the marker deliberately prevents moving this native owner to a
-    /// different thread. Later Phase 0 work will construct it inside the poller.
+    /// Process-level owner of the complete M1 native resource tree.
     pub struct UrmaRuntime {
         config: RuntimeConfig,
+        capability: UrmaDeviceCapability,
+        buffer_pool: Option<UrmaBufferPool>,
+        recv_jfc: Option<UrmaJfc>,
+        send_jfc: Option<UrmaJfc>,
         native: Option<ffi::NativeRuntime>,
+        accepting: bool,
+        poisoned: bool,
         _not_send_sync: PhantomData<Rc<()>>,
     }
 
     impl UrmaRuntime {
-        pub fn open(config: RuntimeConfig) -> Result<Self> {
+        pub fn start(config: RuntimeConfig) -> Result<Self> {
             if ACTIVE
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
@@ -81,18 +124,89 @@ mod native {
                 return Err(Error::AlreadyInitialized);
             }
 
-            let device = CString::new(config.device_name.as_str()).map_err(|_| {
-                ACTIVE.store(false, Ordering::Release);
-                Error::InvalidDeviceName
-            })?;
-            let native = ffi::NativeRuntime::open(&device, config.eid_index).map_err(|error| {
-                ACTIVE.store(false, Ordering::Release);
-                map_ffi_error("runtime_open", error)
-            })?;
+            match Self::start_inner(config) {
+                Ok(runtime) => Ok(runtime),
+                Err(error) => {
+                    if !matches!(&error, Error::StartupRollback { .. }) {
+                        ACTIVE.store(false, Ordering::Release);
+                    }
+                    Err(error)
+                }
+            }
+        }
 
+        /// Compatibility alias retained from M0.
+        pub fn open(config: RuntimeConfig) -> Result<Self> {
+            Self::start(config)
+        }
+
+        fn start_inner(config: RuntimeConfig) -> Result<Self> {
+            let device = CString::new(config.device_name.as_str())
+                .map_err(|_| Error::InvalidDeviceName)?;
+            let mut native = ffi::NativeRuntime::open(&device, config.eid_index)
+                .map_err(|error| map_ffi_error("runtime_open", error))?;
+
+            let capability = match native.query_device() {
+                Ok(capability) => from_ffi_capability(capability),
+                Err(error) => {
+                    let primary = map_ffi_error("query_device", error);
+                    return Err(rollback_startup(primary, None, None, None, Some(native)));
+                }
+            };
+            if let Err(primary) = validate_config(&config, &capability) {
+                return Err(rollback_startup(primary, None, None, None, Some(native)));
+            }
+
+            let send_jfc = match UrmaJfc::create(
+                &mut native,
+                JfcKind::Send,
+                config.send_jfc_depth,
+            ) {
+                Ok(jfc) => jfc,
+                Err(primary) => {
+                    return Err(rollback_startup(primary, None, None, None, Some(native)));
+                }
+            };
+            let recv_jfc = match UrmaJfc::create(
+                &mut native,
+                JfcKind::Receive,
+                config.recv_jfc_depth,
+            ) {
+                Ok(jfc) => jfc,
+                Err(primary) => {
+                    return Err(rollback_startup(
+                        primary,
+                        None,
+                        None,
+                        Some(send_jfc),
+                        Some(native),
+                    ));
+                }
+            };
+            let buffer_pool = match UrmaBufferPool::create(&mut native, config.buffer_pool.clone()) {
+                Ok(pool) => pool,
+                Err(primary) => {
+                    return Err(rollback_startup(
+                        primary,
+                        None,
+                        Some(recv_jfc),
+                        Some(send_jfc),
+                        Some(native),
+                    ));
+                }
+            };
+
+            debug_assert_eq!(send_jfc.kind(), JfcKind::Send);
+            debug_assert_eq!(recv_jfc.kind(), JfcKind::Receive);
             Ok(Self {
                 config,
+                capability,
+                buffer_pool: Some(buffer_pool),
+                recv_jfc: Some(recv_jfc),
+                send_jfc: Some(send_jfc),
                 native: Some(native),
+                accepting: true,
+                poisoned: false,
                 _not_send_sync: PhantomData,
             })
         }
@@ -101,36 +215,202 @@ mod native {
             &self.config
         }
 
-        pub fn close(mut self) -> Result<()> {
-            self.close_inner()
+        pub fn capability(&self) -> &UrmaDeviceCapability {
+            &self.capability
         }
 
-        fn close_inner(&mut self) -> Result<()> {
-            let Some(mut native) = self.native.take() else {
-                return Ok(());
-            };
-            match native.close() {
-                Ok(()) => {
-                    ACTIVE.store(false, Ordering::Release);
-                    Ok(())
+        pub fn jfc_depths(&self) -> (u32, u32) {
+            (
+                self.send_jfc.as_ref().map_or(0, UrmaJfc::depth),
+                self.recv_jfc.as_ref().map_or(0, UrmaJfc::depth),
+            )
+        }
+
+        pub fn registered_memory_layout(&self) -> Option<(usize, usize)> {
+            self.buffer_pool
+                .as_ref()
+                .map(|pool| (pool.registered_len(), pool.alignment()))
+        }
+
+        pub fn allocate_slot(&mut self, kind: SlotKind) -> Option<SlotId> {
+            if !self.accepting {
+                return None;
+            }
+            self.buffer_pool.as_mut()?.allocate(kind)
+        }
+
+        pub fn release_slot(&mut self, id: SlotId) -> Result<()> {
+            self.buffer_pool
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("buffer pool is closed".into()))?
+                .release(id)
+        }
+
+        pub fn slot_state(&self, id: SlotId) -> Option<SlotState> {
+            self.buffer_pool.as_ref()?.slot_state(id)
+        }
+
+        pub fn shutdown(mut self) -> Result<()> {
+            self.shutdown_inner()
+        }
+
+        /// Compatibility alias retained from M0.
+        pub fn close(self) -> Result<()> {
+            self.shutdown()
+        }
+
+        fn shutdown_inner(&mut self) -> Result<()> {
+            if self.poisoned {
+                return Err(Error::Shutdown {
+                    failures: vec!["a previous shutdown attempt left native state uncertain".into()],
+                });
+            }
+            self.accepting = false;
+            let mut failures = Vec::new();
+
+            if let Some(mut pool) = self.buffer_pool.take() {
+                pool.stop();
+                if let Err(error) = pool.close() {
+                    failures.push(error.to_string());
                 }
-                Err(error) => {
-                    // A failed close leaves liburma's process state uncertain. Keep
-                    // the guard active so this process cannot initialize it again.
-                    Err(map_ffi_error("runtime_close", error))
+            }
+            if let Some(mut recv_jfc) = self.recv_jfc.take() {
+                if let Err(error) = recv_jfc.close() {
+                    failures.push(error.to_string());
                 }
+            }
+            if let Some(mut send_jfc) = self.send_jfc.take() {
+                if let Err(error) = send_jfc.close() {
+                    failures.push(error.to_string());
+                }
+            }
+            if let Some(mut native) = self.native.take() {
+                if let Err(error) = native.close() {
+                    failures.push(map_ffi_error("runtime_close", error).to_string());
+                }
+            }
+
+            if failures.is_empty() {
+                ACTIVE.store(false, Ordering::Release);
+                Ok(())
+            } else {
+                // Native state is uncertain; keep the process guard active.
+                self.poisoned = true;
+                Err(Error::Shutdown { failures })
             }
         }
     }
 
     impl Drop for UrmaRuntime {
         fn drop(&mut self) {
-            let _ = self.close_inner();
+            if !self.poisoned {
+                let _ = self.shutdown_inner();
+            }
+        }
+    }
+
+    fn validate_config(config: &RuntimeConfig, capability: &UrmaDeviceCapability) -> Result<()> {
+        config.buffer_pool.total_len()?;
+        if capability.max_jfc < 2 {
+            return Err(Error::InvalidConfiguration(
+                "device reports fewer than two available JFC resources".into(),
+            ));
+        }
+        for (name, depth) in [
+            ("send_jfc_depth", config.send_jfc_depth),
+            ("recv_jfc_depth", config.recv_jfc_depth),
+        ] {
+            if depth == 0 || depth > capability.max_jfc_depth {
+                return Err(Error::InvalidConfiguration(format!(
+                    "{name}={depth} is outside 1..={}",
+                    capability.max_jfc_depth
+                )));
+            }
+        }
+        let slot_size = u64::try_from(config.buffer_pool.slot_size)
+            .map_err(|_| Error::InvalidConfiguration("slot_size does not fit u64".into()))?;
+        if slot_size > capability.max_msg_size {
+            return Err(Error::InvalidConfiguration(format!(
+                "slot_size={slot_size} exceeds max_msg_size={}",
+                capability.max_msg_size
+            )));
+        }
+        // TODO(M1-verify): decode page_size_cap for the target provider before
+        // enforcing that the configured alignment is advertised.
+        Ok(())
+    }
+
+    fn rollback_startup(
+        primary: Error,
+        mut buffer_pool: Option<UrmaBufferPool>,
+        mut recv_jfc: Option<UrmaJfc>,
+        mut send_jfc: Option<UrmaJfc>,
+        mut native: Option<ffi::NativeRuntime>,
+    ) -> Error {
+        let mut cleanup_failures = Vec::new();
+        if let Some(pool) = buffer_pool.as_mut() {
+            if let Err(error) = pool.close() {
+                cleanup_failures.push(error.to_string());
+            }
+        }
+        if let Some(jfc) = recv_jfc.as_mut() {
+            if let Err(error) = jfc.close() {
+                cleanup_failures.push(error.to_string());
+            }
+        }
+        if let Some(jfc) = send_jfc.as_mut() {
+            if let Err(error) = jfc.close() {
+                cleanup_failures.push(error.to_string());
+            }
+        }
+        if let Some(runtime) = native.as_mut() {
+            if let Err(error) = runtime.close() {
+                cleanup_failures.push(map_ffi_error("runtime_close", error).to_string());
+            }
+        }
+        if cleanup_failures.is_empty() {
+            primary
+        } else {
+            Error::StartupRollback {
+                primary: Box::new(primary),
+                cleanup_failures,
+            }
+        }
+    }
+
+    fn from_ffi_capability(raw: ffi::DeviceCapability) -> UrmaDeviceCapability {
+        UrmaDeviceCapability {
+            device_name: raw.device_name,
+            transport_type: raw.transport_type,
+            selected_eid_index: raw.selected_eid_index,
+            eids: raw
+                .eids
+                .into_iter()
+                .map(|eid| DeviceEid {
+                    index: eid.index,
+                    bytes: eid.bytes,
+                })
+                .collect(),
+            max_jfc: raw.max_jfc,
+            max_jfs: raw.max_jfs,
+            max_jfr: raw.max_jfr,
+            max_jetty: raw.max_jetty,
+            max_jfc_depth: raw.max_jfc_depth,
+            max_jfs_depth: raw.max_jfs_depth,
+            max_jfr_depth: raw.max_jfr_depth,
+            max_jfs_inline_len: raw.max_jfs_inline_len,
+            max_jfs_sge: raw.max_jfs_sge,
+            max_jfs_rsge: raw.max_jfs_rsge,
+            max_jfr_sge: raw.max_jfr_sge,
+            max_msg_size: raw.max_msg_size,
+            transport_modes: raw.transport_modes,
+            page_size_cap: raw.page_size_cap,
         }
     }
 
     fn map_ffi_error(operation: &'static str, error: ffi::FfiError) -> Error {
         match error {
+            ffi::FfiError::Contract(detail) => Error::FfiContract { operation, detail },
             ffi::FfiError::NullHandle => Error::NullHandle { operation },
             ffi::FfiError::Status(status) => Error::Native { operation, status },
         }
@@ -149,12 +429,20 @@ mod native {
     }
 
     impl UrmaRuntime {
-        pub fn open(_config: RuntimeConfig) -> Result<Self> {
+        pub fn start(_config: RuntimeConfig) -> Result<Self> {
             Err(Error::FeatureDisabled)
         }
 
-        pub fn close(self) -> Result<()> {
+        pub fn open(config: RuntimeConfig) -> Result<Self> {
+            Self::start(config)
+        }
+
+        pub fn shutdown(self) -> Result<()> {
             Ok(())
+        }
+
+        pub fn close(self) -> Result<()> {
+            self.shutdown()
         }
     }
 }
@@ -166,16 +454,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_config_keeps_device_selection() {
+    fn runtime_config_keeps_device_selection_and_m1_defaults() {
         let config = RuntimeConfig::new("urma0", 2);
         assert_eq!(config.device_name, "urma0");
         assert_eq!(config.eid_index, 2);
+        assert_eq!(config.send_jfc_depth, 64);
+        assert_eq!(config.recv_jfc_depth, 64);
+        assert_eq!(config.buffer_pool, BufferPoolConfig::default());
     }
 
     #[cfg(not(feature = "urma"))]
     #[test]
-    fn feature_off_reports_clear_error() {
-        let error = UrmaRuntime::open(RuntimeConfig::new("urma0", 0)).err();
+    fn feature_off_reports_clear_error_without_umdk() {
+        let error = UrmaRuntime::start(RuntimeConfig::new("urma0", 0)).err();
         assert_eq!(error, Some(Error::FeatureDisabled));
         assert_eq!(abi_baseline(), Err(Error::FeatureDisabled));
     }
@@ -184,7 +475,7 @@ mod tests {
     #[test]
     fn abi_baseline_matches_verified_m0_contract() {
         let baseline = abi_baseline().expect("C shim must return its ABI baseline");
-        assert_eq!(baseline.shim_abi_version, 1);
+        assert_eq!(baseline.shim_abi_version, 2);
         assert_eq!(baseline.pointer_size as usize, std::mem::size_of::<usize>());
         assert_eq!(baseline.status_size as usize, std::mem::size_of::<i32>());
         assert_eq!(baseline.success_value, 0);
@@ -193,4 +484,5 @@ mod tests {
         assert!(baseline.device_size > 0);
         assert!(baseline.context_size > 0);
     }
+
 }

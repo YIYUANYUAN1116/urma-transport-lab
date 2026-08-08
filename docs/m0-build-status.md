@@ -1,5 +1,8 @@
 # M0 Build & ABI Baseline 状态
 
+> 本文是 M0 完成时的基线记录。仓库已继续进入 M1；当前代码状态以
+> `docs/current-status.md` 为准。
+
 ## 结论
 
 M0 代码已完成到“可在目标 Linux + UMDK 开发环境执行验证”的状态：Cargo
@@ -75,8 +78,9 @@ urma_status_t urma_delete_context(urma_context_t *ctx);
 ### FFI 与 unsafe 边界
 
 - `wrapper.h` 同时包含 UMDK public `urma_api.h` 和 lab-owned `shim.h`。
-- bindgen 只生成已确认的五个 M0 liburma 函数和 `urma_lab_*`；
-  `urma_device`、`urma_context` 为 opaque。
+- M0 完成时 bindgen 只生成五个 environment/device/context 函数；M1 已在
+  同一边界加入 query/JFC/local Segment 五个已核实入口。所有 native handle
+  和复杂配置结构仍为 opaque，并只经 `urma_lab_*` shim 使用。
 - C shim 持有 `urma_device_t *` 和 `urma_context_t *`，复杂 UMDK 类型不进入
   runtime/业务代码。
 - `src/ffi/mod.rs` 是唯一 raw binding/unsafe 调用位置，对上仅提供安全的

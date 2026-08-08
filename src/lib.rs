@@ -6,10 +6,16 @@
 mod error;
 #[cfg(feature = "urma")]
 mod ffi;
+pub mod buffer;
+#[cfg(feature = "urma")]
+mod jfc;
 pub mod runtime;
 
+pub use buffer::{BufferPoolConfig, SlotId, SlotKind, SlotState};
 pub use error::{Error, Result};
-pub use runtime::{abi_baseline, AbiBaseline, RuntimeConfig, UrmaRuntime};
+pub use runtime::{
+    abi_baseline, AbiBaseline, DeviceEid, RuntimeConfig, UrmaDeviceCapability, UrmaRuntime,
+};
 
 /// Data-plane milestones deliberately left unimplemented in the skeleton.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

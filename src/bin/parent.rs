@@ -12,7 +12,13 @@ fn run(role: &str) {
     }
     match UrmaRuntime::open(config) {
         Ok(runtime) => {
-            println!("{role}: liburma device/context ready; Jetty/OOB/data path are Phase 0 TODOs");
+            println!("{role}: M1 capability: {:?}", runtime.capability());
+            println!(
+                "{role}: JFC depths {:?}, registered memory {:?}",
+                runtime.jfc_depths(),
+                runtime.registered_memory_layout()
+            );
+            println!("{role}: M1 ready; Jetty/OOB/data path remain TODOs");
             if let Err(error) = runtime.close() {
                 eprintln!("{role}: shutdown failed: {error}");
                 std::process::exit(1);

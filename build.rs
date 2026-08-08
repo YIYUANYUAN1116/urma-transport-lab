@@ -61,12 +61,14 @@ fn build_urma() {
         .header("src/ffi/wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
         .allowlist_function(
-            "^urma_(init|uninit|get_device_by_name|create_context|delete_context)$",
+            "^urma_(init|uninit|get_device_by_name|create_context|delete_context|query_device|create_jfc|delete_jfc|register_seg|unregister_seg)$",
         )
         .allowlist_function("^urma_lab_.*")
-        .allowlist_type("^urma_(init_attr|device|context|lab_.*)(_t)?$")
+        .allowlist_type(
+            "^urma_(init_attr|device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg|lab_.*)(_t)?$",
+        )
         .allowlist_var("^URMA_(SUCCESS|LAB_.*)$")
-        .opaque_type("^urma_(device|context)$")
+        .opaque_type("^urma_(device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg)$")
         .derive_debug(false)
         .derive_default(false)
         .layout_tests(true)

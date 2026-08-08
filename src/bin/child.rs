@@ -8,7 +8,13 @@ fn main() {
     }
     match UrmaRuntime::open(config) {
         Ok(runtime) => {
-            println!("child: liburma device/context ready; Jetty/OOB/data path are Phase 0 TODOs");
+            println!("child: M1 capability: {:?}", runtime.capability());
+            println!(
+                "child: JFC depths {:?}, registered memory {:?}",
+                runtime.jfc_depths(),
+                runtime.registered_memory_layout()
+            );
+            println!("child: M1 ready; Jetty/OOB/data path remain TODOs");
             if let Err(error) = runtime.close() {
                 eprintln!("child: shutdown failed: {error}");
                 std::process::exit(1);
