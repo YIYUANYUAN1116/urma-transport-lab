@@ -23,7 +23,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if rounds == 0 {
         return Err("rounds must be non-zero".into());
     }
-    let mut runtime = UrmaRuntime::start(RuntimeConfig::new(device, 0))?;
+    let mut runtime : UrmaRuntime= UrmaRuntime::start(RuntimeConfig::new(device, 0))?;
     eprintln!("child: ContextReady");
     let mut connection = runtime.create_connection(JettyConfig::default())?;
 
