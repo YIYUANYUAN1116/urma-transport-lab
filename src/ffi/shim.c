@@ -34,6 +34,7 @@ struct urma_lab_segment {
 
 struct urma_lab_jetty {
     urma_lab_runtime_t *runtime;
+    urma_jfr_t *jfr;
     urma_jetty_t *jetty;
     urma_target_jetty_t *target;
     int bound;
@@ -404,15 +405,26 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
     jfr_cfg.jfc = recv_jfc->jfc;
     jfr_cfg.token_value.token = config->token;
 
+    errno = 0;
+    jetty->jfr = urma_create_jfr(runtime->context, &jfr_cfg);
+    if (jetty->jfr == NULL) {
+        int error = urma_lab_pointer_error(-EIO);
+        free(jetty);
+        return error;
+    }
+
     jetty_cfg.flag.value = 0;
-    jetty_cfg.flag.bs.share_jfr = URMA_NO_SHARE_JFR;
+    jetty_cfg.flag.bs.share_jfr = URMA_SHARE_JFR;
     jetty_cfg.jfs_cfg = jfs_cfg;
-    jetty_cfg.jfr_cfg = &jfr_cfg;
+    jetty_cfg.shared.jfr = jetty->jfr;
+    jetty_cfg.shared.jfc = recv_jfc->jfc;
 
     errno = 0;
     jetty->jetty = urma_create_jetty(runtime->context, &jetty_cfg);
     if (jetty->jetty == NULL) {
         int error = urma_lab_pointer_error(-EIO);
+        (void)urma_delete_jfr(jetty->jfr);
+        jetty->jfr = NULL;
         free(jetty);
         return error;
     }
@@ -450,10 +462,7 @@ int urma_lab_jetty_export_descriptor(urma_lab_jetty_t *jetty,
         return -ENOMEM;
     }
 
-    /*
-     * TODO(M2-verify): validate get_rjetty for non-shared JFR on the target
-     * provider. The baseline API is used as designed; Rust never reads it.
-     */
+    /* The public API requires the shared JFR owned by this Jetty wrapper. */
     status = urma_get_rjetty(jetty->jetty, &descriptor->rjetty,
                              &descriptor->length);
     if (status != URMA_SUCCESS) {
@@ -610,7 +619,8 @@ int urma_lab_jetty_delete(urma_lab_jetty_t *jetty)
     urma_status_t status;
     urma_lab_runtime_t *runtime;
 
-    if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL) {
+    if (jetty == NULL || jetty->runtime == NULL ||
+        (jetty->jetty == NULL && jetty->jfr == NULL)) {
         return -EINVAL;
     }
     if (jetty->bound != 0 || jetty->target != NULL ||
@@ -618,14 +628,23 @@ int urma_lab_jetty_delete(urma_lab_jetty_t *jetty)
         return -EBUSY;
     }
     runtime = jetty->runtime;
-    status = urma_delete_jetty(jetty->jetty);
-    if (status != URMA_SUCCESS) {
-        return (int)status;
+    if (jetty->jetty != NULL) {
+        status = urma_delete_jetty(jetty->jetty);
+        if (status != URMA_SUCCESS) {
+            return (int)status;
+        }
+        jetty->jetty = NULL;
+    }
+    if (jetty->jfr != NULL) {
+        status = urma_delete_jfr(jetty->jfr);
+        if (status != URMA_SUCCESS) {
+            return (int)status;
+        }
+        jetty->jfr = NULL;
     }
     if (runtime->jetty_count > 0) {
         runtime->jetty_count--;
     }
-    jetty->jetty = NULL;
     free(jetty);
     return 0;
 }

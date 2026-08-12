@@ -57,14 +57,14 @@ fn build_urma() {
         .header("src/ffi/wrapper.h")
         .clang_arg(format!("-I{}", include_dir.display()))
         .allowlist_function(
-            "^urma_(init|uninit|get_device_by_name|create_context|delete_context|query_device|create_jfc|delete_jfc|register_seg|unregister_seg|create_jetty|modify_jetty|delete_jetty|get_rjetty|put_rjetty|import_jetty|unimport_jetty|bind_jetty|unbind_jetty|post_jetty_send_wr|post_jetty_recv_wr|poll_jfc)$",
+            "^urma_(init|uninit|get_device_by_name|create_context|delete_context|query_device|create_jfc|delete_jfc|create_jfr|delete_jfr|register_seg|unregister_seg|create_jetty|modify_jetty|delete_jetty|get_rjetty|put_rjetty|import_jetty|unimport_jetty|bind_jetty|unbind_jetty|post_jetty_send_wr|post_jetty_recv_wr|poll_jfc)$",
         )
         .allowlist_function("^urma_lab_.*")
         .allowlist_type(
-            "^urma_(init_attr|device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg|jetty|jetty_cfg|jetty_attr|rjetty|target_jetty|sge|jfs_wr|jfr_wr|cr|lab_.*)(_t)?$",
+            "^urma_(init_attr|device|context|device_attr|jfc|jfc_cfg|jfr|jfr_cfg|seg_cfg|target_seg|jetty|jetty_cfg|jetty_attr|rjetty|target_jetty|sge|jfs_wr|jfr_wr|cr|lab_.*)(_t)?$",
         )
         .allowlist_var("^URMA_(SUCCESS|LAB_.*)$")
-        .opaque_type("^urma_(device|context|device_attr|jfc|jfc_cfg|seg_cfg|target_seg|jetty|jetty_cfg|jetty_attr|rjetty|target_jetty|sge|jfs_wr|jfr_wr|cr)$")
+        .opaque_type("^urma_(device|context|device_attr|jfc|jfc_cfg|jfr|jfr_cfg|seg_cfg|target_seg|jetty|jetty_cfg|jetty_attr|rjetty|target_jetty|sge|jfs_wr|jfr_wr|cr)$")
         .derive_debug(false)
         .derive_default(false)
         .layout_tests(true)

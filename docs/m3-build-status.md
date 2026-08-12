@@ -101,7 +101,7 @@ feature-off 单元测试覆盖：
 ## 当前未验证
 
 1. 目标 provider 是否支持对称 RC bind，以及 M3 OOB v2 的两端 descriptor import；
-2. non-shared JFR 的 `urma_get_rjetty` 行为；
+2. shared JFR 的真实 provider 创建、收包和销毁行为；
 3. provider 在 post 返回后是否复制 WR/SGE。当前实现按更保守假设一直保留到 CQE；
 4. send/recv CR 的 `flag.bs.s_r`、`flag.bs.jetty`、recv opcode 与 `completion_len` 实际值；
 5. `urma_poll_jfc` 空 poll、负错误值和单次最多 16 条的 provider 行为；

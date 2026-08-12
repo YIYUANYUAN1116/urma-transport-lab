@@ -120,7 +120,7 @@ int urma_lab_segment_write(urma_lab_segment_t *segment, uint64_t offset,
 int urma_lab_segment_read(const urma_lab_segment_t *segment, uint64_t offset,
                           uint8_t *out, uint32_t length);
 
-/* Creates one RC duplex Jetty with an embedded, non-shared JFR. */
+/* Creates one RC duplex Jetty backed by an owned shared JFR. */
 int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
                           urma_lab_jfc_t *send_jfc,
                           urma_lab_jfc_t *recv_jfc,

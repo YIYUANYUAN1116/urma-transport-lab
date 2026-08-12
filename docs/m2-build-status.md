@@ -11,7 +11,7 @@ M0 与 M1 保持完成状态。M2 已实现到“可在真实 Linux + UMDK provi
 - `build.rs` allowlist 增加经 UMDK public header 核对的 Jetty create/modify/delete、descriptor get/put、import/unimport、bind/unbind API。
 - lab shim ABI version 随 M2 native surface 扩展更新为 `3`。
 - `src/ffi/shim.[ch]` 在 C 内构造含 bitfield/union 的 `urma_jetty_cfg_t`；Rust 不初始化或读取该结构。
-- C shim 创建 RC、non-shared JFR 的 duplex Jetty，并持有 local/imported/bound native resource。
+- C shim 先创建独立 JFR，再作为 shared JFR 创建 RC duplex Jetty，并持有 JFR、local/imported/bound native resource。
 - `src/jetty.rs` 提供 descriptor DTO、显式 network-byte-order 编解码、长度/version 校验，以及 crate-private `UrmaJetty` owner。
 - descriptor wire 不直接发送 `urma_rjetty_t`。provider bytes 作为有 64 KiB 上限的 opaque payload；元数据使用固定宽度字段。
 - `src/connection.rs` 实现 `Init/ContextReady/JettyCreated/DescriptorExchanged/Bound/Ready/Failed/Closed` 状态，并且没有 M3 send API。
@@ -38,8 +38,8 @@ M0 与 M1 保持完成状态。M2 已实现到“可在真实 Linux + UMDK provi
 
 需要在真实目标 provider 验证：
 
-1. provider 是否支持 RC duplex Jetty、non-shared JFR、两个 polling-mode JFC 的组合；
-2. 当前 UMDK `urma_get_rjetty` 对 non-shared JFR 的 provider 行为；源码实现存在依赖 shared-JFR 配置路径的风险，代码以 `TODO(M2-verify)` 明确标记；
+1. provider 是否支持 RC duplex Jetty、shared JFR、两个 polling-mode JFC 的组合；
+2. shared JFR 与 Jetty 的创建、descriptor 导出及逆序销毁行为；
 3. opaque descriptor 在 Parent/Child 使用相同 provider 与兼容 UMDK 小版本时能否成功 import；
 4. token `0` 仅是 lab 静态配置，目标 provider 的 token policy/值必须实测；
 5. `urma_bind_jetty` 返回 `URMA_EEXIST` 时按 public API 文档作为已绑定处理是否符合目标 provider；

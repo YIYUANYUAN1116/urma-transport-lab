@@ -137,7 +137,7 @@ TX/RX slot。它们只是便于调试的起点，必须在 device capability 校
 ### M2：duplex Jetty 与静态 OOB
 
 1. 用 C shim 从无 bitfield DTO 构造 `urma_jetty_cfg_t`：`URMA_TM_RC`、
-   non-shared JFR、分别引用 send/recv JFC。
+   shared JFR、分别引用 send/recv JFC。
 2. Parent 创建并导出本地 `urma_rjetty_t` 的稳定 wire representation；
    Child 同样创建本地 Jetty，但只 import/bind Parent descriptor。
 3. 定义独立 OOB frame：固定 magic、u16 version、message kind、payload
@@ -204,7 +204,7 @@ runtime 或 Dragonfly 依赖。
 
 - 目标节点的 `liburma.so` 是否仅靠 `-lurma` 即可解析
   `urma_common/dl/rt`，以及 provider/config 的最终部署路径；
-- provider 对 RC duplex Jetty、non-shared JFR、无 JFCE polling 的支持矩阵；
+- provider 对 RC duplex Jetty、shared JFR、无 JFCE polling 的支持矩阵；
 - `urma_get_rjetty` descriptor 的跨进程、跨 provider 小版本兼容边界；
 - token 的安全 provision 方式，以及 bind 的主动/被动语义和
   `URMA_EEXIST` 重试策略；
