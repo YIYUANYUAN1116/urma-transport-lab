@@ -10,12 +10,12 @@ fn parent_child_urma_ping_pong() {
     let device = std::env::var("URMA_TEST_DEVICE").unwrap_or_else(|_| "urma0".into());
     let address = "127.0.0.1:31909";
     let mut parent = Command::new(env!("CARGO_BIN_EXE_parent"))
-        .args([&device, address])
+        .args([&device, address, "--ping-pong"])
         .spawn()
         .expect("start parent");
     thread::sleep(Duration::from_millis(500));
     let child = Command::new(env!("CARGO_BIN_EXE_child"))
-        .args([&device, address])
+        .args([&device, address, "--ping-pong"])
         .status()
         .expect("run child");
     assert!(child.success());
@@ -28,12 +28,12 @@ fn parent_child_urma_ping_pong_one_hundred_rounds() {
     let device = std::env::var("URMA_TEST_DEVICE").unwrap_or_else(|_| "urma0".into());
     let address = "127.0.0.1:31910";
     let mut parent = Command::new(env!("CARGO_BIN_EXE_parent"))
-        .args([&device, address, "100"])
+        .args([&device, address, "--ping-pong", "100"])
         .spawn()
         .expect("start parent");
     thread::sleep(Duration::from_millis(500));
     let child = Command::new(env!("CARGO_BIN_EXE_child"))
-        .args([&device, address, "100"])
+        .args([&device, address, "--ping-pong", "100"])
         .status()
         .expect("run child");
     assert!(child.success());

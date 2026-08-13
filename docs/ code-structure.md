@@ -77,3 +77,81 @@ CompletionEvent
 
 Dragonfly未来接入点
 ```
+
+# M4
+
+```text
+Child                              Parent
+
+post_recv      ← handshake
+   |
+   |              post_send(Request)
+   |=============================>
+
+Parent recv CQE(Request)
+
+
+Child post_recv ← handshake 已有
+                              post_send(Metadata)
+      <=============================
+
+recv CQE(Metadata)
+copy
+release RX
+post_recv          ← 为 Data0 准备
+
+
+                              post_send(Data0)
+      <=============================
+
+recv CQE(Data0)
+copy
+release RX
+post_recv          ← 为 Data1 准备
+
+
+                              post_send(Data1)
+      <=============================
+
+recv CQE(Data1)
+copy
+release RX
+post_recv          ← 为 End 准备
+
+
+                              post_send(End)
+      <=============================
+
+recv CQE(End)
+copy
+release RX
+不再 post_recv
+
+```
+
+```text
+                 ┌───────────────┐
+                 │ AwaitMetadata │
+                 └───────┬───────┘
+                         │ Metadata
+                         v
+                 ┌───────────────┐
+                 │   Receiving   │
+                 └───────┬───────┘
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+           Data                     End
+             │                       │
+             v                       v
+ sequence / length check       chunk count
+ write file                    length
+ SHA256 update                 digest
+ received += len               verify
+ seq++                         │
+             │                 v
+             └────────> ┌──────────┐
+                        │ Complete │
+                        └──────────┘
+
+```

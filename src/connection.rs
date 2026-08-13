@@ -28,7 +28,7 @@ mod native {
         wr::{OperationType, ReceiveCredit, WrToken},
         JettyDescriptor, SlotKind, UrmaDeviceCapability,
     };
-    use std::{thread, time::Duration};
+    use std::{collections::VecDeque, thread, time::Duration};
 
     /// M2 control-plane owner. It intentionally exposes no data-plane API.
     pub struct UrmaConnection<'runtime> {
@@ -40,6 +40,7 @@ mod native {
         recv_jfc: &'runtime ffi::JfcHandle,
         poller: CompletionPoller,
         receive_credit: ReceiveCredit,
+        pending_messages: VecDeque<Message>,
     }
 
     impl<'runtime> UrmaConnection<'runtime> {
@@ -61,6 +62,7 @@ mod native {
                 recv_jfc,
                 poller: CompletionPoller::new(connection_id, generation, 16)?,
                 receive_credit: ReceiveCredit::default(),
+                pending_messages: VecDeque::new(),
             };
             connection.transition(ConnectionState::JettyCreated);
             Ok(connection)
@@ -210,21 +212,15 @@ mod native {
 
         pub fn wait_for_message(&mut self, timeout: Duration) -> Result<Message> {
             let deadline = deadline_after(timeout);
-            let mut received = None;
             loop {
                 check_deadline(deadline, "wait_for_message")?;
                 for event in self.poll_once()? {
                     if let CompletionEvent::RecvCompleted { bytes, .. } = event {
-                        if received.is_some() {
-                            return Err(Error::Protocol(
-                                "multiple messages completed while waiting for one".into(),
-                            ));
-                        }
-                        received = Some(Message::decode(&bytes)?);
+                        self.pending_messages.push_back(Message::decode(&bytes)?);
                     }
                 }
-                if received.is_some() && self.poller.outstanding_send() == 0 {
-                    return Ok(received.expect("checked above"));
+                if !self.pending_messages.is_empty() && self.poller.outstanding_send() == 0 {
+                    return Ok(self.pending_messages.pop_front().expect("checked above"));
                 }
                 thread::yield_now();
             }

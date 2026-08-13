@@ -12,6 +12,7 @@ default = []
 urma = ["dep:bindgen", "dep:cc"]
 
 [dependencies]
+sha2 = "0.10.9"
 
 [build-dependencies]
 bindgen = { version = "0.72.1", optional = true }

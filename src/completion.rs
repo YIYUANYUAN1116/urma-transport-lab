@@ -171,6 +171,7 @@ mod native {
                     pool.complete_send(token.slot)?;
                     pool.release(token.slot)?;
                     self.stats.send_cqe += 1;
+                    eprintln!("CQE send slot={} status=0", token.slot.index());
                     Ok(CompletionEvent::SendCompleted { slot: token.slot })
                 }
                 OperationType::Recv => {
@@ -188,6 +189,11 @@ mod native {
                     let bytes = pool.complete_recv(token.slot, record.completion_len)?;
                     pool.release(token.slot)?;
                     self.stats.recv_cqe += 1;
+                    eprintln!(
+                        "CQE recv slot={} status=0 length={}",
+                        token.slot.index(),
+                        bytes.len()
+                    );
                     Ok(CompletionEvent::RecvCompleted {
                         slot: token.slot,
                         bytes,

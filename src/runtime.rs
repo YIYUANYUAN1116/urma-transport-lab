@@ -146,7 +146,7 @@ mod native {
         fn start_inner(config: RuntimeConfig) -> Result<Self> {
             let device =
                 CString::new(config.device_name.as_str()).map_err(|_| Error::InvalidDeviceName)?;
-            let mut native:NativeRuntime = ffi::NativeRuntime::open(&device, config.eid_index)
+            let mut native: NativeRuntime = ffi::NativeRuntime::open(&device, config.eid_index)
                 .map_err(|error| map_ffi_error("runtime_open", error))?;
 
             let capability = match native.query_device() {
