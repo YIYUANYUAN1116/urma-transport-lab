@@ -1,7 +1,14 @@
-use std::str::FromStr;
+use std::{path::PathBuf, str::FromStr};
 use urma_transport_lab::{
-    BenchmarkCase, BenchmarkScenario, BenchmarkTransport, FileCompletionPolicy, TimingMode,
+    run_tcp_child, run_tcp_parent, BenchmarkCase, BenchmarkScenario, BenchmarkTransport,
+    FileCompletionPolicy, FileSource, MemorySource, TcpBenchmarkDestination, TcpBenchmarkSource,
+    TimingMode,
 };
+
+enum Role {
+    Parent,
+    Child,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -12,7 +19,8 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut dry_run = false;
-    let mut case_id = String::from("b0-dry-run");
+    let mut role = None;
+    let mut case_id = String::from("benchmark-case");
     let mut repeat = 1u32;
     let mut scenario = BenchmarkScenario::Memory;
     let mut transport = BenchmarkTransport::TcpUserspace;
@@ -22,11 +30,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut timing_mode = TimingMode::SteadyState;
     let mut completion_policy = FileCompletionPolicy::Buffered;
     let mut data_seed = 0u64;
+    let mut listen = String::from("127.0.0.1:19091");
+    let mut parent = String::from("127.0.0.1:19091");
+    let mut input = None;
+    let mut output = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--dry-run" => dry_run = true,
+            "--role" => {
+                role = Some(match required_value(&mut args, "--role")?.as_str() {
+                    "parent" => Role::Parent,
+                    "child" => Role::Child,
+                    value => return Err(format!("invalid --role {value:?}").into()),
+                })
+            }
             "--case-id" => case_id = required_value(&mut args, "--case-id")?,
             "--repeat" => repeat = parse_value(&mut args, "--repeat")?,
             "--scenario" => {
@@ -49,16 +68,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?)?
             }
             "--seed" => data_seed = parse_value(&mut args, "--seed")?,
+            "--listen" => listen = required_value(&mut args, "--listen")?,
+            "--parent" => parent = required_value(&mut args, "--parent")?,
+            "--input" => input = Some(PathBuf::from(required_value(&mut args, "--input")?)),
+            "--output" => output = Some(PathBuf::from(required_value(&mut args, "--output")?)),
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
             }
             _ => return Err(format!("unknown argument {argument:?}; use --help").into()),
         }
-    }
-
-    if !dry_run {
-        return Err("B0 only supports --dry-run; no transport data path is implemented".into());
     }
 
     let case = BenchmarkCase::new(
@@ -73,7 +92,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         completion_policy,
         data_seed,
     )?;
-    println!("{}", case.to_json_line());
+    if dry_run {
+        println!("{}", case.to_json_line());
+        return Ok(());
+    }
+
+    let result = match role.ok_or("TCP benchmark requires --role parent or --role child")? {
+        Role::Parent => {
+            let source = match case.scenario {
+                BenchmarkScenario::Memory => TcpBenchmarkSource::Memory(MemorySource::generate(
+                    case.transfer_bytes,
+                    case.data_seed,
+                )?),
+                BenchmarkScenario::File => {
+                    let path = input.ok_or("file Parent requires --input PATH")?;
+                    TcpBenchmarkSource::File(FileSource::from_path(path)?)
+                }
+            };
+            eprintln!("benchmark parent: listening on {listen}");
+            run_tcp_parent(&case, &listen, source)?
+        }
+        Role::Child => {
+            let destination = match case.scenario {
+                BenchmarkScenario::Memory => TcpBenchmarkDestination::Memory,
+                BenchmarkScenario::File => TcpBenchmarkDestination::File(
+                    output.ok_or("file Child requires --output PATH")?,
+                ),
+            };
+            eprintln!("benchmark child: connecting to {parent}");
+            run_tcp_child(&case, &parent, destination)?
+        }
+    };
+    println!("{}", result.to_json_line());
     Ok(())
 }
 
@@ -101,13 +151,13 @@ where
 
 fn print_usage() {
     println!(
-        "usage: benchmark --dry-run [OPTIONS]\n\
+        "usage: benchmark [--dry-run | --role parent|child] [OPTIONS]\n\
          \n\
-         B0 validates and prints one benchmark case as single-line JSON.\n\
-         It does not perform network or URMA transport.\n\
+         B1 runs one blocking-TCP case or validates it with --dry-run.\n\
          \n\
          OPTIONS:\n\
-           --case-id ID                  default: b0-dry-run\n\
+           --role parent|child\n\
+           --case-id ID                  default: benchmark-case\n\
            --repeat N                    default: 1\n\
            --scenario memory|file        default: memory\n\
            --transport tcp-userspace|tcp-sendfile|urma\n\
@@ -119,6 +169,10 @@ fn print_usage() {
                                          default: steady-state\n\
            --completion-policy buffered|durable\n\
                                          default: buffered\n\
-           --seed N                      default: 0"
+           --seed N                      default: 0\n\
+           --listen ADDRESS              Parent bind address, default: 127.0.0.1:19091\n\
+           --parent ADDRESS              Child target address, default: 127.0.0.1:19091\n\
+           --input PATH                  required for file Parent\n\
+           --output PATH                 required for file Child"
     );
 }

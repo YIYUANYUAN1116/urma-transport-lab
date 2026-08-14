@@ -17,6 +17,7 @@ mod jfc;
 pub mod message;
 pub mod oob;
 pub mod runtime;
+pub mod tcp_benchmark;
 pub mod transfer;
 pub mod wr;
 
@@ -39,6 +40,9 @@ pub use message::{
 };
 pub use runtime::{
     abi_baseline, AbiBaseline, DeviceEid, RuntimeConfig, UrmaDeviceCapability, UrmaRuntime,
+};
+pub use tcp_benchmark::{
+    run_tcp_child, run_tcp_parent, TcpBenchmarkDestination, TcpBenchmarkSource, TcpTransportStats,
 };
 pub use transfer::{digest_reader, hex_digest, ReceiveState, TransferSummary};
 

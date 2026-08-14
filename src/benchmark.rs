@@ -324,6 +324,12 @@ pub struct CpuUsage {
     pub system_us: u64,
 }
 
+impl CpuUsage {
+    pub const fn total_us(self) -> u64 {
+        self.user_us.saturating_add(self.system_us)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BenchmarkResult {
     pub case_id: String,
@@ -804,6 +810,7 @@ fn json_cpu(output: &mut String, cpu: Option<CpuUsage>) {
             output.push('{');
             json_number_field(output, "user_us", cpu.user_us, true);
             json_number_field(output, "system_us", cpu.system_us, false);
+            json_number_field(output, "total_us", cpu.total_us(), false);
             output.push('}');
         }
         None => output.push_str("null"),

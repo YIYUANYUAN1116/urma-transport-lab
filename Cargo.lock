@@ -317,6 +317,7 @@ dependencies = [
  "bindgen",
  "cc",
  "crc32fast",
+ "libc",
  "sha2",
 ]
 
