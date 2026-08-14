@@ -12,6 +12,7 @@ default = []
 urma = ["dep:bindgen", "dep:cc"]
 
 [dependencies]
+crc32fast = "1.5.0"
 sha2 = "0.10.9"
 
 [build-dependencies]

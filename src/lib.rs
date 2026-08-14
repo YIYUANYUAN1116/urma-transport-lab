@@ -6,6 +6,7 @@
 pub mod buffer;
 pub mod completion;
 pub mod connection;
+pub mod digest;
 mod error;
 #[cfg(feature = "urma")]
 mod ffi;
@@ -23,9 +24,13 @@ pub use completion::{CompletionEvent, CompletionStats};
 pub use connection::ConnectionState;
 #[cfg(feature = "urma")]
 pub use connection::UrmaConnection;
+pub use digest::{crc32_bytes, crc32_reader, format_crc32_digest, parse_crc32_digest, Crc32Hasher};
 pub use error::{Error, Result};
 pub use jetty::{JettyConfig, JettyDescriptor, JETTY_DESCRIPTOR_VERSION, MAX_JETTY_DESCRIPTOR_LEN};
-pub use message::{Message, MessageBody, MessageType};
+pub use message::{
+    DigestAlgorithm, DigestDescriptor, IntegrationMessageBodyV3, IntegrationMessageTypeV3,
+    IntegrationMessageV3, Message, MessageBody, MessageType,
+};
 pub use runtime::{
     abi_baseline, AbiBaseline, DeviceEid, RuntimeConfig, UrmaDeviceCapability, UrmaRuntime,
 };
