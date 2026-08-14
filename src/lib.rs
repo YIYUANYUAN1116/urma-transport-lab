@@ -3,6 +3,7 @@
 //! The default build is intentionally hardware independent. Enable `urma` on a
 //! Linux host with UMDK installed to compile and link the native boundary.
 
+pub mod benchmark;
 pub mod buffer;
 pub mod completion;
 pub mod connection;
@@ -19,6 +20,11 @@ pub mod runtime;
 pub mod transfer;
 pub mod wr;
 
+pub use benchmark::{
+    BenchmarkCase, BenchmarkResult, BenchmarkScenario, BenchmarkSink, BenchmarkTimer,
+    BenchmarkTransport, CpuUsage, FileCompletionPolicy, FileSink, FileSource, IntegrityResult,
+    MemorySink, MemorySource, TimingMode, TimingSample,
+};
 pub use buffer::{BufferPoolConfig, SlotId, SlotKind, SlotState};
 pub use completion::{CompletionEvent, CompletionStats};
 pub use connection::ConnectionState;
