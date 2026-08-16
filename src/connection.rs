@@ -40,7 +40,7 @@ mod native {
         recv_jfc: &'runtime ffi::JfcHandle,
         poller: CompletionPoller,
         receive_credit: ReceiveCredit,
-        pending_messages: VecDeque<Message>,
+        pending_frames: VecDeque<Vec<u8>>,
     }
 
     impl<'runtime> UrmaConnection<'runtime> {
@@ -62,7 +62,7 @@ mod native {
                 recv_jfc,
                 poller: CompletionPoller::new(connection_id, generation, 16)?,
                 receive_credit: ReceiveCredit::default(),
-                pending_messages: VecDeque::new(),
+                pending_frames: VecDeque::new(),
             };
             connection.transition(ConnectionState::JettyCreated);
             Ok(connection)
@@ -154,14 +154,18 @@ mod native {
         }
 
         pub fn send(&mut self, message: &Message) -> Result<()> {
+            self.send_frame(&message.encode()?)
+        }
+
+        /// Post one encoded message without imposing a completion drain.
+        pub fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
             self.require(ConnectionState::Ready)?;
             self.receive_credit.require_before_send()?;
-            let bytes = message.encode()?;
             let slot = self
                 .buffer_pool
                 .allocate(SlotKind::Tx)
                 .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
-            let (offset, length) = match self.buffer_pool.write_tx(slot, &bytes) {
+            let (offset, length) = match self.buffer_pool.write_tx(slot, bytes) {
                 Ok(layout) => layout,
                 Err(error) => {
                     self.buffer_pool.release(slot)?;
@@ -211,16 +215,20 @@ mod native {
         }
 
         pub fn wait_for_message(&mut self, timeout: Duration) -> Result<Message> {
+            Message::decode(&self.wait_for_frame(timeout)?)
+        }
+
+        pub fn wait_for_frame(&mut self, timeout: Duration) -> Result<Vec<u8>> {
             let deadline = deadline_after(timeout);
             loop {
-                check_deadline(deadline, "wait_for_message")?;
+                check_deadline(deadline, "wait_for_frame")?;
                 for event in self.poll_once()? {
                     if let CompletionEvent::RecvCompleted { bytes, .. } = event {
-                        self.pending_messages.push_back(Message::decode(&bytes)?);
+                        self.pending_frames.push_back(bytes);
                     }
                 }
-                if !self.pending_messages.is_empty() && self.poller.outstanding_send() == 0 {
-                    return Ok(self.pending_messages.pop_front().expect("checked above"));
+                if !self.pending_frames.is_empty() && self.poller.outstanding_send() == 0 {
+                    return Ok(self.pending_frames.pop_front().expect("checked above"));
                 }
                 thread::yield_now();
             }
@@ -244,6 +252,18 @@ mod native {
 
         pub fn stats(&self) -> CompletionStats {
             self.poller.stats()
+        }
+
+        pub fn outstanding_send(&self) -> usize {
+            self.poller.outstanding_send()
+        }
+
+        pub fn outstanding_recv(&self) -> usize {
+            self.poller.outstanding_recv()
+        }
+
+        pub fn receive_credit(&self) -> usize {
+            self.receive_credit.current()
         }
 
         pub(crate) fn fail(&mut self) {

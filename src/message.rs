@@ -258,15 +258,12 @@ impl IntegrationMessageV3 {
     pub fn encode(&self) -> Result<Vec<u8>> {
         self.validate_common()?;
         let payload = self.encode_payload()?;
-        if payload.len() > MAX_DATA_PAYLOAD_LEN {
-            return Err(Error::Protocol(format!(
-                "integration payload length {} exceeds {MAX_DATA_PAYLOAD_LEN}",
-                payload.len()
-            )));
-        }
         let length = u32::try_from(payload.len())
             .map_err(|_| Error::Protocol("integration payload exceeds u32".into()))?;
-        let mut out = Vec::with_capacity(DATA_HEADER_LEN + payload.len());
+        let frame_len = DATA_HEADER_LEN
+            .checked_add(payload.len())
+            .ok_or_else(|| Error::Protocol("integration frame length overflow".into()))?;
+        let mut out = Vec::with_capacity(frame_len);
         out.extend_from_slice(&DATA_MAGIC.to_be_bytes());
         out.extend_from_slice(&INTEGRATION_VERSION.to_be_bytes());
         out.extend_from_slice(&self.message_type().wire_value().to_be_bytes());
@@ -299,7 +296,10 @@ impl IntegrationMessageV3 {
         let request_id = u64::from_be_bytes(input[8..16].try_into().expect("fixed slice"));
         let sequence = u32::from_be_bytes(input[16..20].try_into().expect("fixed slice"));
         let length = u32::from_be_bytes(input[20..24].try_into().expect("fixed slice")) as usize;
-        if length > MAX_DATA_PAYLOAD_LEN || input.len() != DATA_HEADER_LEN + length {
+        let frame_len = DATA_HEADER_LEN
+            .checked_add(length)
+            .ok_or_else(|| Error::Protocol("integration frame length overflow".into()))?;
+        if input.len() != frame_len {
             return Err(Error::Protocol(format!(
                 "integration payload length {length} disagrees with frame length {}",
                 input.len()
@@ -956,6 +956,14 @@ mod tests {
                 Ok(message)
             );
         }
+    }
+
+    #[test]
+    fn integration_v3_supports_one_mib_data_payload() {
+        let message = IntegrationMessageV3::data(7, 0, vec![0x5a; 1024 * 1024]);
+        let encoded = message.encode().unwrap();
+        assert_eq!(encoded.len(), DATA_HEADER_LEN + 1024 * 1024);
+        assert_eq!(IntegrationMessageV3::decode(&encoded), Ok(message));
     }
 
     #[test]

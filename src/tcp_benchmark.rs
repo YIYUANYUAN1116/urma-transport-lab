@@ -552,6 +552,7 @@ fn send_file_with_sendfile(
 struct CpuSnapshot(CpuUsage);
 
 impl CpuSnapshot {
+    #[cfg(not(windows))]
     fn capture() -> Result<Self> {
         // SAFETY: rusage is plain data initialized before the libc call, and
         // getrusage writes it only for the duration of this call.
@@ -567,6 +568,11 @@ impl CpuSnapshot {
             user_us: timeval_us(usage.ru_utime)?,
             system_us: timeval_us(usage.ru_stime)?,
         }))
+    }
+
+    #[cfg(windows)]
+    fn capture() -> Result<Self> {
+        Ok(Self(CpuUsage::default()))
     }
 
     fn elapsed_since(self, start: Self) -> Result<CpuUsage> {
@@ -585,6 +591,7 @@ impl CpuSnapshot {
     }
 }
 
+#[cfg(not(windows))]
 fn timeval_us(value: libc::timeval) -> Result<u64> {
     let seconds =
         u64::try_from(value.tv_sec).map_err(|_| invalid("process CPU seconds are negative"))?;

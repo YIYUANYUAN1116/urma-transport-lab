@@ -90,6 +90,10 @@ impl ReceiveCredit {
             Ok(())
         }
     }
+
+    pub(crate) fn current(&self) -> usize {
+        self.posted
+    }
 }
 
 #[cfg(test)]

@@ -137,11 +137,15 @@ mod native {
         ) -> Result<Self> {
             let total_len = config.total_len()?;
             let segment = UrmaRegisteredSegment::create(runtime, total_len, config.alignment)?;
-            let mut slots = Vec::with_capacity(config.tx_slot_count + config.rx_slot_count);
+            let slot_count = config
+                .tx_slot_count
+                .checked_add(config.rx_slot_count)
+                .ok_or_else(|| Error::InvalidConfiguration("slot count overflow".into()))?;
+            let mut slots = Vec::with_capacity(slot_count);
             for index in 0..config.tx_slot_count {
                 slots.push(BufferSlot {
                     kind: SlotKind::Tx,
-                    offset: index * config.slot_size,
+                    offset: slot_offset(&config, index)?,
                     len: config.slot_size,
                     state: SlotState::Free,
                 });
@@ -149,7 +153,12 @@ mod native {
             for index in 0..config.rx_slot_count {
                 slots.push(BufferSlot {
                     kind: SlotKind::Rx,
-                    offset: (config.tx_slot_count + index) * config.slot_size,
+                    offset: slot_offset(
+                        &config,
+                        config.tx_slot_count.checked_add(index).ok_or_else(|| {
+                            Error::InvalidConfiguration("slot index overflow".into())
+                        })?,
+                    )?,
                     len: config.slot_size,
                     state: SlotState::Free,
                 });
@@ -363,6 +372,13 @@ mod native {
         }
     }
 
+    fn slot_offset(config: &BufferPoolConfig, index: usize) -> Result<usize> {
+        config
+            .slot_size
+            .checked_mul(index)
+            .ok_or_else(|| Error::InvalidConfiguration("slot offset overflow".into()))
+    }
+
     fn map_ffi_error(operation: &'static str, error: ffi::FfiError) -> Error {
         match error {
             ffi::FfiError::Contract(detail) => Error::FfiContract { operation, detail },
@@ -395,6 +411,20 @@ mod tests {
         let config = BufferPoolConfig {
             slot_size: 0,
             ..BufferPoolConfig::default()
+        };
+        assert!(matches!(
+            config.total_len(),
+            Err(Error::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_registered_pool_size_overflow() {
+        let config = BufferPoolConfig {
+            slot_size: usize::MAX,
+            tx_slot_count: 1,
+            rx_slot_count: 1,
+            alignment: 4096,
         };
         assert!(matches!(
             config.total_len(),

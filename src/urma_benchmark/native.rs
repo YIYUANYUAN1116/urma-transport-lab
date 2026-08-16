@@ -1,0 +1,797 @@
+use super::*;
+use crate::{
+    derive_urma_slot_size,
+    oob::{child_handshake, parent_handshake, OobSession},
+    BenchmarkResult, BenchmarkScenario, BenchmarkTimer, CompletionEvent, CompletionStats, CpuUsage,
+    DigestDescriptor, FileCompletionPolicy, FileSink, FileSource, IntegrityResult, JettyConfig,
+    MemorySink, MemorySource, RuntimeConfig, TimingMode, TimingSample, UrmaConnection, UrmaRuntime,
+};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{self, Read, Write},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
+    path::PathBuf,
+    thread,
+    time::{Duration, Instant},
+};
+
+const REQUEST_ID: u64 = 1;
+const TIMEOUT: Duration = Duration::from_secs(30);
+const CONTROL_MAGIC: u32 = 0x4252_4d41;
+const CONTROL_VERSION: u16 = 1;
+const CONTROL_HEADER_LEN: usize = 12;
+const MAX_CONTROL_PAYLOAD: usize = 4096;
+const READY: u16 = 1;
+const START: u16 = 2;
+const DONE: u16 = 3;
+
+#[derive(Clone, Debug)]
+pub enum UrmaBenchmarkSource {
+    Memory(MemorySource),
+    File(FileSource),
+}
+
+impl UrmaBenchmarkSource {
+    fn validate(&self, case: &BenchmarkCase) -> Result<()> {
+        let (scenario, length) = match self {
+            Self::Memory(source) => (BenchmarkScenario::Memory, source.length()),
+            Self::File(source) => (BenchmarkScenario::File, source.length()),
+        };
+        if scenario != case.scenario || length != case.transfer_bytes {
+            return Err(invalid("URMA source does not match benchmark case"));
+        }
+        Ok(())
+    }
+
+    fn expected_crc32(&self) -> u32 {
+        match self {
+            Self::Memory(source) => source.expected_crc32(),
+            Self::File(source) => source.expected_crc32(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UrmaBenchmarkDestination {
+    Memory,
+    File(PathBuf),
+}
+
+impl UrmaBenchmarkDestination {
+    fn validate(&self, case: &BenchmarkCase) -> Result<()> {
+        let scenario = match self {
+            Self::Memory => BenchmarkScenario::Memory,
+            Self::File(_) => BenchmarkScenario::File,
+        };
+        if scenario != case.scenario {
+            return Err(invalid("URMA destination does not match benchmark case"));
+        }
+        Ok(())
+    }
+
+    fn create_sink(
+        &self,
+        expected_bytes: u64,
+        expected_crc32: u32,
+        policy: FileCompletionPolicy,
+    ) -> Result<ActiveSink> {
+        match self {
+            Self::Memory => Ok(ActiveSink::Memory(MemorySink::new(
+                expected_bytes,
+                expected_crc32,
+            ))),
+            Self::File(path) => Ok(ActiveSink::File(FileSink::create(
+                path,
+                expected_bytes,
+                expected_crc32,
+                policy,
+            )?)),
+        }
+    }
+}
+
+enum ActiveSink {
+    Memory(MemorySink),
+    File(FileSink),
+}
+
+impl BenchmarkSink for ActiveSink {
+    fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Memory(sink) => sink.write_chunk(bytes),
+            Self::File(sink) => sink.write_chunk(bytes),
+        }
+    }
+
+    fn finish(self) -> Result<IntegrityResult> {
+        match self {
+            Self::Memory(sink) => sink.finish(),
+            Self::File(sink) => sink.finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UrmaTransportStats {
+    pub send_post: u64,
+    pub recv_post: u64,
+    pub send_cqe: u64,
+    pub recv_cqe: u64,
+    pub cqe_error: u64,
+    pub poll_calls: u64,
+    pub empty_polls: u64,
+    pub max_outstanding_send: u64,
+    pub current_outstanding_send: u64,
+    pub configured_window: u64,
+    pub configured_receive_credit: u64,
+    pub slot_size: u64,
+    pub effective_payload_size: u64,
+    pub tx_slot_count: u64,
+    pub rx_slot_count: u64,
+    pub total_registered_bytes: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+}
+
+impl UrmaTransportStats {
+    fn insert_all(self, output: &mut BTreeMap<String, u64>) {
+        for (name, value) in [
+            ("send_post", self.send_post),
+            ("recv_post", self.recv_post),
+            ("send_cqe", self.send_cqe),
+            ("recv_cqe", self.recv_cqe),
+            ("cqe_error", self.cqe_error),
+            ("poll_calls", self.poll_calls),
+            ("empty_polls", self.empty_polls),
+            ("max_outstanding_send", self.max_outstanding_send),
+            ("current_outstanding_send", self.current_outstanding_send),
+            ("configured_window", self.configured_window),
+            ("configured_receive_credit", self.configured_receive_credit),
+            ("slot_size", self.slot_size),
+            ("effective_payload_size", self.effective_payload_size),
+            ("tx_slot_count", self.tx_slot_count),
+            ("rx_slot_count", self.rx_slot_count),
+            ("total_registered_bytes", self.total_registered_bytes),
+            ("bytes_sent", self.bytes_sent),
+            ("bytes_received", self.bytes_received),
+        ] {
+            output.insert(name.into(), value);
+        }
+    }
+}
+
+pub fn run_urma_parent(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    listen: impl ToSocketAddrs,
+    source: UrmaBenchmarkSource,
+) -> Result<BenchmarkResult> {
+    source.validate(case)?;
+    let runtime_config = benchmark_runtime_config(case, device, eid_index)?;
+    let jetty_config = JettyConfig::default();
+    validate_urma_case(
+        case,
+        UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config),
+    )?;
+    let setup_measurement = setup_measurement(case.timing_mode)?;
+    let listener = TcpListener::bind(listen).map_err(|error| io_error("bind URMA OOB", error))?;
+    let mut runtime = UrmaRuntime::start(runtime_config.clone())?;
+    validate_urma_case(
+        case,
+        UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config)
+            .with_provider_max_message_size(runtime.capability().max_msg_size),
+    )?;
+    let mut connection = runtime.create_connection(jetty_config)?;
+    let (stream, _) = listener
+        .accept()
+        .map_err(|error| io_error("accept URMA OOB", error))?;
+    let mut session = parent_handshake(stream, &mut connection)?;
+
+    let request = IntegrationMessageV3::decode(&connection.wait_for_frame(TIMEOUT)?)?;
+    match &request.body {
+        IntegrationMessageBodyV3::Request {
+            task_id,
+            piece_number,
+        } if request.request_id == REQUEST_ID
+            && request.sequence == 0
+            && task_id == &case.case_id
+            && *piece_number == case.repeat => {}
+        _ => return Err(Error::Protocol("invalid URMA benchmark Request".into())),
+    }
+    let metadata = IntegrationMessageV3::metadata(
+        REQUEST_ID,
+        0,
+        case.transfer_bytes,
+        DigestDescriptor::crc32(source.expected_crc32()),
+    );
+    connection.send_frame(&metadata.encode()?)?;
+    connection.drain_completions(TIMEOUT)?;
+
+    expect_case_control(&mut session, READY, &case.case_id)?;
+    let measurement = match setup_measurement {
+        Some(measurement) => measurement,
+        None => Measurement::start(case.timing_mode)?,
+    };
+    write_control(session.stream_mut(), START, case.case_id.as_bytes())?;
+    let mut pipeline = PipelineTracker::new(case.window as usize)?;
+    let mut bytes_sent = 0u64;
+    let data_messages = send_source(
+        &source,
+        case.chunk_size_usize()?,
+        &mut connection,
+        &mut pipeline,
+        &mut bytes_sent,
+    )?;
+    drain_pipeline(&mut connection, &mut pipeline)?;
+    let end = IntegrationMessageV3::end(REQUEST_ID, data_messages, case.transfer_bytes);
+    connection.send_frame(&end.encode()?)?;
+    connection.drain_completions(TIMEOUT)?;
+    if pipeline.current() != 0 || connection.outstanding_send() != 0 {
+        return Err(Error::Protocol("URMA pipeline did not fully drain".into()));
+    }
+    if case.window > 1 && data_messages > 1 && pipeline.maximum() <= 1 {
+        return Err(Error::Protocol(
+            "configured W>1 but max_outstanding_send did not exceed one".into(),
+        ));
+    }
+    let (parent_sample, parent_cpu) = measurement.finish()?;
+
+    let done = decode_done(&read_control(session.stream_mut(), DONE)?)?;
+    if done.case_id != case.case_id || !done.integrity.is_ok() {
+        return Err(Error::Protocol("invalid URMA benchmark Done".into()));
+    }
+    let local = connection.stats();
+    let stats = combined_stats(
+        case,
+        &runtime_config,
+        local,
+        done.completion,
+        bytes_sent,
+        done.bytes_received,
+    )?;
+    let child_sample =
+        TimingSample::from_duration(case.timing_mode, Duration::from_nanos(done.elapsed_ns));
+    let mut result = BenchmarkResult::from_sample(case, child_sample, done.integrity)?;
+    result.parent_cpu = Some(parent_cpu);
+    result.child_cpu = Some(done.child_cpu);
+    stats.insert_all(&mut result.transport_stats);
+    result
+        .transport_stats
+        .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);
+
+    session.close()?;
+    connection.close()?;
+    runtime.shutdown()?;
+    Ok(result)
+}
+
+pub fn run_urma_child(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    parent: impl ToSocketAddrs,
+    destination: UrmaBenchmarkDestination,
+) -> Result<BenchmarkResult> {
+    destination.validate(case)?;
+    let runtime_config = benchmark_runtime_config(case, device, eid_index)?;
+    let jetty_config = JettyConfig::default();
+    validate_urma_case(
+        case,
+        UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config),
+    )?;
+    let setup_measurement = setup_measurement(case.timing_mode)?;
+    let mut runtime = UrmaRuntime::start(runtime_config.clone())?;
+    validate_urma_case(
+        case,
+        UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config)
+            .with_provider_max_message_size(runtime.capability().max_msg_size),
+    )?;
+    let mut connection = runtime.create_connection(jetty_config)?;
+    let stream = TcpStream::connect(parent).map_err(|error| io_error("connect URMA OOB", error))?;
+    let mut session = child_handshake(stream, &mut connection)?;
+
+    let request = IntegrationMessageV3::request(REQUEST_ID, case.case_id.clone(), case.repeat);
+    connection.send_frame(&request.encode()?)?;
+    let metadata = IntegrationMessageV3::decode(&connection.wait_for_frame(TIMEOUT)?)?;
+    let expected_crc32 = match &metadata.body {
+        IntegrationMessageBodyV3::Metadata { digest, .. }
+            if digest.algorithm == DigestAlgorithm::Crc32 =>
+        {
+            digest
+                .value
+                .parse::<u32>()
+                .map_err(|_| Error::Protocol("invalid Metadata CRC32".into()))?
+        }
+        _ => return Err(Error::Protocol("expected URMA benchmark Metadata".into())),
+    };
+    let mut receiver = UrmaReceiveState::new(REQUEST_ID, case.transfer_bytes, expected_crc32)?;
+    receiver.accept_metadata(&metadata)?;
+    let mut sink =
+        destination.create_sink(case.transfer_bytes, expected_crc32, case.completion_policy)?;
+    let remaining_messages = usize::try_from(case.chunk_count()? + 1)
+        .map_err(|_| invalid("receive message count exceeds usize"))?;
+    let mut credit = ReceiveCreditController::new(case.window as usize, remaining_messages)?;
+    replenish_credit(&mut connection, &mut credit)?;
+    if connection.receive_credit() != credit.current_credit() {
+        return Err(Error::Protocol("RX credit accounting mismatch".into()));
+    }
+    write_control(session.stream_mut(), READY, case.case_id.as_bytes())?;
+    expect_case_control(&mut session, START, &case.case_id)?;
+    let measurement = match setup_measurement {
+        Some(measurement) => measurement,
+        None => Measurement::start(case.timing_mode)?,
+    };
+
+    let deadline = Instant::now() + TIMEOUT;
+    let mut bytes_received = 0u64;
+    'receive: loop {
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout {
+                operation: "URMA benchmark receive",
+            });
+        }
+        let events = connection.poll_once()?;
+        if events.is_empty() {
+            thread::yield_now();
+            continue;
+        }
+        for event in events {
+            match event {
+                CompletionEvent::SendCompleted { .. } => {
+                    return Err(Error::Protocol(
+                        "unexpected send CQE in URMA receive loop".into(),
+                    ))
+                }
+                CompletionEvent::RecvCompleted { bytes, .. } => {
+                    credit.completed()?;
+                    // The CQ poller has already copied to owned bytes and freed
+                    // the registered slot. Restore credit before sink I/O.
+                    replenish_credit(&mut connection, &mut credit)?;
+                    let message = IntegrationMessageV3::decode(&bytes)?;
+                    if let IntegrationMessageBodyV3::Data(payload) = &message.body {
+                        bytes_received = bytes_received
+                            .checked_add(payload.len() as u64)
+                            .ok_or_else(|| {
+                                Error::Protocol("received byte count overflow".into())
+                            })?;
+                    }
+                    if receiver.accept_payload(&message, &mut sink)? {
+                        break 'receive;
+                    }
+                }
+            }
+        }
+    }
+    if credit.remaining_messages() != 0
+        || credit.current_credit() != 0
+        || connection.outstanding_recv() != 0
+    {
+        return Err(Error::Protocol(
+            "RX credits or slots remain outstanding after End".into(),
+        ));
+    }
+    let integrity = sink.finish()?;
+    if !integrity.is_ok() {
+        return Err(Error::Protocol(
+            "URMA sink integrity verification failed".into(),
+        ));
+    }
+    let (sample, child_cpu) = measurement.finish()?;
+    let completion = connection.stats();
+    let mut result = BenchmarkResult::from_sample(case, sample, integrity)?;
+    result.child_cpu = Some(child_cpu);
+    combined_stats(
+        case,
+        &runtime_config,
+        CompletionStats::default(),
+        completion,
+        0,
+        bytes_received,
+    )?
+    .insert_all(&mut result.transport_stats);
+    let done = Done {
+        case_id: case.case_id.clone(),
+        integrity,
+        elapsed_ns: result.elapsed_ns,
+        child_cpu,
+        completion,
+        bytes_received,
+    };
+    write_control(session.stream_mut(), DONE, &encode_done(&done)?)?;
+
+    session.close()?;
+    connection.close()?;
+    runtime.shutdown()?;
+    Ok(result)
+}
+
+fn send_source(
+    source: &UrmaBenchmarkSource,
+    chunk_size: usize,
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+    bytes_sent: &mut u64,
+) -> Result<u32> {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut sequence = 0u32;
+    match source {
+        UrmaBenchmarkSource::Memory(source) => {
+            for chunk in source.chunks(chunk_size)? {
+                post_data(connection, pipeline, sequence, chunk, deadline)?;
+                *bytes_sent += chunk.len() as u64;
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
+            }
+        }
+        UrmaBenchmarkSource::File(source) => {
+            let mut file = source.open()?;
+            let mut buffer = vec![0u8; chunk_size];
+            loop {
+                let read = read_chunk(&mut file, &mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                post_data(connection, pipeline, sequence, &buffer[..read], deadline)?;
+                *bytes_sent += read as u64;
+                sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
+            }
+        }
+    }
+    Ok(sequence)
+}
+
+fn post_data(
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+    sequence: u32,
+    payload: &[u8],
+    deadline: Instant,
+) -> Result<()> {
+    while !pipeline.can_post() {
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout {
+                operation: "URMA pipeline capacity",
+            });
+        }
+        poll_send_completions(connection, pipeline)?;
+    }
+    let message = IntegrationMessageV3::data(REQUEST_ID, sequence, payload.to_vec());
+    connection.send_frame(&message.encode()?)?;
+    pipeline.posted()?;
+    debug_assert_eq!(pipeline.current(), connection.outstanding_send());
+    Ok(())
+}
+
+fn drain_pipeline(
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+) -> Result<()> {
+    let deadline = Instant::now() + TIMEOUT;
+    while pipeline.current() != 0 {
+        if Instant::now() >= deadline {
+            return Err(Error::Timeout {
+                operation: "URMA pipeline drain",
+            });
+        }
+        poll_send_completions(connection, pipeline)?;
+    }
+    Ok(())
+}
+
+fn poll_send_completions(
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+) -> Result<()> {
+    for event in connection.poll_once()? {
+        match event {
+            CompletionEvent::SendCompleted { .. } => pipeline.completed()?,
+            CompletionEvent::RecvCompleted { .. } => {
+                return Err(Error::Protocol(
+                    "unexpected receive CQE while sending URMA payload".into(),
+                ))
+            }
+        }
+    }
+    debug_assert_eq!(pipeline.current(), connection.outstanding_send());
+    if pipeline.current() != 0 {
+        thread::yield_now();
+    }
+    Ok(())
+}
+
+fn replenish_credit(
+    connection: &mut UrmaConnection<'_>,
+    credit: &mut ReceiveCreditController,
+) -> Result<()> {
+    while credit.posts_needed() != 0 {
+        connection.recv_ready()?;
+        credit.posted()?;
+    }
+    Ok(())
+}
+
+fn read_chunk(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(io_error("read URMA benchmark source", error)),
+        }
+    }
+    Ok(filled)
+}
+
+fn setup_measurement(mode: TimingMode) -> Result<Option<Measurement>> {
+    if mode == TimingMode::SetupIncluded {
+        Ok(Some(Measurement::start(mode)?))
+    } else {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CpuSnapshot(CpuUsage);
+
+impl CpuSnapshot {
+    fn capture() -> Result<Self> {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+            return Err(io_error(
+                "get process CPU usage",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(Self(CpuUsage {
+            user_us: timeval_us(usage.ru_utime)?,
+            system_us: timeval_us(usage.ru_stime)?,
+        }))
+    }
+
+    fn elapsed_since(self, start: Self) -> Result<CpuUsage> {
+        Ok(CpuUsage {
+            user_us: self
+                .0
+                .user_us
+                .checked_sub(start.0.user_us)
+                .ok_or_else(|| invalid("process user CPU time moved backwards"))?,
+            system_us: self
+                .0
+                .system_us
+                .checked_sub(start.0.system_us)
+                .ok_or_else(|| invalid("process system CPU time moved backwards"))?,
+        })
+    }
+}
+
+fn timeval_us(value: libc::timeval) -> Result<u64> {
+    let seconds = u64::try_from(value.tv_sec).map_err(|_| invalid("negative CPU seconds"))?;
+    let micros = u64::try_from(value.tv_usec).map_err(|_| invalid("negative CPU micros"))?;
+    seconds
+        .checked_mul(1_000_000)
+        .and_then(|value| value.checked_add(micros))
+        .ok_or_else(|| invalid("process CPU time overflow"))
+}
+
+struct Measurement {
+    timer: BenchmarkTimer,
+    cpu: CpuSnapshot,
+}
+
+impl Measurement {
+    fn start(mode: TimingMode) -> Result<Self> {
+        Ok(Self {
+            timer: BenchmarkTimer::start(mode),
+            cpu: CpuSnapshot::capture()?,
+        })
+    }
+
+    fn finish(self) -> Result<(TimingSample, CpuUsage)> {
+        Ok((
+            self.timer.finish(),
+            CpuSnapshot::capture()?.elapsed_since(self.cpu)?,
+        ))
+    }
+}
+
+fn combined_stats(
+    case: &BenchmarkCase,
+    runtime: &RuntimeConfig,
+    parent: CompletionStats,
+    child: CompletionStats,
+    bytes_sent: u64,
+    bytes_received: u64,
+) -> Result<UrmaTransportStats> {
+    let total_registered_bytes = runtime.buffer_pool.total_len()?;
+    Ok(UrmaTransportStats {
+        send_post: parent.send_post,
+        recv_post: child.recv_post,
+        send_cqe: parent.send_cqe,
+        recv_cqe: child.recv_cqe,
+        cqe_error: parent.cqe_error + child.cqe_error,
+        poll_calls: parent.poll_calls + child.poll_calls,
+        empty_polls: parent.empty_polls + child.empty_polls,
+        max_outstanding_send: parent.max_outstanding_send,
+        current_outstanding_send: 0,
+        configured_window: u64::from(case.window),
+        configured_receive_credit: u64::from(case.window),
+        slot_size: u64::try_from(runtime.buffer_pool.slot_size)
+            .map_err(|_| invalid("slot_size does not fit result u64"))?,
+        effective_payload_size: case.chunk_size,
+        tx_slot_count: u64::try_from(runtime.buffer_pool.tx_slot_count)
+            .map_err(|_| invalid("TX slot count does not fit result u64"))?,
+        rx_slot_count: u64::try_from(runtime.buffer_pool.rx_slot_count)
+            .map_err(|_| invalid("RX slot count does not fit result u64"))?,
+        total_registered_bytes: u64::try_from(total_registered_bytes)
+            .map_err(|_| invalid("registered pool size does not fit result u64"))?,
+        bytes_sent,
+        bytes_received,
+    })
+}
+
+fn benchmark_runtime_config(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+) -> Result<RuntimeConfig> {
+    let mut config = RuntimeConfig::new(device, eid_index);
+    config.buffer_pool.slot_size = derive_urma_slot_size(case, config.buffer_pool.alignment)?;
+    config.buffer_pool.total_len()?;
+    Ok(config)
+}
+
+fn expect_case_control(session: &mut OobSession, kind: u16, case_id: &str) -> Result<()> {
+    let payload = read_control(session.stream_mut(), kind)?;
+    if payload != case_id.as_bytes() {
+        return Err(Error::Protocol(
+            "URMA benchmark control case_id mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_control(stream: &mut TcpStream, kind: u16, payload: &[u8]) -> Result<()> {
+    if payload.len() > MAX_CONTROL_PAYLOAD {
+        return Err(invalid("URMA benchmark control payload too large"));
+    }
+    let mut header = Vec::with_capacity(CONTROL_HEADER_LEN);
+    header.extend_from_slice(&CONTROL_MAGIC.to_be_bytes());
+    header.extend_from_slice(&CONTROL_VERSION.to_be_bytes());
+    header.extend_from_slice(&kind.to_be_bytes());
+    header.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    stream
+        .write_all(&header)
+        .and_then(|_| stream.write_all(payload))
+        .map_err(|error| io_error("write URMA benchmark control", error))
+}
+
+fn read_control(stream: &mut TcpStream, expected_kind: u16) -> Result<Vec<u8>> {
+    let mut header = [0u8; CONTROL_HEADER_LEN];
+    stream
+        .read_exact(&mut header)
+        .map_err(|error| io_error("read URMA benchmark control header", error))?;
+    let magic = u32::from_be_bytes(header[0..4].try_into().expect("fixed slice"));
+    let version = u16::from_be_bytes(header[4..6].try_into().expect("fixed slice"));
+    let kind = u16::from_be_bytes(header[6..8].try_into().expect("fixed slice"));
+    let length = u32::from_be_bytes(header[8..12].try_into().expect("fixed slice")) as usize;
+    if magic != CONTROL_MAGIC
+        || version != CONTROL_VERSION
+        || kind != expected_kind
+        || length > MAX_CONTROL_PAYLOAD
+    {
+        return Err(Error::Protocol(
+            "invalid URMA benchmark control frame".into(),
+        ));
+    }
+    let mut payload = vec![0u8; length];
+    stream
+        .read_exact(&mut payload)
+        .map_err(|error| io_error("read URMA benchmark control payload", error))?;
+    Ok(payload)
+}
+
+#[derive(Clone, Debug)]
+struct Done {
+    case_id: String,
+    integrity: IntegrityResult,
+    elapsed_ns: u64,
+    child_cpu: CpuUsage,
+    completion: CompletionStats,
+    bytes_received: u64,
+}
+
+fn encode_done(done: &Done) -> Result<Vec<u8>> {
+    let case = done.case_id.as_bytes();
+    let case_len = u16::try_from(case.len()).map_err(|_| invalid("case_id too long"))?;
+    let mut output = Vec::with_capacity(128 + case.len());
+    output.extend_from_slice(&case_len.to_be_bytes());
+    output.extend_from_slice(case);
+    for value in [
+        done.integrity.expected_bytes,
+        done.integrity.actual_bytes,
+        done.elapsed_ns,
+        done.child_cpu.user_us,
+        done.child_cpu.system_us,
+        done.completion.send_post,
+        done.completion.recv_post,
+        done.completion.send_cqe,
+        done.completion.recv_cqe,
+        done.completion.cqe_error,
+        done.completion.poll_calls,
+        done.completion.empty_polls,
+        done.completion.max_outstanding_send,
+        done.bytes_received,
+    ] {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
+    output.extend_from_slice(&done.integrity.expected_crc32.to_be_bytes());
+    output.extend_from_slice(&done.integrity.actual_crc32.to_be_bytes());
+    Ok(output)
+}
+
+fn decode_done(input: &[u8]) -> Result<Done> {
+    if input.len() < 2 {
+        return Err(Error::Protocol("truncated URMA Done".into()));
+    }
+    let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
+    let expected_len = 2 + case_len + 14 * 8 + 2 * 4;
+    if input.len() != expected_len {
+        return Err(Error::Protocol("invalid URMA Done length".into()));
+    }
+    let case_id = std::str::from_utf8(&input[2..2 + case_len])
+        .map_err(|_| Error::Protocol("URMA Done case_id is not UTF-8".into()))?
+        .to_owned();
+    let mut offset = 2 + case_len;
+    let mut next_u64 = || {
+        let value = u64::from_be_bytes(input[offset..offset + 8].try_into().expect("fixed slice"));
+        offset += 8;
+        value
+    };
+    let expected_bytes = next_u64();
+    let actual_bytes = next_u64();
+    let elapsed_ns = next_u64();
+    let user_us = next_u64();
+    let system_us = next_u64();
+    let send_post = next_u64();
+    let recv_post = next_u64();
+    let send_cqe = next_u64();
+    let recv_cqe = next_u64();
+    let cqe_error = next_u64();
+    let poll_calls = next_u64();
+    let empty_polls = next_u64();
+    let max_outstanding_send = next_u64();
+    let bytes_received = next_u64();
+    let expected_crc32 = u32::from_be_bytes(input[offset..offset + 4].try_into().expect("fixed"));
+    offset += 4;
+    let actual_crc32 = u32::from_be_bytes(input[offset..offset + 4].try_into().expect("fixed"));
+    Ok(Done {
+        case_id,
+        integrity: IntegrityResult::new(expected_bytes, actual_bytes, expected_crc32, actual_crc32),
+        elapsed_ns,
+        child_cpu: CpuUsage { user_us, system_us },
+        completion: CompletionStats {
+            send_post,
+            recv_post,
+            send_cqe,
+            recv_cqe,
+            cqe_error,
+            poll_calls,
+            empty_polls,
+            max_outstanding_send,
+        },
+        bytes_received,
+    })
+}
+
+fn io_error(operation: &'static str, error: io::Error) -> Error {
+    Error::Io {
+        operation,
+        message: error.to_string(),
+    }
+}

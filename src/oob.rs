@@ -199,6 +199,10 @@ mod native {
     }
 
     impl OobSession {
+        pub(crate) fn stream_mut(&mut self) -> &mut TcpStream {
+            &mut self.stream
+        }
+
         /// M2 carries no post-handshake messages. Parent waits until child closes.
         pub fn wait_for_peer_close(mut self) -> Result<()> {
             let mut byte = [0u8; 1];

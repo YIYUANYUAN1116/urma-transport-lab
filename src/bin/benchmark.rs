@@ -34,6 +34,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut parent = String::from("127.0.0.1:19091");
     let mut input = None;
     let mut output = None;
+    let mut device = String::from("urma0");
+    let mut eid_index = 0u32;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -72,6 +74,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--parent" => parent = required_value(&mut args, "--parent")?,
             "--input" => input = Some(PathBuf::from(required_value(&mut args, "--input")?)),
             "--output" => output = Some(PathBuf::from(required_value(&mut args, "--output")?)),
+            "--device" => device = required_value(&mut args, "--device")?,
+            "--eid-index" => eid_index = parse_value(&mut args, "--eid-index")?,
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
@@ -97,7 +101,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let result = match role.ok_or("TCP benchmark requires --role parent or --role child")? {
+    let role = role.ok_or("benchmark requires --role parent or --role child")?;
+    #[cfg(feature = "urma")]
+    if case.transport == BenchmarkTransport::Urma {
+        use urma_transport_lab::{
+            run_urma_child, run_urma_parent, UrmaBenchmarkDestination, UrmaBenchmarkSource,
+        };
+        let result = match role {
+            Role::Parent => {
+                let source = match case.scenario {
+                    BenchmarkScenario::Memory => UrmaBenchmarkSource::Memory(
+                        MemorySource::generate(case.transfer_bytes, case.data_seed)?,
+                    ),
+                    BenchmarkScenario::File => UrmaBenchmarkSource::File(FileSource::from_path(
+                        input.ok_or("file Parent requires --input PATH")?,
+                    )?),
+                };
+                eprintln!("benchmark URMA parent: listening on {listen}");
+                run_urma_parent(&case, device, eid_index, &listen, source)?
+            }
+            Role::Child => {
+                let destination = match case.scenario {
+                    BenchmarkScenario::Memory => UrmaBenchmarkDestination::Memory,
+                    BenchmarkScenario::File => UrmaBenchmarkDestination::File(
+                        output.ok_or("file Child requires --output PATH")?,
+                    ),
+                };
+                eprintln!("benchmark URMA child: connecting to {parent}");
+                run_urma_child(&case, device, eid_index, &parent, destination)?
+            }
+        };
+        println!("{}", result.to_json_line());
+        return Ok(());
+    }
+    #[cfg(not(feature = "urma"))]
+    if case.transport == BenchmarkTransport::Urma {
+        return Err("URMA benchmark requires --features urma".into());
+    }
+    #[cfg(not(feature = "urma"))]
+    let _ = (&device, eid_index);
+
+    let result = match role {
         Role::Parent => {
             let source = match case.scenario {
                 BenchmarkScenario::Memory => TcpBenchmarkSource::Memory(MemorySource::generate(
@@ -153,7 +197,7 @@ fn print_usage() {
     println!(
         "usage: benchmark [--dry-run | --role parent|child] [OPTIONS]\n\
          \n\
-         B1 runs one blocking-TCP case or validates it with --dry-run.\n\
+         Runs one B1 TCP or B2 URMA case, or validates it with --dry-run.\n\
          \n\
          OPTIONS:\n\
            --role parent|child\n\
@@ -173,6 +217,8 @@ fn print_usage() {
            --listen ADDRESS              Parent bind address, default: 127.0.0.1:19091\n\
            --parent ADDRESS              Child target address, default: 127.0.0.1:19091\n\
            --input PATH                  required for file Parent\n\
-           --output PATH                 required for file Child"
+           --output PATH                 required for file Child\n\
+           --device NAME                 URMA device, default: urma0\n\
+           --eid-index N                 URMA EID index, default: 0"
     );
 }

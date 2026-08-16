@@ -19,6 +19,7 @@ pub mod oob;
 pub mod runtime;
 pub mod tcp_benchmark;
 pub mod transfer;
+pub mod urma_benchmark;
 pub mod wr;
 
 pub use benchmark::{
@@ -45,6 +46,15 @@ pub use tcp_benchmark::{
     run_tcp_child, run_tcp_parent, TcpBenchmarkDestination, TcpBenchmarkSource, TcpTransportStats,
 };
 pub use transfer::{digest_reader, hex_digest, ReceiveState, TransferSummary};
+pub use urma_benchmark::{
+    derive_urma_slot_size, validate_urma_case, PipelineTracker, ReceiveCreditController,
+    UrmaPipelineLimits, UrmaReceiveState, URMA_PROTOCOL_HEADER_LEN,
+};
+#[cfg(feature = "urma")]
+pub use urma_benchmark::{
+    run_urma_child, run_urma_parent, UrmaBenchmarkDestination, UrmaBenchmarkSource,
+    UrmaTransportStats,
+};
 
 /// Phase 0 roadmap markers. M2 control-plane variants are now implemented;
 /// post/poll variants remain M3 work.

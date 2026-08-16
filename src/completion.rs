@@ -8,6 +8,9 @@ pub struct CompletionStats {
     pub send_cqe: u64,
     pub recv_cqe: u64,
     pub cqe_error: u64,
+    pub poll_calls: u64,
+    pub empty_polls: u64,
+    pub max_outstanding_send: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,6 +95,10 @@ mod native {
                 OperationType::Send => {
                     self.stats.send_post += 1;
                     self.outstanding_send += 1;
+                    self.stats.max_outstanding_send = self
+                        .stats
+                        .max_outstanding_send
+                        .max(self.outstanding_send as u64);
                 }
                 OperationType::Recv => {
                     self.stats.recv_post += 1;
@@ -107,6 +114,7 @@ mod native {
             recv_jfc: &ffi::JfcHandle,
             pool: &mut UrmaBufferPool,
         ) -> Result<Vec<CompletionEvent>> {
+            self.stats.poll_calls += 1;
             let mut events = Vec::new();
             for record in send_jfc
                 .poll(self.batch)
@@ -119,6 +127,9 @@ mod native {
                 .map_err(|error| map_ffi_error("poll_recv_jfc", error))?
             {
                 events.push(self.route(record, true, pool)?);
+            }
+            if events.is_empty() {
+                self.stats.empty_polls += 1;
             }
             Ok(events)
         }
@@ -171,7 +182,6 @@ mod native {
                     pool.complete_send(token.slot)?;
                     pool.release(token.slot)?;
                     self.stats.send_cqe += 1;
-                    eprintln!("CQE send slot={} status=0", token.slot.index());
                     Ok(CompletionEvent::SendCompleted { slot: token.slot })
                 }
                 OperationType::Recv => {
@@ -189,11 +199,6 @@ mod native {
                     let bytes = pool.complete_recv(token.slot, record.completion_len)?;
                     pool.release(token.slot)?;
                     self.stats.recv_cqe += 1;
-                    eprintln!(
-                        "CQE recv slot={} status=0 length={}",
-                        token.slot.index(),
-                        bytes.len()
-                    );
                     Ok(CompletionEvent::RecvCompleted {
                         slot: token.slot,
                         bytes,
@@ -220,6 +225,10 @@ mod native {
 
         pub(crate) fn outstanding_send(&self) -> usize {
             self.outstanding_send
+        }
+
+        pub(crate) fn outstanding_recv(&self) -> usize {
+            self.outstanding_recv
         }
     }
 
