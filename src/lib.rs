@@ -11,6 +11,7 @@ pub mod digest;
 mod error;
 #[cfg(feature = "urma")]
 mod ffi;
+pub mod file_comparison;
 pub mod jetty;
 #[cfg(feature = "urma")]
 mod jfc;
@@ -34,6 +35,10 @@ pub use connection::ConnectionState;
 pub use connection::UrmaConnection;
 pub use digest::{crc32_bytes, crc32_reader, format_crc32_digest, parse_crc32_digest, Crc32Hasher};
 pub use error::{Error, Result};
+pub use file_comparison::{
+    dispatch_b4_file_child, dispatch_b4_file_parent, B4Aggregate, B4CaseStatus, B4ExecutionOutcome,
+    B4FileMatrixConfig, B4FileMatrixRunner, B4FileRunRecord, B4Report, B4TransportDispatch,
+};
 pub use jetty::{JettyConfig, JettyDescriptor, JETTY_DESCRIPTOR_VERSION, MAX_JETTY_DESCRIPTOR_LEN};
 pub use message::{
     DigestAlgorithm, DigestDescriptor, IntegrationMessageBodyV3, IntegrationMessageTypeV3,

@@ -342,6 +342,7 @@ pub struct BenchmarkResult {
     pub elapsed_ns: u64,
     pub elapsed_us: u64,
     pub throughput_mib_s: f64,
+    pub throughput_gbit_s: f64,
     pub integrity: IntegrityResult,
     pub timing_mode: TimingMode,
     pub completion_policy: FileCompletionPolicy,
@@ -381,6 +382,7 @@ impl BenchmarkResult {
             elapsed_ns,
             elapsed_us: elapsed_ns / 1_000,
             throughput_mib_s: throughput_mib_s(integrity.actual_bytes, sample.elapsed),
+            throughput_gbit_s: throughput_gbit_s(integrity.actual_bytes, sample.elapsed),
             integrity,
             timing_mode: case.timing_mode,
             completion_policy: case.completion_policy,
@@ -404,6 +406,8 @@ impl BenchmarkResult {
         json_number_field(&mut output, "elapsed_us", self.elapsed_us, false);
         output.push_str(",\"throughput_mib_s\":");
         output.push_str(&format!("{:.6}", self.throughput_mib_s));
+        output.push_str(",\"throughput_gbit_s\":");
+        output.push_str(&format!("{:.6}", self.throughput_gbit_s));
         json_string_field(&mut output, "timing_mode", self.timing_mode.as_str(), false);
         json_string_field(
             &mut output,
@@ -463,6 +467,13 @@ pub fn throughput_mib_s(bytes: u64, elapsed: Duration) -> f64 {
         return 0.0;
     }
     (bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
+}
+
+pub fn throughput_gbit_s(bytes: u64, elapsed: Duration) -> f64 {
+    if bytes == 0 || elapsed.is_zero() {
+        return 0.0;
+    }
+    (bytes as f64 * 8.0 / 1_000_000_000.0) / elapsed.as_secs_f64()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -988,6 +999,7 @@ mod tests {
         let json = result.to_json_line();
         assert!(json.contains("\"elapsed_ns\":2000000000"));
         assert!(json.contains("\"throughput_mib_s\":0.500000"));
+        assert!(json.contains("\"throughput_gbit_s\":0.004194"));
         assert!(json.contains("\"parent_cpu\":null"));
         assert!(json.ends_with("\"transport_stats\":{}}"));
         assert!(!json.contains('\n'));
