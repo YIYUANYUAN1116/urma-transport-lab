@@ -82,7 +82,7 @@ configured_window
 
 B2.1 没有改变 TX/RX 生命周期、window、receive credit、CQ polling、timer 或 sink 语义。
 
-Child 先用 handshake 的单个 RX 接收 Metadata；得知总长度和 chunk 数后，在发送 Ready 前预投递 `min(window, Data 数 + End)` 个 RX。每批 recv CQE 已完成 registered-slot -> owned `Vec` copy 和 slot release；Child 随后先按剩余消息数补 credit，再调用 sink。最后一条 End 使用精确 credit，因此正常完成时 `outstanding_recv=0`，没有为未知未来消息留下 RX WR。
+Child 先用 handshake 的单个 RX 接收 Metadata；得知总长度和 chunk 数后，在发送 Ready 前预投递 `min(2 * window, rx_slot_count, Data 数 + End)` 个 RX。每批 recv CQE 已完成 registered-slot -> owned `Vec` copy 和 slot release；Child 随后先按剩余消息数补 credit，再调用 sink。最后一条 End 使用精确 credit，因此正常完成时 `outstanding_recv=0`，没有为未知未来消息留下 RX WR。
 
 ## buffer 生命周期
 
@@ -205,6 +205,14 @@ slot 统计来自 BufferPool 当前状态的只读 snapshot；completion 字段�
 
 本轮本地验证结果：`cargo fmt --check` 通过；`cargo check --features urma` 和 `cargo test --features urma --no-run` 均因开发机找不到 `urma_api.h` 而在 build script 阶段停止，尚未完成 feature-on 类型检查或测试编译。真实 W=4 provider 回归等待 node3/node4 执行。
 
+为单独验证 RQ headroom 推断，B2 benchmark 当前仅把 receive credit target 从 `window` 调整为：
+
+```text
+min(2 * window, rx_slot_count, remaining_messages)
+```
+
+默认 RX slot count 为 8，因此 W=4 的 `configured_receive_credit` 从 4 变为 8；W=8 仍受 RX slot count 限制为 8。该实验改动不调整 send window、RX repost 时机、polling、timeout、retry/backoff、Metadata/Data/End 协议或 BufferPool 生命周期。即使 W=4 重跑成功，也只能作为支持 RQ headroom 推断的实验现象，仍需结合 timeout/provider 证据确认根因。
+
 ## B2 测试方法
 
 ### 1. Linux + UMDK 编译与非 provider 回归
@@ -276,6 +284,7 @@ send_post == send_cqe
 recv_post == recv_cqe
 cqe_error == 0
 configured_window == requested window
+configured_receive_credit == min(2 * window, rx_slot_count, remaining_messages)
 effective_payload_size == 65536
 ```
 

@@ -170,6 +170,21 @@ pub struct ReceiveCreditController {
     current_credit: usize,
 }
 
+pub(crate) fn receive_credit_target(
+    window: usize,
+    rx_slot_count: usize,
+    remaining_messages: usize,
+) -> Result<usize> {
+    let doubled_window = window
+        .checked_mul(2)
+        .ok_or_else(|| invalid("receive credit window multiplication overflow"))?;
+    let target = doubled_window.min(rx_slot_count).min(remaining_messages);
+    if target == 0 {
+        return Err(invalid("receive credit target must be non-zero"));
+    }
+    Ok(target)
+}
+
 impl ReceiveCreditController {
     pub fn new(configured: usize, remaining_messages: usize) -> Result<Self> {
         if configured == 0 {
@@ -468,6 +483,14 @@ mod tests {
         }
         assert_eq!(credit.remaining_messages(), 0);
         assert_eq!(credit.current_credit(), 0);
+    }
+
+    #[test]
+    fn receive_credit_target_adds_bounded_rq_headroom() {
+        assert_eq!(receive_credit_target(4, 8, 100), Ok(8));
+        assert_eq!(receive_credit_target(8, 8, 100), Ok(8));
+        assert_eq!(receive_credit_target(4, 16, 3), Ok(3));
+        assert!(receive_credit_target(usize::MAX, 8, 100).is_err());
     }
 
     #[test]

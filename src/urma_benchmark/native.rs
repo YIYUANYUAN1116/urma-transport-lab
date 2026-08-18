@@ -312,7 +312,12 @@ pub fn run_urma_child(
         destination.create_sink(case.transfer_bytes, expected_crc32, case.completion_policy)?;
     let remaining_messages = usize::try_from(case.chunk_count()? + 1)
         .map_err(|_| invalid("receive message count exceeds usize"))?;
-    let mut credit = ReceiveCreditController::new(case.window as usize, remaining_messages)?;
+    let credit_target = receive_credit_target(
+        case.window as usize,
+        runtime_config.buffer_pool.rx_slot_count,
+        remaining_messages,
+    )?;
+    let mut credit = ReceiveCreditController::new(credit_target, remaining_messages)?;
     replenish_credit(&mut connection, &mut credit)?;
     if connection.receive_credit() != credit.current_credit() {
         return Err(Error::Protocol("RX credit accounting mismatch".into()));
@@ -664,6 +669,13 @@ fn combined_stats(
     bytes_received: u64,
 ) -> Result<UrmaTransportStats> {
     let total_registered_bytes = runtime.buffer_pool.total_len()?;
+    let remaining_messages = usize::try_from(case.chunk_count()? + 1)
+        .map_err(|_| invalid("receive message count exceeds usize"))?;
+    let configured_receive_credit = receive_credit_target(
+        case.window as usize,
+        runtime.buffer_pool.rx_slot_count,
+        remaining_messages,
+    )?;
     Ok(UrmaTransportStats {
         send_post: parent.send_post,
         recv_post: child.recv_post,
@@ -675,7 +687,8 @@ fn combined_stats(
         max_outstanding_send: parent.max_outstanding_send,
         current_outstanding_send: 0,
         configured_window: u64::from(case.window),
-        configured_receive_credit: u64::from(case.window),
+        configured_receive_credit: u64::try_from(configured_receive_credit)
+            .map_err(|_| invalid("configured receive credit does not fit u64"))?,
         slot_size: u64::try_from(runtime.buffer_pool.slot_size)
             .map_err(|_| invalid("slot_size does not fit result u64"))?,
         effective_payload_size: case.chunk_size,
