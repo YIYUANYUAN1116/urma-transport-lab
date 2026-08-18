@@ -221,14 +221,16 @@ mod native {
         pub fn wait_for_frame(&mut self, timeout: Duration) -> Result<Vec<u8>> {
             let deadline = deadline_after(timeout);
             loop {
+                if self.poller.outstanding_send() == 0 {
+                    if let Some(frame) = self.pending_frames.pop_front() {
+                        return Ok(frame);
+                    }
+                }
                 check_deadline(deadline, "wait_for_frame")?;
                 for event in self.poll_once()? {
                     if let CompletionEvent::RecvCompleted { bytes, .. } = event {
                         self.pending_frames.push_back(bytes);
                     }
-                }
-                if !self.pending_frames.is_empty() && self.poller.outstanding_send() == 0 {
-                    return Ok(self.pending_frames.pop_front().expect("checked above"));
                 }
                 thread::yield_now();
             }
@@ -239,10 +241,8 @@ mod native {
             while self.poller.outstanding_send() != 0 {
                 check_deadline(deadline, "drain completions")?;
                 for event in self.poll_once()? {
-                    if matches!(event, CompletionEvent::RecvCompleted { .. }) {
-                        return Err(Error::Protocol(
-                            "unexpected receive while draining send completions".into(),
-                        ));
+                    if let CompletionEvent::RecvCompleted { bytes, .. } = event {
+                        self.pending_frames.push_back(bytes);
                     }
                 }
                 thread::yield_now();
