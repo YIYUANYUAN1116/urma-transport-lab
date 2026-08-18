@@ -123,12 +123,12 @@ send_post / recv_post
 send_cqe / recv_cqe / cqe_error
 poll_calls / empty_polls
 configured_window / configured_receive_credit
-current_outstanding_send / max_outstanding_send
+current_outstanding_send / current_outstanding_recv / max_outstanding_send
 bytes_sent / bytes_received
 parent_elapsed_ns
 ```
 
-`current_outstanding_send` 在成功结果中必须为 0。数据消息数至少为 2 的 W>1 case 若没有观测到 `max_outstanding_send > 1`，runner 明确失败，不能把该结果标记为 pipeline 生效。
+`current_outstanding_send` 和 `current_outstanding_recv` 在成功结果中必须为 0。数据消息数至少为 2 的 W>1 case 若没有观测到 `max_outstanding_send > 1`，runner 明确失败，不能把该结果标记为 pipeline 生效。
 
 ## 非 provider 测试
 
@@ -143,75 +143,52 @@ parent_elapsed_ns
 - 64 KiB、256 KiB、512 KiB、1 MiB payload 的 aligned slot 推导和 v3 1 MiB codec round-trip；
 - slot 太小、provider max message size 太小和 registered pool size overflow。
 
-本地执行记录：
+本轮 Linux/当前 UMDK 源码执行记录：
 
 ```text
 cargo fmt --check                  PASS
-cargo check --no-default-features PASS（Windows 使用既有 B1 CPU 采集的 cfg portability guard）
-cargo test --no-default-features  PASS（66 unit + 2 B0 CLI + 1 runtime integration）
-cargo check --features urma       ATTEMPTED/BLOCKED：feature 明确要求 Linux target
+cargo check --no-default-features PASS
+cargo test --no-default-features  PASS（77 unit + 2 B0 CLI + 1 runtime integration）
+cargo check --features urma       PASS（使用当前 UMDK headers/lib）
 cargo test --features urma --no-run
-                                    ATTEMPTED/BLOCKED：同上，本机无 Linux UMDK/provider
+                                    PASS（feature-on 全目标测试编译）
+cargo build --release --features urma --bin benchmark
+                                    PASS
 ```
 
-Feature-on 仍须在有 UMDK 的 Linux 构建机执行，不能用 feature-off 结果推断 provider 行为。
+上述 feature-on 结果只证明 ABI shim、Rust 类型和链接输入能够构建，不能替代真实 UB/UDMA provider 行为验证。
 
-## 真实环境 W>1 诊断
+## 长时间 W>2 卡死定位与修复
 
-真实双节点 UB 环境已经确认以下证据：
+实验已确认 W=1、W=2 的 64 MiB case 通过，W=3、W=4 在数百到上千条消息后 timeout，而 W=3 的 196608-byte 小文件通过。失败现场 Parent 的 `send_post - send_cqe` 等于 window，Child 的 `recv_post - recv_cqe` 等于 receive credit；这说明 timeout 快照中的 slot 仍分别处于 `SendPosted`/`PostedRecv`，没有证据表明 CQE 已被 poller 消费后漏掉 slot 回收。
 
-- node3 Parent、node4 Child；
-- Memory 64 MiB、payload 32768 bytes、W=1 成功；
-- W=1 的 `send_post/send_cqe/recv_post/recv_cqe` 均为 2050，`cqe_error=0`，length/CRC32 完整性通过；
-- 相同 bytes/chunk 的 W=4 当前失败：Parent 报 `operation URMA pipeline capacity timed out`，Child 报 `operation URMA benchmark receive timed out`。
+源码定位到的根因是数据阶段错误使用了“总阶段绝对 deadline”：
 
-当前最高概率推断是 W=4 只维持 4 个 RX credit、没有额外 RQ headroom，Parent 收到 send CQE 后可能在 Child 处理 recv CQE 并 repost 前继续发送，使远端 RQ 短暂耗尽并进入 RNR。该判断属于架构推断，尚未被失败现场统计或 UDMA/provider 日志确认，不能记录为已验证根因。CompletionPoller counter、TX slot 回收或 pipeline tracker 是否在真实失败点发生分叉也仍待现场数据确认。
+- Parent `send_source()` 在第一条 Data 前只创建一次 `now + 30s`，随后把同一个 deadline 传给所有 chunk；传输累计超过 30 秒后，窗口下一次满时会在 poll 前直接 timeout。
+- Child receive loop 同样只在 Start 后创建一次 deadline，并在每次 poll 前检查；因此持续有 CQE 进展的长传输也会在总耗时达到 30 秒后退出。
+- Parent 一旦在 window 满时退出，快照自然留下恰好 W 个 SEND；Child 同时保留当前 receive credit 个 RECV。这与 W=3 时最后 3 SEND、6 RECV 的现场一致，不表示这批 WR 已经发生 slot/token 回收错误。
 
-为收集证据，两个目标 timeout 现在各输出一条 `event=urma_benchmark_timeout` 的单行 JSON，不恢复逐 chunk/逐 CQE 成功日志。
+最小修复保持 `TIMEOUT=30s`、poll batch、yield 策略、window、receive credit、Metadata/Data/End 和 shared-JFR 配置不变，只把判断改为 CQE 无进展 watchdog：每批非空 completion 都刷新 `last_progress`，只有连续 30 秒 poll 不到新 CQE 才报 timeout。Parent capacity wait、最终 pipeline drain 和 Child receive loop 使用同一语义，并先 poll、再在空结果上判断 idle timeout，避免截止点已有 CQE 却未消费。
 
-Parent `pipeline_capacity` diagnostic 包含：
+为继续验证 WR/slot 生命周期，benchmark Data SEND 和 payload RECV 在现有 `user_ctx -> WrHandle` outstanding 表中附带逻辑 sequence；它不改变 pointer-free `WrToken` 编码，也不改变 CQE 路由。timeout 单行 JSON 新增：
 
 ```text
-configured_window
-current_outstanding_send
-pipeline_tracker_current
-max_outstanding_send
-send_post / send_cqe
-recv_post / recv_cqe
-cqe_error
-poll_calls / empty_polls
-connection_outstanding_send
-tx_slots.free / allocated / send_posted / send_completed / other
+Parent:
+  last_completed_sequence
+  pending_send[].sequence / slot_id / slot_state
+
+Child:
+  last_completed_sequence
+  pending_recv[].sequence / slot_id / slot_state
 ```
 
-Child `benchmark_receive` diagnostic 包含：
+原有 completion counters 和 slot 聚合 snapshot 保留。Child 的 pending receive sequence 是 RC 消息顺序下预投递 credit 对应的期望 Data/End sequence；最后一次 Data 的 sequence 后一项即 End sequence。诊断只读，不增加第二套完成计数。
 
-```text
-configured_receive_credit
-current_receive_credit
-benchmark_credit_current
-benchmark_credit_remaining_messages
-recv_post / recv_cqe
-send_post / send_cqe
-cqe_error
-poll_calls / empty_polls
-connection_outstanding_recv
-rx_slots.free / allocated / posted_recv / recv_completed / other
-```
+当前验证状态：
 
-slot 统计来自 BufferPool 当前状态的只读 snapshot；completion 字段直接复用现有 `CompletionStats`，没有维护第二套 counter。该诊断没有改变 window、RX prepost/repost、poll batch、retry/backoff、timeout、slot 状态转换或 native handle ownership。`send_completed`/`recv_completed` 通常会因为 completion path 随即 release slot 而为 0，但保留它们可以在 timeout 时确认是否存在完成后未释放的 slot。
-
-下一步需在 node3/node4 使用原失败参数重新运行 W=4，同时保存 Parent/Child timeout JSON 和 UDMA/provider 日志。只有现场数据能够区分：RQ/RNR、provider 多 outstanding SEND 路径、completion accounting 分叉或其他原因。
-
-本轮本地验证结果：`cargo fmt --check` 通过；`cargo check --features urma` 和 `cargo test --features urma --no-run` 均因开发机找不到 `urma_api.h` 而在 build script 阶段停止，尚未完成 feature-on 类型检查或测试编译。真实 W=4 provider 回归等待 node3/node4 执行。
-
-为单独验证 RQ headroom 推断，B2 benchmark 当前仅把 receive credit target 从 `window` 调整为：
-
-```text
-min(2 * window, rx_slot_count, remaining_messages)
-```
-
-默认 RX slot count 为 8，因此 W=4 的 `configured_receive_credit` 从 4 变为 8；W=8 仍受 RX slot count 限制为 8。该实验改动不调整 send window、RX repost 时机、polling、timeout、retry/backoff、Metadata/Data/End 协议或 BufferPool 生命周期。即使 W=4 重跑成功，也只能作为支持 RQ headroom 推断的实验现象，仍需结合 timeout/provider 证据确认根因。
+- 已编译：`cargo check --no-default-features`、使用当前 UMDK headers/lib 的 `cargo check --features urma`。
+- 已单元测试：idle watchdog 从最后一次进展计时、RX 预投递 sequence 连续性以及既有 pipeline/credit/codec 测试。
+- 待真实 provider 验证：node3/node4 上 W=3/4/8、64 MiB 及更大传输。完成现场回归前，不声称该修复已经 hardware validated。
 
 ## B2 测试方法
 
@@ -280,6 +257,7 @@ integrity.ok == true
 bytes == 67108864
 bytes_sent == bytes_received == 67108864
 current_outstanding_send == 0
+current_outstanding_recv == 0
 send_post == send_cqe
 recv_post == recv_cqe
 cqe_error == 0
@@ -357,7 +335,7 @@ memory 64 MiB: W=1,4,8
 file buffered 64 MiB: W=1,4,8
 ```
 
-每个 W>1 正式结果必须同时检查：integrity ok、bytes 相等、`current_outstanding_send=0`、`max_outstanding_send>1`、send/recv post 与 CQE 数量一致、`cqe_error=0`。文件 case 还需 `cmp` 输入输出。当前真实 UB 验证状态：`awaiting environment validation`。
+每个 W>1 正式结果必须同时检查：integrity ok、bytes 相等、`current_outstanding_send=0`、`current_outstanding_recv=0`、`max_outstanding_send>1`、send/recv post 与 CQE 数量一致、`cqe_error=0`。文件 case 还需 `cmp` 输入输出。当前真实 UB 验证状态：`awaiting environment validation`。
 
 ## B3 接口（仅保留，未开始）
 

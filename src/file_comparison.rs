@@ -547,6 +547,7 @@ fn validate_b4_result(
                 "empty_polls",
                 "max_outstanding_send",
                 "current_outstanding_send",
+                "current_outstanding_recv",
                 "configured_window",
                 "configured_receive_credit",
                 "slot_size",
@@ -558,6 +559,7 @@ fn validate_b4_result(
                 stat(name)?;
             }
             if stat("current_outstanding_send")? != 0
+                || stat("current_outstanding_recv")? != 0
                 || stat("send_post")? != stat("send_cqe")?
                 || stat("recv_post")? != stat("recv_cqe")?
                 || stat("cqe_error")? != 0
@@ -790,6 +792,7 @@ mod tests {
                     ("empty_polls", 0),
                     ("max_outstanding_send", u64::from(case.window)),
                     ("current_outstanding_send", 0),
+                    ("current_outstanding_recv", 0),
                     ("configured_window", u64::from(case.window)),
                     ("configured_receive_credit", u64::from(case.window)),
                     ("slot_size", 266_240),

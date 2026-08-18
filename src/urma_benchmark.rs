@@ -4,8 +4,17 @@ use crate::{
     BenchmarkCase, BenchmarkSink, BenchmarkTransport, Crc32Hasher, DigestAlgorithm, Error,
     IntegrationMessageBodyV3, IntegrationMessageV3, Result,
 };
+use std::time::{Duration, Instant};
 
 pub const URMA_PROTOCOL_HEADER_LEN: usize = crate::message::DATA_HEADER_LEN;
+
+pub(crate) fn idle_timeout_elapsed(
+    last_progress: Instant,
+    now: Instant,
+    timeout: Duration,
+) -> bool {
+    now.saturating_duration_since(last_progress) >= timeout
+}
 
 /// Derives the registered slot used by the URMA benchmark. `chunk_size`
 /// remains the business payload size; only the backing slot is rounded up.
@@ -168,6 +177,7 @@ pub struct ReceiveCreditController {
     configured: usize,
     remaining_messages: usize,
     current_credit: usize,
+    next_post_sequence: u64,
 }
 
 pub(crate) fn receive_credit_target(
@@ -194,6 +204,7 @@ impl ReceiveCreditController {
             configured,
             remaining_messages,
             current_credit: 0,
+            next_post_sequence: 0,
         })
     }
 
@@ -207,7 +218,12 @@ impl ReceiveCreditController {
         if self.posts_needed() == 0 {
             return Err(invalid("receive post would exceed required credit"));
         }
+        let next_post_sequence = self
+            .next_post_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("receive post sequence overflow".into()))?;
         self.current_credit += 1;
+        self.next_post_sequence = next_post_sequence;
         Ok(())
     }
 
@@ -233,6 +249,10 @@ impl ReceiveCreditController {
 
     pub const fn remaining_messages(&self) -> usize {
         self.remaining_messages
+    }
+
+    pub const fn next_post_sequence(&self) -> u64 {
+        self.next_post_sequence
     }
 }
 
@@ -469,6 +489,7 @@ mod tests {
     fn receive_credit_replenishes_without_overposting() {
         let mut credit = ReceiveCreditController::new(4, 7).unwrap();
         while credit.posts_needed() != 0 {
+            assert_eq!(credit.next_post_sequence(), credit.current_credit() as u64);
             credit.posted().unwrap();
         }
         assert_eq!(credit.current_credit(), 4);
@@ -483,6 +504,18 @@ mod tests {
         }
         assert_eq!(credit.remaining_messages(), 0);
         assert_eq!(credit.current_credit(), 0);
+        assert_eq!(credit.next_post_sequence(), 7);
+    }
+
+    #[test]
+    fn idle_timeout_is_measured_from_latest_progress() {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(30);
+        let progress = start + Duration::from_secs(25);
+        let now = start + Duration::from_secs(40);
+
+        assert!(idle_timeout_elapsed(start, now, timeout));
+        assert!(!idle_timeout_elapsed(progress, now, timeout));
     }
 
     #[test]

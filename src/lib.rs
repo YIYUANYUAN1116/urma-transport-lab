@@ -29,7 +29,7 @@ pub use benchmark::{
     MemorySink, MemorySource, TimingMode, TimingSample,
 };
 pub use buffer::{BufferPoolConfig, SlotId, SlotKind, SlotState, SlotStateSnapshot};
-pub use completion::{CompletionEvent, CompletionStats};
+pub use completion::{CompletionDiagnostic, CompletionEvent, CompletionStats, PendingWrSnapshot};
 pub use connection::ConnectionState;
 #[cfg(feature = "urma")]
 pub use connection::UrmaConnection;

@@ -123,6 +123,7 @@ pub struct UrmaTransportStats {
     pub empty_polls: u64,
     pub max_outstanding_send: u64,
     pub current_outstanding_send: u64,
+    pub current_outstanding_recv: u64,
     pub configured_window: u64,
     pub configured_receive_credit: u64,
     pub slot_size: u64,
@@ -146,6 +147,7 @@ impl UrmaTransportStats {
             ("empty_polls", self.empty_polls),
             ("max_outstanding_send", self.max_outstanding_send),
             ("current_outstanding_send", self.current_outstanding_send),
+            ("current_outstanding_recv", self.current_outstanding_recv),
             ("configured_window", self.configured_window),
             ("configured_receive_credit", self.configured_receive_credit),
             ("slot_size", self.slot_size),
@@ -329,20 +331,21 @@ pub fn run_urma_child(
         None => Measurement::start(case.timing_mode)?,
     };
 
-    let deadline = Instant::now() + TIMEOUT;
+    let mut last_progress = Instant::now();
     let mut bytes_received = 0u64;
     'receive: loop {
-        if Instant::now() >= deadline {
-            log_child_receive_timeout(&connection, &credit);
-            return Err(Error::Timeout {
-                operation: "URMA benchmark receive",
-            });
-        }
         let events = connection.poll_once()?;
         if events.is_empty() {
+            if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
+                log_child_receive_timeout(&connection, &credit);
+                return Err(Error::Timeout {
+                    operation: "URMA benchmark receive",
+                });
+            }
             thread::yield_now();
             continue;
         }
+        last_progress = Instant::now();
         for event in events {
             match event {
                 CompletionEvent::SendCompleted { .. } => {
@@ -420,12 +423,12 @@ fn send_source(
     pipeline: &mut PipelineTracker,
     bytes_sent: &mut u64,
 ) -> Result<u32> {
-    let deadline = Instant::now() + TIMEOUT;
+    let mut last_progress = Instant::now();
     let mut sequence = 0u32;
     match source {
         UrmaBenchmarkSource::Memory(source) => {
             for chunk in source.chunks(chunk_size)? {
-                post_data(connection, pipeline, sequence, chunk, deadline)?;
+                post_data(connection, pipeline, sequence, chunk, &mut last_progress)?;
                 *bytes_sent += chunk.len() as u64;
                 sequence = sequence
                     .checked_add(1)
@@ -440,7 +443,13 @@ fn send_source(
                 if read == 0 {
                     break;
                 }
-                post_data(connection, pipeline, sequence, &buffer[..read], deadline)?;
+                post_data(
+                    connection,
+                    pipeline,
+                    sequence,
+                    &buffer[..read],
+                    &mut last_progress,
+                )?;
                 *bytes_sent += read as u64;
                 sequence = sequence
                     .checked_add(1)
@@ -456,19 +465,21 @@ fn post_data(
     pipeline: &mut PipelineTracker,
     sequence: u32,
     payload: &[u8],
-    deadline: Instant,
+    last_progress: &mut Instant,
 ) -> Result<()> {
     while !pipeline.can_post() {
-        if Instant::now() >= deadline {
+        let completed = poll_send_completions(connection, pipeline)?;
+        if completed != 0 {
+            *last_progress = Instant::now();
+        } else if idle_timeout_elapsed(*last_progress, Instant::now(), TIMEOUT) {
             log_parent_pipeline_capacity_timeout(connection, pipeline);
             return Err(Error::Timeout {
                 operation: "URMA pipeline capacity",
             });
         }
-        poll_send_completions(connection, pipeline)?;
     }
     let message = IntegrationMessageV3::data(REQUEST_ID, sequence, payload.to_vec());
-    connection.send_frame(&message.encode()?)?;
+    connection.send_frame_tracked(&message.encode()?, u64::from(sequence))?;
     pipeline.posted()?;
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
     Ok(())
@@ -478,14 +489,17 @@ fn drain_pipeline(
     connection: &mut UrmaConnection<'_>,
     pipeline: &mut PipelineTracker,
 ) -> Result<()> {
-    let deadline = Instant::now() + TIMEOUT;
+    let mut last_progress = Instant::now();
     while pipeline.current() != 0 {
-        if Instant::now() >= deadline {
+        let completed = poll_send_completions(connection, pipeline)?;
+        if completed != 0 {
+            last_progress = Instant::now();
+        } else if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
+            log_parent_pipeline_timeout(connection, pipeline, "pipeline_drain");
             return Err(Error::Timeout {
                 operation: "URMA pipeline drain",
             });
         }
-        poll_send_completions(connection, pipeline)?;
     }
     Ok(())
 }
@@ -493,10 +507,14 @@ fn drain_pipeline(
 fn poll_send_completions(
     connection: &mut UrmaConnection<'_>,
     pipeline: &mut PipelineTracker,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut completed = 0;
     for event in connection.poll_once()? {
         match event {
-            CompletionEvent::SendCompleted { .. } => pipeline.completed()?,
+            CompletionEvent::SendCompleted { .. } => {
+                pipeline.completed()?;
+                completed += 1;
+            }
             CompletionEvent::RecvCompleted { .. } => {
                 return Err(Error::Protocol(
                     "unexpected receive CQE while sending URMA payload".into(),
@@ -508,7 +526,7 @@ fn poll_send_completions(
     if pipeline.current() != 0 {
         thread::yield_now();
     }
-    Ok(())
+    Ok(completed)
 }
 
 fn replenish_credit(
@@ -516,7 +534,7 @@ fn replenish_credit(
     credit: &mut ReceiveCreditController,
 ) -> Result<()> {
     while credit.posts_needed() != 0 {
-        connection.recv_ready()?;
+        connection.recv_ready_tracked(credit.next_post_sequence())?;
         credit.posted()?;
     }
     Ok(())
@@ -526,10 +544,20 @@ fn log_parent_pipeline_capacity_timeout(
     connection: &UrmaConnection<'_>,
     pipeline: &PipelineTracker,
 ) {
+    log_parent_pipeline_timeout(connection, pipeline, "pipeline_capacity");
+}
+
+fn log_parent_pipeline_timeout(
+    connection: &UrmaConnection<'_>,
+    pipeline: &PipelineTracker,
+    operation: &str,
+) {
     let stats = connection.stats();
     let slots = connection.tx_slot_state_snapshot();
+    let diagnostic = connection.pending_send_diagnostic();
     eprintln!(
-        "{{\"event\":\"urma_benchmark_timeout\",\"role\":\"parent\",\"operation\":\"pipeline_capacity\",\"configured_window\":{},\"current_outstanding_send\":{},\"pipeline_tracker_current\":{},\"max_outstanding_send\":{},\"send_post\":{},\"send_cqe\":{},\"recv_post\":{},\"recv_cqe\":{},\"cqe_error\":{},\"poll_calls\":{},\"empty_polls\":{},\"connection_outstanding_send\":{},\"tx_slots\":{{\"free\":{},\"allocated\":{},\"send_posted\":{},\"send_completed\":{},\"other\":{}}}}}",
+        "{{\"event\":\"urma_benchmark_timeout\",\"role\":\"parent\",\"operation\":\"{}\",\"configured_window\":{},\"current_outstanding_send\":{},\"pipeline_tracker_current\":{},\"max_outstanding_send\":{},\"send_post\":{},\"send_cqe\":{},\"recv_post\":{},\"recv_cqe\":{},\"cqe_error\":{},\"poll_calls\":{},\"empty_polls\":{},\"connection_outstanding_send\":{},\"last_completed_sequence\":{},\"pending_send\":{},\"tx_slots\":{{\"free\":{},\"allocated\":{},\"send_posted\":{},\"send_completed\":{},\"other\":{}}}}}",
+        operation,
         pipeline.configured_window(),
         connection.outstanding_send(),
         pipeline.current(),
@@ -542,6 +570,8 @@ fn log_parent_pipeline_capacity_timeout(
         stats.poll_calls,
         stats.empty_polls,
         connection.outstanding_send(),
+        optional_sequence_json(diagnostic.last_completed_sequence),
+        pending_wr_json(&diagnostic.pending),
         slots.free,
         slots.allocated,
         slots.send_posted,
@@ -553,8 +583,9 @@ fn log_parent_pipeline_capacity_timeout(
 fn log_child_receive_timeout(connection: &UrmaConnection<'_>, credit: &ReceiveCreditController) {
     let stats = connection.stats();
     let slots = connection.rx_slot_state_snapshot();
+    let diagnostic = connection.pending_recv_diagnostic();
     eprintln!(
-        "{{\"event\":\"urma_benchmark_timeout\",\"role\":\"child\",\"operation\":\"benchmark_receive\",\"configured_receive_credit\":{},\"current_receive_credit\":{},\"benchmark_credit_current\":{},\"benchmark_credit_remaining_messages\":{},\"recv_post\":{},\"recv_cqe\":{},\"send_post\":{},\"send_cqe\":{},\"cqe_error\":{},\"poll_calls\":{},\"empty_polls\":{},\"connection_outstanding_recv\":{},\"rx_slots\":{{\"free\":{},\"allocated\":{},\"posted_recv\":{},\"recv_completed\":{},\"other\":{}}}}}",
+        "{{\"event\":\"urma_benchmark_timeout\",\"role\":\"child\",\"operation\":\"benchmark_receive\",\"configured_receive_credit\":{},\"current_receive_credit\":{},\"benchmark_credit_current\":{},\"benchmark_credit_remaining_messages\":{},\"recv_post\":{},\"recv_cqe\":{},\"send_post\":{},\"send_cqe\":{},\"cqe_error\":{},\"poll_calls\":{},\"empty_polls\":{},\"connection_outstanding_recv\":{},\"last_completed_sequence\":{},\"pending_recv\":{},\"rx_slots\":{{\"free\":{},\"allocated\":{},\"posted_recv\":{},\"recv_completed\":{},\"other\":{}}}}}",
         credit.configured_credit(),
         connection.receive_credit(),
         credit.current_credit(),
@@ -567,12 +598,33 @@ fn log_child_receive_timeout(connection: &UrmaConnection<'_>, credit: &ReceiveCr
         stats.poll_calls,
         stats.empty_polls,
         connection.outstanding_recv(),
+        optional_sequence_json(diagnostic.last_completed_sequence),
+        pending_wr_json(&diagnostic.pending),
         slots.free,
         slots.allocated,
         slots.posted_recv,
         slots.recv_completed,
         slots.other,
     );
+}
+
+fn optional_sequence_json(sequence: Option<u64>) -> String {
+    sequence.map_or_else(|| "null".into(), |value| value.to_string())
+}
+
+fn pending_wr_json(pending: &[crate::PendingWrSnapshot]) -> String {
+    let entries = pending
+        .iter()
+        .map(|item| {
+            format!(
+                "{{\"sequence\":{},\"slot_id\":{},\"slot_state\":\"{:?}\"}}",
+                optional_sequence_json(item.sequence),
+                item.slot.index(),
+                item.state,
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("[{}]", entries.join(","))
 }
 
 fn read_chunk(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
@@ -686,6 +738,7 @@ fn combined_stats(
         empty_polls: parent.empty_polls + child.empty_polls,
         max_outstanding_send: parent.max_outstanding_send,
         current_outstanding_send: 0,
+        current_outstanding_recv: 0,
         configured_window: u64::from(case.window),
         configured_receive_credit: u64::try_from(configured_receive_credit)
             .map_err(|_| invalid("configured receive credit does not fit u64"))?,

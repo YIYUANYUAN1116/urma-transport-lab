@@ -1,4 +1,4 @@
-use crate::{Error, Result, SlotId};
+use crate::{Error, Result, SlotId, SlotState};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -17,6 +17,19 @@ pub struct CompletionStats {
 pub enum CompletionEvent {
     SendCompleted { slot: SlotId },
     RecvCompleted { slot: SlotId, bytes: Vec<u8> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingWrSnapshot {
+    pub sequence: Option<u64>,
+    pub slot: SlotId,
+    pub state: SlotState,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompletionDiagnostic {
+    pub pending: Vec<PendingWrSnapshot>,
+    pub last_completed_sequence: Option<u64>,
 }
 
 pub fn check_deadline(deadline: Instant, operation: &'static str) -> Result<()> {
@@ -53,13 +66,20 @@ mod native {
     };
     use std::collections::HashMap;
 
+    struct OutstandingWr {
+        handle: ffi::WrHandle,
+        sequence: Option<u64>,
+    }
+
     pub(crate) struct CompletionPoller {
         connection_id: u16,
         generation: u8,
         batch: usize,
-        outstanding: HashMap<u64, ffi::WrHandle>,
+        outstanding: HashMap<u64, OutstandingWr>,
         outstanding_send: usize,
         outstanding_recv: usize,
+        last_completed_send_sequence: Option<u64>,
+        last_completed_recv_sequence: Option<u64>,
         stats: CompletionStats,
     }
 
@@ -77,6 +97,8 @@ mod native {
                 outstanding: HashMap::new(),
                 outstanding_send: 0,
                 outstanding_recv: 0,
+                last_completed_send_sequence: None,
+                last_completed_recv_sequence: None,
                 stats: CompletionStats::default(),
             })
         }
@@ -86,11 +108,18 @@ mod native {
             user_ctx: u64,
             operation: OperationType,
             wr: ffi::WrHandle,
+            sequence: Option<u64>,
         ) -> Result<()> {
             if self.outstanding.contains_key(&user_ctx) {
                 return Err(Error::Protocol("duplicate outstanding user_ctx".into()));
             }
-            self.outstanding.insert(user_ctx, wr);
+            self.outstanding.insert(
+                user_ctx,
+                OutstandingWr {
+                    handle: wr,
+                    sequence,
+                },
+            );
             match operation {
                 OperationType::Send => {
                     self.stats.send_post += 1;
@@ -153,11 +182,11 @@ mod native {
                 return Err(Error::Protocol("stale or foreign CQE user_ctx".into()));
             }
             let expected_recv = token.operation == OperationType::Recv;
-            let wr = self
+            let outstanding = self
                 .outstanding
                 .remove(&record.user_ctx)
                 .ok_or_else(|| Error::Protocol("CQE has no outstanding WR".into()))?;
-            wr.complete();
+            outstanding.handle.complete();
             match token.operation {
                 OperationType::Send => self.outstanding_send -= 1,
                 OperationType::Recv => self.outstanding_recv -= 1,
@@ -182,6 +211,9 @@ mod native {
                     pool.complete_send(token.slot)?;
                     pool.release(token.slot)?;
                     self.stats.send_cqe += 1;
+                    if let Some(sequence) = outstanding.sequence {
+                        self.last_completed_send_sequence = Some(sequence);
+                    }
                     Ok(CompletionEvent::SendCompleted { slot: token.slot })
                 }
                 OperationType::Recv => {
@@ -199,6 +231,9 @@ mod native {
                     let bytes = pool.complete_recv(token.slot, record.completion_len)?;
                     pool.release(token.slot)?;
                     self.stats.recv_cqe += 1;
+                    if let Some(sequence) = outstanding.sequence {
+                        self.last_completed_recv_sequence = Some(sequence);
+                    }
                     Ok(CompletionEvent::RecvCompleted {
                         slot: token.slot,
                         bytes,
@@ -229,6 +264,33 @@ mod native {
 
         pub(crate) fn outstanding_recv(&self) -> usize {
             self.outstanding_recv
+        }
+
+        pub(crate) fn diagnostic(
+            &self,
+            operation: OperationType,
+            pool: &UrmaBufferPool,
+        ) -> CompletionDiagnostic {
+            let mut pending = self
+                .outstanding
+                .iter()
+                .filter_map(|(user_ctx, outstanding)| {
+                    let token = WrToken::decode(*user_ctx).ok()?;
+                    (token.operation == operation).then(|| PendingWrSnapshot {
+                        sequence: outstanding.sequence,
+                        slot: token.slot,
+                        state: pool.slot_state(token.slot).unwrap_or(SlotState::Free),
+                    })
+                })
+                .collect::<Vec<_>>();
+            pending.sort_by_key(|item| (item.sequence, item.slot.index()));
+            CompletionDiagnostic {
+                pending,
+                last_completed_sequence: match operation {
+                    OperationType::Send => self.last_completed_send_sequence,
+                    OperationType::Recv => self.last_completed_recv_sequence,
+                },
+            }
         }
     }
 

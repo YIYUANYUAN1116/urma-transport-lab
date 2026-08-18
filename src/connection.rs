@@ -20,7 +20,8 @@ mod native {
     use crate::{
         buffer::UrmaBufferPool,
         completion::{
-            check_deadline, deadline_after, CompletionEvent, CompletionPoller, CompletionStats,
+            check_deadline, deadline_after, CompletionDiagnostic, CompletionEvent,
+            CompletionPoller, CompletionStats,
         },
         ffi,
         jetty::UrmaJetty,
@@ -121,6 +122,14 @@ mod native {
         }
 
         pub fn recv_ready(&mut self) -> Result<()> {
+            self.recv_ready_with_sequence(None)
+        }
+
+        pub fn recv_ready_tracked(&mut self, sequence: u64) -> Result<()> {
+            self.recv_ready_with_sequence(Some(sequence))
+        }
+
+        fn recv_ready_with_sequence(&mut self, sequence: Option<u64>) -> Result<()> {
             if !matches!(self.state, ConnectionState::Bound | ConnectionState::Ready) {
                 return Err(self.state_error("post receive"));
             }
@@ -148,7 +157,8 @@ mod native {
                     return Err(error);
                 }
             };
-            self.poller.track(user_ctx, OperationType::Recv, wr)?;
+            self.poller
+                .track(user_ctx, OperationType::Recv, wr, sequence)?;
             self.receive_credit.posted();
             Ok(())
         }
@@ -159,6 +169,14 @@ mod native {
 
         /// Post one encoded message without imposing a completion drain.
         pub fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
+            self.send_frame_with_sequence(bytes, None)
+        }
+
+        pub fn send_frame_tracked(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
+            self.send_frame_with_sequence(bytes, Some(sequence))
+        }
+
+        fn send_frame_with_sequence(&mut self, bytes: &[u8], sequence: Option<u64>) -> Result<()> {
             self.require(ConnectionState::Ready)?;
             self.receive_credit.require_before_send()?;
             let slot = self
@@ -191,7 +209,8 @@ mod native {
                     return Err(error);
                 }
             };
-            self.poller.track(user_ctx, OperationType::Send, wr)
+            self.poller
+                .track(user_ctx, OperationType::Send, wr, sequence)
         }
 
         pub fn poll_once(&mut self) -> Result<Vec<CompletionEvent>> {
@@ -272,6 +291,16 @@ mod native {
 
         pub fn rx_slot_state_snapshot(&self) -> SlotStateSnapshot {
             self.buffer_pool.slot_state_snapshot(SlotKind::Rx)
+        }
+
+        pub fn pending_send_diagnostic(&self) -> CompletionDiagnostic {
+            self.poller
+                .diagnostic(OperationType::Send, self.buffer_pool)
+        }
+
+        pub fn pending_recv_diagnostic(&self) -> CompletionDiagnostic {
+            self.poller
+                .diagnostic(OperationType::Recv, self.buffer_pool)
         }
 
         pub(crate) fn fail(&mut self) {
