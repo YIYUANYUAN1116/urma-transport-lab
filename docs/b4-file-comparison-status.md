@@ -118,6 +118,146 @@ cargo test --features urma --no-run
 
 Feature-on 编译和真实 provider 行为仍需 Linux + UMDK 环境确认。真实 UB B4 benchmark 尚未执行。
 
+## B4 测试方法
+
+### 1. 先验证 matrix 与报告代码
+
+B4 的 transport-neutral case 展开、结果校验、failure 分类、聚合和 JSON/CSV 可以在没有 URMA provider 的机器上测试：
+
+```bash
+cargo fmt --check
+cargo check --no-default-features
+cargo test --no-default-features file_comparison::tests
+```
+
+这组测试使用 synthetic `BenchmarkResult` 验证报告逻辑，不产生真实 TCP/URMA benchmark 样本。Linux + UMDK 构建机还应执行：
+
+```bash
+cargo check --features urma
+cargo test --features urma --no-run
+cargo build --release --features urma --bin benchmark
+```
+
+### 2. 准备统一输入与参数
+
+正式 B4 必须先完成 B2 correctness 和 B3 calibration，并使用 B3 得到的 `C*`/`W*`。以下 64 MiB、64 KiB、W=4 只演示命令格式，不表示推荐参数或 B3 结论。
+
+在 Parent 节点生成一次输入文件，三种 transport 和所有 repeat 都复用它：
+
+```bash
+dd if=/dev/urandom of=/tmp/b4-input.bin bs=1M count=64 status=progress
+sha256sum /tmp/b4-input.bin
+```
+
+所有 case 必须保持相同的：
+
+```text
+bytes=67108864
+chunk_size=C*（示例为 65536）
+window=W*（示例为 4；TCP 会记录但不用它控制 socket）
+timing_mode
+completion_policy
+input file
+```
+
+### 3. 逐 transport 运行真实 file-to-file case
+
+当前 `benchmark` CLI 一次运行一个 case。每个 case 都先在 Parent/node3 启动监听端，再在 Child/node4 启动连接端。以下先以 `tcp-userspace`、repeat 1 为例。
+
+node3 Parent：
+
+```bash
+./target/release/benchmark \
+  --role parent \
+  --case-id b4-tcp-userspace \
+  --repeat 1 \
+  --scenario file \
+  --transport tcp-userspace \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --window 4 \
+  --timing-mode steady-state \
+  --completion-policy buffered \
+  --seed 42 \
+  --input /tmp/b4-input.bin \
+  --listen 0.0.0.0:19091
+```
+
+node4 Child：
+
+```bash
+./target/release/benchmark \
+  --role child \
+  --case-id b4-tcp-userspace \
+  --repeat 1 \
+  --scenario file \
+  --transport tcp-userspace \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --window 4 \
+  --timing-mode steady-state \
+  --completion-policy buffered \
+  --seed 42 \
+  --output /tmp/b4-tcp-userspace-r1.bin \
+  --parent 10.x.x.x:19091
+```
+
+测试 `tcp-sendfile` 时，两端同时修改：
+
+```text
+--case-id b4-tcp-sendfile
+--transport tcp-sendfile
+```
+
+并为 Child 使用独立输出文件，例如 `/tmp/b4-tcp-sendfile-r1.bin`。
+
+测试 `urma` 时，两端同时修改为：
+
+```text
+--case-id b4-urma
+--transport urma
+--device udmac0d1e2
+--eid-index 0
+```
+
+URMA Parent 仍使用 `--listen 0.0.0.0:19091`，Child 仍使用 `--parent 10.x.x.x:19091`，Child 输出可使用 `/tmp/b4-urma-r1.bin`。两端的 `case-id`、repeat、transport、bytes、chunk、window、timing、completion 和 seed 必须完全一致。
+
+### 4. repeat、完整性与结果验收
+
+每种 transport 先做 1 次不计入结果的 warm-up，再分别以 `--repeat 1` 到 `--repeat 5` 重启一对 Parent/Child。`--repeat` 只是样本编号，不会自动循环。每次使用独立 Child 输出路径，并保存两端单行 JSON；正式比较使用 Child elapsed，Parent 的时间保留在 `parent_elapsed_ns`。
+
+每个输出文件均需比较 length/digest；将输出复制回 Parent 后可执行：
+
+```bash
+cmp /tmp/b4-input.bin /tmp/b4-tcp-userspace-r1.bin
+cmp /tmp/b4-input.bin /tmp/b4-tcp-sendfile-r1.bin
+cmp /tmp/b4-input.bin /tmp/b4-urma-r1.bin
+```
+
+所有成功 case 都必须满足公共 integrity 和 bytes 账目。另按 transport 检查：
+
+- `tcp-userspace`：存在 userspace read/write counters；
+- `tcp-sendfile`：`sendfile_calls > 0`，Parent userspace read/write 为 0；
+- `urma`：send/recv post 与 CQE 闭合、`cqe_error=0`、`current_outstanding_send=0`、effective payload/window 与 case 一致，W>1 时 `max_outstanding_send>1`。
+
+需要 `durable` 数据时，三种 transport 全部改为 `--completion-policy durable` 并重新运行完整 repeat，不得把 buffered 与 durable 样本混在同一聚合中。
+
+### 5. 当前自动化边界
+
+`B4FileMatrixRunner` 当前是 library API，`run_with()` 需要调用方提供执行真实 Parent/Child transport 的 callback；仓库尚无独立 B4 matrix CLI。现有 `benchmark` binary 只输出单 case raw JSON，不会自动展开三种 transport/repeat，也不会直接输出 `B4Report` 的 aggregate JSON/CSV。
+
+因此当前可执行验证分为：
+
+```text
+file_comparison unit tests
+  -> 验证 matrix/report 逻辑
+
+benchmark Parent/Child single cases
+  -> 验证真实 transport、文件完整性和 raw metrics
+```
+
+在增加真实 matrix driver 之前，正式样本需按上述方法逐 case 调度和留存；不能声称已经端到端验证 `B4FileMatrixRunner` 的真实 transport callback 或自动聚合输出。
+
 ## 当前证据边界与后续顺序
 
 B3 尚未执行，因此 C*/W* 未确定。当前不能得出 TCP userspace、Linux sendfile 或 URMA 的性能优劣结论，也不能选择或暗示某组 URMA 参数最优。

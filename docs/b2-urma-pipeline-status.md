@@ -156,6 +156,140 @@ cargo test --features urma --no-run
 
 Feature-on 仍须在有 UMDK 的 Linux 构建机执行，不能用 feature-off 结果推断 provider 行为。
 
+## B2 测试方法
+
+### 1. Linux + UMDK 编译与非 provider 回归
+
+在能找到 UMDK headers、libraries 和 provider 的 Linux 构建机执行：
+
+```bash
+cargo fmt --check
+cargo check --features urma
+cargo test --features urma --no-run
+cargo test --no-default-features
+cargo build --release --features urma --bin benchmark
+```
+
+前三项确认 feature-on 代码能够编译；feature-off 单元测试验证 pipeline/window、RX credit、codec、slot 推导和 completion accounting。它们都不能替代真实 provider 测试。
+
+### 2. 双节点 Memory correctness
+
+下面以 Parent 位于 node3、Child 位于 node4、Parent 数据面地址为 `10.x.x.x:19091`、两端设备名均为 `udmac0d1e2` 为例。先在 node3 启动 Parent：
+
+```bash
+./target/release/benchmark \
+  --role parent \
+  --case-id b2-memory-w4 \
+  --repeat 1 \
+  --scenario memory \
+  --transport urma \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --window 4 \
+  --timing-mode steady-state \
+  --completion-policy buffered \
+  --seed 42 \
+  --listen 0.0.0.0:19091 \
+  --device udmac0d1e2 \
+  --eid-index 0
+```
+
+再在 node4 启动参数完全匹配的 Child，仅 role、连接地址不同：
+
+```bash
+./target/release/benchmark \
+  --role child \
+  --case-id b2-memory-w4 \
+  --repeat 1 \
+  --scenario memory \
+  --transport urma \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --window 4 \
+  --timing-mode steady-state \
+  --completion-policy buffered \
+  --seed 42 \
+  --parent 10.x.x.x:19091 \
+  --device udmac0d1e2 \
+  --eid-index 0
+```
+
+分别把 `--window` 和 `--case-id` 改为 W=1、4、8，逐组重新启动 Parent/Child。CLI 的 `--repeat` 是单次样本编号，不会在进程内自动循环；需要多个样本时，应为每个 repeat 重新运行一对进程，并保证两端的 case 参数完全一致。
+
+每个成功 JSON 至少检查：
+
+```text
+integrity.ok == true
+bytes == 67108864
+bytes_sent == bytes_received == 67108864
+current_outstanding_send == 0
+send_post == send_cqe
+recv_post == recv_cqe
+cqe_error == 0
+configured_window == requested window
+effective_payload_size == 65536
+```
+
+W=4/8 且 Data message 数不少于 2 时还必须满足 `max_outstanding_send > 1`，否则只能证明传输成功，不能证明 bounded pipeline 实际生效。W=1 用作 stop-and-wait correctness 对照。
+
+### 3. 双节点 File correctness
+
+在 node3 准备恰好 64 MiB 的输入文件：
+
+```bash
+dd if=/dev/urandom of=/tmp/b2-input.bin bs=1M count=64 status=progress
+```
+
+node3 Parent：
+
+```bash
+./target/release/benchmark \
+  --role parent \
+  --case-id b2-file-w4 \
+  --repeat 1 \
+  --scenario file \
+  --transport urma \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --window 4 \
+  --timing-mode steady-state \
+  --completion-policy buffered \
+  --seed 42 \
+  --input /tmp/b2-input.bin \
+  --listen 0.0.0.0:19091 \
+  --device udmac0d1e2 \
+  --eid-index 0
+```
+
+node4 Child：
+
+```bash
+./target/release/benchmark \
+  --role child \
+  --case-id b2-file-w4 \
+  --repeat 1 \
+  --scenario file \
+  --transport urma \
+  --bytes 67108864 \
+  --chunk-size 65536 \
+  --window 4 \
+  --timing-mode steady-state \
+  --completion-policy buffered \
+  --seed 42 \
+  --output /tmp/b2-output.bin \
+  --parent 10.x.x.x:19091 \
+  --device udmac0d1e2 \
+  --eid-index 0
+```
+
+除检查 Memory case 的 JSON 账目外，还要分别在两端执行 `sha256sum` 并比较 length/digest。若把 Child 输出复制回 node3，再执行字节级比较：
+
+```bash
+cmp /tmp/b2-input.bin /tmp/b2-output-from-node4.bin
+```
+
+W=1、4、8 均按相同方法执行。`durable` 可作为额外文件落盘检查，但 B2 correctness 的基础矩阵使用 `buffered` 即可；不得把单次成功当作性能或稳定性结论。
+
 ## 真实 UB 验证（待执行）
 
 目标环境至少分别运行 Parent/Child；B2 correctness 回归可使用 64 KiB payload，执行：
