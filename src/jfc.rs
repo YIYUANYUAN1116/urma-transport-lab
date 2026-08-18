@@ -16,6 +16,7 @@ pub(crate) struct UrmaJfc {
 impl UrmaJfc {
     pub(crate) fn create(
         runtime: &mut ffi::NativeRuntime,
+        jfce: &ffi::JfceHandle,
         kind: JfcKind,
         depth: u32,
     ) -> Result<Self> {
@@ -23,7 +24,7 @@ impl UrmaJfc {
             JfcKind::Send => "create_send_jfc",
             JfcKind::Receive => "create_recv_jfc",
         };
-        let handle = ffi::JfcHandle::create(runtime, depth)
+        let handle = ffi::JfcHandle::create(runtime, jfce, depth)
             .map_err(|error| map_ffi_error(operation, error))?;
         Ok(Self {
             kind,

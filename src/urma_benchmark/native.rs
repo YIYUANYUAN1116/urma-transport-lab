@@ -125,6 +125,13 @@ pub struct UrmaTransportStats {
     pub yield_count: u64,
     pub sleep_count: u64,
     pub backoff_sleep_ns: u64,
+    pub jfc_rearm_count: u64,
+    pub event_wait_count: u64,
+    pub event_wakeup_count: u64,
+    pub event_timeout_count: u64,
+    pub spurious_wakeup_count: u64,
+    pub event_wait_ns: u64,
+    pub max_event_wait_ns: u64,
     pub max_empty_streak: u64,
     pub nonempty_polls: u64,
     pub completion_batch_total: u64,
@@ -160,6 +167,13 @@ impl UrmaTransportStats {
             ("yield_count", self.yield_count),
             ("sleep_count", self.sleep_count),
             ("backoff_sleep_ns", self.backoff_sleep_ns),
+            ("jfc_rearm_count", self.jfc_rearm_count),
+            ("event_wait_count", self.event_wait_count),
+            ("event_wakeup_count", self.event_wakeup_count),
+            ("event_timeout_count", self.event_timeout_count),
+            ("spurious_wakeup_count", self.spurious_wakeup_count),
+            ("event_wait_ns", self.event_wait_ns),
+            ("max_event_wait_ns", self.max_event_wait_ns),
             ("max_empty_streak", self.max_empty_streak),
             ("nonempty_polls", self.nonempty_polls),
             ("completion_batch_total", self.completion_batch_total),
@@ -773,6 +787,21 @@ fn combined_stats(
         backoff_sleep_ns: parent
             .backoff_sleep_ns
             .saturating_add(child.backoff_sleep_ns),
+        jfc_rearm_count: parent.jfc_rearm_count.saturating_add(child.jfc_rearm_count),
+        event_wait_count: parent
+            .event_wait_count
+            .saturating_add(child.event_wait_count),
+        event_wakeup_count: parent
+            .event_wakeup_count
+            .saturating_add(child.event_wakeup_count),
+        event_timeout_count: parent
+            .event_timeout_count
+            .saturating_add(child.event_timeout_count),
+        spurious_wakeup_count: parent
+            .spurious_wakeup_count
+            .saturating_add(child.spurious_wakeup_count),
+        event_wait_ns: parent.event_wait_ns.saturating_add(child.event_wait_ns),
+        max_event_wait_ns: parent.max_event_wait_ns.max(child.max_event_wait_ns),
         max_empty_streak: parent.max_empty_streak.max(child.max_empty_streak),
         nonempty_polls,
         completion_batch_total,
@@ -862,7 +891,7 @@ fn read_control(stream: &mut TcpStream, expected_kind: u16) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Done {
     case_id: String,
     integrity: IntegrityResult,
@@ -896,6 +925,13 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
         done.completion.yield_count,
         done.completion.sleep_count,
         done.completion.backoff_sleep_ns,
+        done.completion.jfc_rearm_count,
+        done.completion.event_wait_count,
+        done.completion.event_wakeup_count,
+        done.completion.event_timeout_count,
+        done.completion.spurious_wakeup_count,
+        done.completion.event_wait_ns,
+        done.completion.max_event_wait_ns,
         done.completion.max_empty_streak,
         done.completion.nonempty_polls,
         done.completion.completion_batch_total,
@@ -915,7 +951,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         return Err(Error::Protocol("truncated URMA Done".into()));
     }
     let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
-    let expected_len = 2 + case_len + 23 * 8 + 2 * 4;
+    let expected_len = 2 + case_len + 30 * 8 + 2 * 4;
     if input.len() != expected_len {
         return Err(Error::Protocol("invalid URMA Done length".into()));
     }
@@ -945,6 +981,13 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let yield_count = next_u64();
     let sleep_count = next_u64();
     let backoff_sleep_ns = next_u64();
+    let jfc_rearm_count = next_u64();
+    let event_wait_count = next_u64();
+    let event_wakeup_count = next_u64();
+    let event_timeout_count = next_u64();
+    let spurious_wakeup_count = next_u64();
+    let event_wait_ns = next_u64();
+    let max_event_wait_ns = next_u64();
     let max_empty_streak = next_u64();
     let nonempty_polls = next_u64();
     let completion_batch_total = next_u64();
@@ -972,6 +1015,13 @@ fn decode_done(input: &[u8]) -> Result<Done> {
             yield_count,
             sleep_count,
             backoff_sleep_ns,
+            jfc_rearm_count,
+            event_wait_count,
+            event_wakeup_count,
+            event_timeout_count,
+            spurious_wakeup_count,
+            event_wait_ns,
+            max_event_wait_ns,
             max_empty_streak,
             nonempty_polls,
             completion_batch_total,
@@ -986,5 +1036,52 @@ fn io_error(operation: &'static str, error: io::Error) -> Error {
     Error::Io {
         operation,
         message: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn done_control_round_trip_preserves_hybrid_polling_stats() {
+        let done = Done {
+            case_id: "hybrid-poll".into(),
+            integrity: IntegrityResult::new(64, 64, 7, 7),
+            elapsed_ns: 11,
+            child_cpu: CpuUsage {
+                user_us: 13,
+                system_us: 17,
+            },
+            completion: CompletionStats {
+                send_post: 1,
+                recv_post: 2,
+                send_cqe: 3,
+                recv_cqe: 4,
+                cqe_error: 5,
+                poll_calls: 6,
+                empty_polls: 7,
+                send_jfc_poll_calls: 8,
+                recv_jfc_poll_calls: 9,
+                yield_count: 10,
+                sleep_count: 11,
+                backoff_sleep_ns: 12,
+                jfc_rearm_count: 13,
+                event_wait_count: 14,
+                event_wakeup_count: 15,
+                event_timeout_count: 16,
+                spurious_wakeup_count: 17,
+                event_wait_ns: 18,
+                max_event_wait_ns: 19,
+                max_empty_streak: 20,
+                nonempty_polls: 21,
+                completion_batch_total: 22,
+                max_completion_poll_gap_ns: 23,
+                max_outstanding_send: 24,
+            },
+            bytes_received: 64,
+        };
+
+        assert_eq!(decode_done(&encode_done(&done).unwrap()).unwrap(), done);
     }
 }

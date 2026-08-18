@@ -8,13 +8,14 @@ extern "C" {
 #endif
 
 typedef struct urma_lab_runtime urma_lab_runtime_t;
+typedef struct urma_lab_jfce urma_lab_jfce_t;
 typedef struct urma_lab_jfc urma_lab_jfc_t;
 typedef struct urma_lab_segment urma_lab_segment_t;
 typedef struct urma_lab_jetty urma_lab_jetty_t;
 typedef struct urma_lab_descriptor urma_lab_descriptor_t;
 typedef struct urma_lab_wr urma_lab_wr_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 4U
+#define URMA_LAB_SHIM_ABI_VERSION 5U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
@@ -103,11 +104,31 @@ int urma_lab_runtime_open(const char *device_name, uint32_t eid_index,
 int urma_lab_runtime_query_device(urma_lab_runtime_t *runtime,
                                   urma_lab_device_capability_t *out);
 
-/* Creates a polling-mode JFC (`jfce == NULL`) with the requested depth. */
-int urma_lab_jfc_create(urma_lab_runtime_t *runtime, uint32_t depth,
+/* Creates one event channel shared by the runtime's send and receive JFCs. */
+int urma_lab_jfce_create(urma_lab_runtime_t *runtime, urma_lab_jfce_t **out);
+int urma_lab_jfce_delete(urma_lab_jfce_t *jfce);
+
+/* Creates a JFC associated with `jfce` for hybrid polling/event notification. */
+int urma_lab_jfc_create(urma_lab_runtime_t *runtime, urma_lab_jfce_t *jfce,
+                        uint32_t depth,
                         urma_lab_jfc_t **out);
 
 int urma_lab_jfc_delete(urma_lab_jfc_t *jfc);
+int urma_lab_jfc_rearm(urma_lab_jfc_t *jfc);
+
+#define URMA_LAB_JFCE_SEND_READY 1U
+#define URMA_LAB_JFCE_RECV_READY 2U
+
+/*
+ * Waits for either known JFC. Returns 1 when at least one event was received,
+ * 0 on timeout, or a negative error. A successful wait must be followed by
+ * `urma_lab_jfce_ack` after polling the reported JFCs.
+ */
+int urma_lab_jfce_wait(urma_lab_jfce_t *jfce,
+                       urma_lab_jfc_t *send_jfc,
+                       urma_lab_jfc_t *recv_jfc,
+                       int32_t timeout_ms, uint32_t *ready_mask);
+int urma_lab_jfce_ack(urma_lab_jfce_t *jfce);
 
 /* Allocates aligned zeroed memory, then registers it as local-only memory. */
 int urma_lab_segment_create(urma_lab_runtime_t *runtime, uint64_t length,

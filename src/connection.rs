@@ -39,6 +39,7 @@ mod native {
         buffer_pool: &'runtime mut UrmaBufferPool,
         send_jfc: &'runtime ffi::JfcHandle,
         recv_jfc: &'runtime ffi::JfcHandle,
+        jfce: &'runtime ffi::JfceHandle,
         poller: CompletionPoller,
         receive_credit: ReceiveCredit,
         pending_frames: VecDeque<Vec<u8>>,
@@ -51,6 +52,7 @@ mod native {
             buffer_pool: &'runtime mut UrmaBufferPool,
             send_jfc: &'runtime ffi::JfcHandle,
             recv_jfc: &'runtime ffi::JfcHandle,
+            jfce: &'runtime ffi::JfceHandle,
             connection_id: u16,
             generation: u8,
         ) -> Result<Self> {
@@ -61,6 +63,7 @@ mod native {
                 buffer_pool,
                 send_jfc,
                 recv_jfc,
+                jfce,
                 poller: CompletionPoller::new(connection_id, generation, 16)?,
                 receive_credit: ReceiveCredit::default(),
                 pending_frames: VecDeque::new(),
@@ -215,10 +218,12 @@ mod native {
 
         pub fn poll_once(&mut self) -> Result<Vec<CompletionEvent>> {
             self.require(ConnectionState::Ready)?;
-            let events = match self
-                .poller
-                .poll_once(self.send_jfc, self.recv_jfc, self.buffer_pool)
-            {
+            let events = match self.poller.poll_once(
+                self.send_jfc,
+                self.recv_jfc,
+                self.jfce,
+                self.buffer_pool,
+            ) {
                 Ok(events) => events,
                 Err(error) => {
                     self.fail();
@@ -324,10 +329,12 @@ mod native {
                 let deadline = deadline_after(Duration::from_secs(1));
                 while self.poller.outstanding() != 0 && check_deadline(deadline, "drain WR").is_ok()
                 {
-                    match self
-                        .poller
-                        .poll_once(self.send_jfc, self.recv_jfc, self.buffer_pool)
-                    {
+                    match self.poller.poll_once(
+                        self.send_jfc,
+                        self.recv_jfc,
+                        self.jfce,
+                        self.buffer_pool,
+                    ) {
                         Ok(_) => {}
                         Err(Error::Completion { .. }) => {}
                         Err(error) => failures.push(error.to_string()),

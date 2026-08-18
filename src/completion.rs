@@ -15,6 +15,13 @@ pub struct CompletionStats {
     pub yield_count: u64,
     pub sleep_count: u64,
     pub backoff_sleep_ns: u64,
+    pub jfc_rearm_count: u64,
+    pub event_wait_count: u64,
+    pub event_wakeup_count: u64,
+    pub event_timeout_count: u64,
+    pub spurious_wakeup_count: u64,
+    pub event_wait_ns: u64,
+    pub max_event_wait_ns: u64,
     pub max_empty_streak: u64,
     pub nonempty_polls: u64,
     pub completion_batch_total: u64,
@@ -25,27 +32,11 @@ pub struct CompletionStats {
 #[cfg(any(feature = "urma", test))]
 const HOT_POLL_LIMIT: u64 = 64;
 #[cfg(any(feature = "urma", test))]
-const YIELD_POLL_LIMIT: u64 = 128;
-#[cfg(any(feature = "urma", test))]
-const EMPTY_POLL_SLEEP: Duration = Duration::from_micros(10);
+const EVENT_WAIT_TIMEOUT_MS: i32 = 10;
 
 #[cfg(any(feature = "urma", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmptyPollAction {
-    Spin,
-    Yield,
-    Sleep(Duration),
-}
-
-#[cfg(any(feature = "urma", test))]
-fn empty_poll_action(streak: u64) -> EmptyPollAction {
-    if streak <= HOT_POLL_LIMIT {
-        EmptyPollAction::Spin
-    } else if streak <= YIELD_POLL_LIMIT {
-        EmptyPollAction::Yield
-    } else {
-        EmptyPollAction::Sleep(EMPTY_POLL_SLEEP)
-    }
+fn should_wait_for_event(streak: u64) -> bool {
+    streak > HOT_POLL_LIMIT
 }
 
 #[cfg(any(feature = "urma", test))]
@@ -122,6 +113,8 @@ mod native {
         last_completed_recv_sequence: Option<u64>,
         empty_streak: u64,
         last_poll_started: Option<Instant>,
+        send_armed: bool,
+        recv_armed: bool,
         stats: CompletionStats,
     }
 
@@ -143,6 +136,8 @@ mod native {
                 last_completed_recv_sequence: None,
                 empty_streak: 0,
                 last_poll_started: None,
+                send_armed: false,
+                recv_armed: false,
                 stats: CompletionStats::default(),
             })
         }
@@ -185,14 +180,89 @@ mod native {
             &mut self,
             send_jfc: &ffi::JfcHandle,
             recv_jfc: &ffi::JfcHandle,
+            jfce: &ffi::JfceHandle,
             pool: &mut UrmaBufferPool,
         ) -> Result<Vec<CompletionEvent>> {
             let poll_started = Instant::now();
-            let poll_gap = self
-                .last_poll_started
-                .map(|last| poll_started.saturating_duration_since(last));
-            self.last_poll_started = Some(poll_started);
+            let previous_poll_started = self.last_poll_started.replace(poll_started);
             self.stats.poll_calls += 1;
+            let mut events = self.poll_active(send_jfc, recv_jfc, pool)?;
+            if !events.is_empty() {
+                self.record_nonempty(events.len(), previous_poll_started);
+                return Ok(events);
+            }
+
+            self.empty_streak = self.empty_streak.saturating_add(1);
+            self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
+            if !should_wait_for_event(self.empty_streak)
+                || self.outstanding_send + self.outstanding_recv == 0
+            {
+                self.stats.empty_polls += 1;
+                std::hint::spin_loop();
+                return Ok(events);
+            }
+
+            let newly_armed = self.rearm_active(send_jfc, recv_jfc)?;
+            if newly_armed {
+                // Close the arm race: a CQE may have arrived after the first
+                // empty poll and before its JFC was armed.
+                events = self.poll_active(send_jfc, recv_jfc, pool)?;
+                if !events.is_empty() {
+                    self.record_nonempty(events.len(), previous_poll_started);
+                    return Ok(events);
+                }
+            }
+
+            self.stats.event_wait_count += 1;
+            let wait_started = Instant::now();
+            let ready = jfce
+                .wait(send_jfc, recv_jfc, EVENT_WAIT_TIMEOUT_MS)
+                .map_err(|error| map_ffi_error("wait_jfce", error))?;
+            let wait_elapsed = duration_ns_saturating(wait_started.elapsed());
+            self.stats.event_wait_ns = self.stats.event_wait_ns.saturating_add(wait_elapsed);
+            self.stats.max_event_wait_ns = self.stats.max_event_wait_ns.max(wait_elapsed);
+
+            let Some(ready) = ready else {
+                self.stats.event_timeout_count += 1;
+                self.stats.empty_polls += 1;
+                return Ok(events);
+            };
+            self.stats.event_wakeup_count += 1;
+            if ready.send {
+                self.send_armed = false;
+            }
+            if ready.recv {
+                self.recv_armed = false;
+            }
+
+            let poll_result = self.poll_active(send_jfc, recv_jfc, pool);
+            // Follow the UMDK event contract: consume CQEs before acknowledging
+            // the event, then rearm. Ack is still attempted if CQ routing fails
+            // so JFC deletion cannot be left waiting on an event reference.
+            jfce.ack()
+                .map_err(|error| map_ffi_error("ack_jfce", error))?;
+            events = poll_result?;
+            let rearmed = self.rearm_active(send_jfc, recv_jfc)?;
+            if rearmed {
+                // Also close the race after acknowledging an event and
+                // rearming its JFC.
+                events.extend(self.poll_active(send_jfc, recv_jfc, pool)?);
+            }
+            if events.is_empty() {
+                self.stats.spurious_wakeup_count += 1;
+                self.stats.empty_polls += 1;
+            } else {
+                self.record_nonempty(events.len(), previous_poll_started);
+            }
+            Ok(events)
+        }
+
+        fn poll_active(
+            &mut self,
+            send_jfc: &ffi::JfcHandle,
+            recv_jfc: &ffi::JfcHandle,
+            pool: &mut UrmaBufferPool,
+        ) -> Result<Vec<CompletionEvent>> {
             let mut events = Vec::new();
             if self.outstanding_send != 0 {
                 self.stats.send_jfc_poll_calls += 1;
@@ -212,40 +282,48 @@ mod native {
                     events.push(self.route(record, true, pool)?);
                 }
             }
-            if events.is_empty() {
-                self.stats.empty_polls += 1;
-                self.empty_streak = self.empty_streak.saturating_add(1);
-                self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
-                match empty_poll_action(self.empty_streak) {
-                    EmptyPollAction::Spin => std::hint::spin_loop(),
-                    EmptyPollAction::Yield => {
-                        self.stats.yield_count += 1;
-                        std::thread::yield_now();
-                    }
-                    EmptyPollAction::Sleep(duration) => {
-                        self.stats.sleep_count += 1;
-                        self.stats.backoff_sleep_ns = self
-                            .stats
-                            .backoff_sleep_ns
-                            .saturating_add(duration_ns_saturating(duration));
-                        std::thread::sleep(duration);
-                    }
-                }
-            } else {
-                self.empty_streak = 0;
-                self.stats.nonempty_polls += 1;
-                self.stats.completion_batch_total = self
-                    .stats
-                    .completion_batch_total
-                    .saturating_add(events.len() as u64);
-                if let Some(gap) = poll_gap {
-                    self.stats.max_completion_poll_gap_ns = self
-                        .stats
-                        .max_completion_poll_gap_ns
-                        .max(duration_ns_saturating(gap));
-                }
-            }
             Ok(events)
+        }
+
+        fn rearm_active(
+            &mut self,
+            send_jfc: &ffi::JfcHandle,
+            recv_jfc: &ffi::JfcHandle,
+        ) -> Result<bool> {
+            let mut rearmed = false;
+            if self.outstanding_send != 0 && !self.send_armed {
+                send_jfc
+                    .rearm()
+                    .map_err(|error| map_ffi_error("rearm_send_jfc", error))?;
+                self.send_armed = true;
+                self.stats.jfc_rearm_count += 1;
+                rearmed = true;
+            }
+            if self.outstanding_recv != 0 && !self.recv_armed {
+                recv_jfc
+                    .rearm()
+                    .map_err(|error| map_ffi_error("rearm_recv_jfc", error))?;
+                self.recv_armed = true;
+                self.stats.jfc_rearm_count += 1;
+                rearmed = true;
+            }
+            Ok(rearmed)
+        }
+
+        fn record_nonempty(&mut self, event_count: usize, previous_poll_started: Option<Instant>) {
+            self.empty_streak = 0;
+            self.stats.nonempty_polls += 1;
+            self.stats.completion_batch_total = self
+                .stats
+                .completion_batch_total
+                .saturating_add(event_count as u64);
+            if let Some(last) = previous_poll_started {
+                let gap = Instant::now().saturating_duration_since(last);
+                self.stats.max_completion_poll_gap_ns = self
+                    .stats
+                    .max_completion_poll_gap_ns
+                    .max(duration_ns_saturating(gap));
+            }
         }
 
         fn route(
@@ -412,18 +490,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_poll_backoff_keeps_a_hot_phase_before_yield_and_short_sleep() {
-        assert_eq!(empty_poll_action(1), EmptyPollAction::Spin);
-        assert_eq!(empty_poll_action(HOT_POLL_LIMIT), EmptyPollAction::Spin);
-        assert_eq!(
-            empty_poll_action(HOT_POLL_LIMIT + 1),
-            EmptyPollAction::Yield
-        );
-        assert_eq!(empty_poll_action(YIELD_POLL_LIMIT), EmptyPollAction::Yield);
-        assert_eq!(
-            empty_poll_action(YIELD_POLL_LIMIT + 1),
-            EmptyPollAction::Sleep(Duration::from_micros(10))
-        );
+    fn hybrid_policy_keeps_a_hot_phase_before_event_wait() {
+        assert!(!should_wait_for_event(1));
+        assert!(!should_wait_for_event(HOT_POLL_LIMIT));
+        assert!(should_wait_for_event(HOT_POLL_LIMIT + 1));
+        assert_eq!(EVENT_WAIT_TIMEOUT_MS, 10);
     }
 
     #[test]

@@ -213,17 +213,130 @@ impl Drop for NativeRuntime {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct JfcEventReady {
+    pub send: bool,
+    pub recv: bool,
+}
+
+pub(crate) struct JfceHandle {
+    raw: Option<NonNull<sys::urma_lab_jfce_t>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl JfceHandle {
+    pub(crate) fn create(runtime: &mut NativeRuntime) -> Result<Self, FfiError> {
+        let raw_runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: The runtime pointer is live and `raw` is a valid out pointer.
+        let status = unsafe { sys::urma_lab_jfce_create(raw_runtime.as_ptr(), &mut raw) };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        let raw = NonNull::new(raw).ok_or(FfiError::NullHandle)?;
+        Ok(Self {
+            raw: Some(raw),
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), FfiError> {
+        let Some(raw) = self.raw else {
+            return Ok(());
+        };
+        // SAFETY: This is the unique live shim JFCE wrapper and all associated
+        // JFC owners are closed before this method is called.
+        let status = unsafe { sys::urma_lab_jfce_delete(raw.as_ptr()) };
+        if status == 0 {
+            self.raw = None;
+            Ok(())
+        } else {
+            Err(FfiError::Status(status))
+        }
+    }
+
+    pub(crate) fn wait(
+        &self,
+        send_jfc: &JfcHandle,
+        recv_jfc: &JfcHandle,
+        timeout_ms: i32,
+    ) -> Result<Option<JfcEventReady>, FfiError> {
+        if timeout_ms < 0 {
+            return Err(FfiError::Contract("JFCE timeout must be non-negative"));
+        }
+        let jfce = self.raw.ok_or(FfiError::Contract("JFCE is closed"))?;
+        let send = send_jfc
+            .raw
+            .ok_or(FfiError::Contract("send JFC is closed"))?;
+        let recv = recv_jfc
+            .raw
+            .ok_or(FfiError::Contract("receive JFC is closed"))?;
+        let mut ready_mask = 0u32;
+        // SAFETY: All handles are live, associated by the shim at creation,
+        // and `ready_mask` is a valid writable out pointer.
+        let status = unsafe {
+            sys::urma_lab_jfce_wait(
+                jfce.as_ptr(),
+                send.as_ptr(),
+                recv.as_ptr(),
+                timeout_ms,
+                &mut ready_mask,
+            )
+        };
+        if status < 0 {
+            return Err(FfiError::Status(status));
+        }
+        if status == 0 {
+            return Ok(None);
+        }
+        let known_mask = sys::URMA_LAB_JFCE_SEND_READY | sys::URMA_LAB_JFCE_RECV_READY;
+        if ready_mask == 0 || ready_mask & !known_mask != 0 {
+            return Err(FfiError::Contract("JFCE returned an invalid ready mask"));
+        }
+        Ok(Some(JfcEventReady {
+            send: ready_mask & sys::URMA_LAB_JFCE_SEND_READY != 0,
+            recv: ready_mask & sys::URMA_LAB_JFCE_RECV_READY != 0,
+        }))
+    }
+
+    pub(crate) fn ack(&self) -> Result<(), FfiError> {
+        let jfce = self.raw.ok_or(FfiError::Contract("JFCE is closed"))?;
+        // SAFETY: A successful preceding wait stored one or more live event
+        // records in the shim; this call acknowledges and clears them.
+        let status = unsafe { sys::urma_lab_jfce_ack(jfce.as_ptr()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FfiError::Status(status))
+        }
+    }
+}
+
+impl Drop for JfceHandle {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 pub(crate) struct JfcHandle {
     raw: Option<NonNull<sys::urma_lab_jfc_t>>,
     _not_send_sync: PhantomData<Rc<()>>,
 }
 
 impl JfcHandle {
-    pub(crate) fn create(runtime: &mut NativeRuntime, depth: u32) -> Result<Self, FfiError> {
+    pub(crate) fn create(
+        runtime: &mut NativeRuntime,
+        jfce: &JfceHandle,
+        depth: u32,
+    ) -> Result<Self, FfiError> {
         let raw_runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
+        let raw_jfce = jfce.raw.ok_or(FfiError::Contract("JFCE is closed"))?;
         let mut raw = std::ptr::null_mut();
-        // SAFETY: The runtime pointer is live and `raw` is a valid out pointer.
-        let status = unsafe { sys::urma_lab_jfc_create(raw_runtime.as_ptr(), depth, &mut raw) };
+        // SAFETY: The runtime and JFCE pointers are live and `raw` is a valid
+        // out pointer. The shim verifies that both owners match.
+        let status = unsafe {
+            sys::urma_lab_jfc_create(raw_runtime.as_ptr(), raw_jfce.as_ptr(), depth, &mut raw)
+        };
         if status != 0 {
             return Err(FfiError::Status(status));
         }
@@ -284,6 +397,17 @@ impl JfcHandle {
             });
         }
         Ok(out)
+    }
+
+    pub(crate) fn rearm(&self) -> Result<(), FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("JFC is closed"))?;
+        // SAFETY: `raw` is a live JFC associated with a live JFCE.
+        let status = unsafe { sys::urma_lab_jfc_rearm(raw.as_ptr()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(FfiError::Status(status))
+        }
     }
 }
 

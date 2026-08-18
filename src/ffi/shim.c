@@ -14,13 +14,23 @@ struct urma_lab_runtime {
     urma_context_t *context;
     uint32_t eid_index;
     uint32_t jfc_count;
+    uint32_t jfce_count;
     uint32_t segment_count;
     uint32_t jetty_count;
     uint32_t outstanding_wr_count;
 };
 
+struct urma_lab_jfce {
+    urma_lab_runtime_t *runtime;
+    urma_jfce_t *jfce;
+    uint32_t jfc_count;
+    urma_jfc_t *pending_events[2];
+    uint32_t pending_event_count;
+};
+
 struct urma_lab_jfc {
     urma_lab_runtime_t *runtime;
+    urma_lab_jfce_t *jfce;
     urma_jfc_t *jfc;
 };
 
@@ -194,13 +204,66 @@ int urma_lab_runtime_query_device(urma_lab_runtime_t *runtime,
     return 0;
 }
 
-int urma_lab_jfc_create(urma_lab_runtime_t *runtime, uint32_t depth,
+int urma_lab_jfce_create(urma_lab_runtime_t *runtime, urma_lab_jfce_t **out)
+{
+    urma_lab_jfce_t *jfce;
+
+    if (runtime == NULL || runtime->context == NULL || out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+
+    jfce = calloc(1, sizeof(*jfce));
+    if (jfce == NULL) {
+        return -ENOMEM;
+    }
+    errno = 0;
+    jfce->jfce = urma_create_jfce(runtime->context);
+    if (jfce->jfce == NULL) {
+        int error = urma_lab_pointer_error(-EIO);
+        free(jfce);
+        return error;
+    }
+    jfce->runtime = runtime;
+    runtime->jfce_count++;
+    *out = jfce;
+    return 0;
+}
+
+int urma_lab_jfce_delete(urma_lab_jfce_t *jfce)
+{
+    urma_status_t status;
+    urma_lab_runtime_t *runtime;
+
+    if (jfce == NULL || jfce->jfce == NULL || jfce->runtime == NULL) {
+        return -EINVAL;
+    }
+    if (jfce->jfc_count != 0 || jfce->pending_event_count != 0) {
+        return -EBUSY;
+    }
+    runtime = jfce->runtime;
+    status = urma_delete_jfce(jfce->jfce);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    if (runtime->jfce_count > 0) {
+        runtime->jfce_count--;
+    }
+    jfce->jfce = NULL;
+    free(jfce);
+    return 0;
+}
+
+int urma_lab_jfc_create(urma_lab_runtime_t *runtime, urma_lab_jfce_t *jfce,
+                        uint32_t depth,
                         urma_lab_jfc_t **out)
 {
     urma_jfc_cfg_t cfg = {0};
     urma_lab_jfc_t *jfc;
 
-    if (runtime == NULL || runtime->context == NULL || out == NULL || depth == 0) {
+    if (runtime == NULL || runtime->context == NULL || jfce == NULL ||
+        jfce->jfce == NULL || jfce->runtime != runtime || out == NULL ||
+        depth == 0) {
         return -EINVAL;
     }
     *out = NULL;
@@ -210,7 +273,7 @@ int urma_lab_jfc_create(urma_lab_runtime_t *runtime, uint32_t depth,
         return -ENOMEM;
     }
     cfg.depth = depth;
-    /* TODO(M1-verify): confirm NULL JFCE polling support on the target provider. */
+    cfg.jfce = jfce->jfce;
     errno = 0;
     jfc->jfc = urma_create_jfc(runtime->context, &cfg);
     if (jfc->jfc == NULL) {
@@ -220,7 +283,9 @@ int urma_lab_jfc_create(urma_lab_runtime_t *runtime, uint32_t depth,
     }
 
     jfc->runtime = runtime;
+    jfc->jfce = jfce;
     runtime->jfc_count++;
+    jfce->jfc_count++;
     *out = jfc;
     return 0;
 }
@@ -244,8 +309,83 @@ int urma_lab_jfc_delete(urma_lab_jfc_t *jfc)
     if (runtime->jfc_count > 0) {
         runtime->jfc_count--;
     }
+    if (jfc->jfce != NULL && jfc->jfce->jfc_count > 0) {
+        jfc->jfce->jfc_count--;
+    }
     jfc->jfc = NULL;
     free(jfc);
+    return 0;
+}
+
+int urma_lab_jfc_rearm(urma_lab_jfc_t *jfc)
+{
+    urma_status_t status;
+
+    if (jfc == NULL || jfc->jfc == NULL || jfc->jfce == NULL ||
+        jfc->jfce->jfce == NULL) {
+        return -EINVAL;
+    }
+    status = urma_rearm_jfc(jfc->jfc, false);
+    return status == URMA_SUCCESS ? 0 : (int)status;
+}
+
+int urma_lab_jfce_wait(urma_lab_jfce_t *jfce,
+                       urma_lab_jfc_t *send_jfc,
+                       urma_lab_jfc_t *recv_jfc,
+                       int32_t timeout_ms, uint32_t *ready_mask)
+{
+    uint32_t event_counts[2] = {1, 1};
+    int count;
+    int i;
+
+    if (jfce == NULL || jfce->jfce == NULL || send_jfc == NULL ||
+        send_jfc->jfc == NULL || recv_jfc == NULL || recv_jfc->jfc == NULL ||
+        send_jfc->jfce != jfce || recv_jfc->jfce != jfce ||
+        timeout_ms < 0 || ready_mask == NULL || jfce->pending_event_count != 0) {
+        return -EINVAL;
+    }
+    *ready_mask = 0;
+
+    do {
+        errno = 0;
+        count = urma_wait_jfc(jfce->jfce, 2, timeout_ms, jfce->pending_events);
+        /* UMDK documents errno 512 (ERESTARTSYS) as a retryable zero return. */
+    } while ((count < 0 && errno == EINTR) || (count == 0 && errno == 512));
+    if (count < 0) {
+        return urma_lab_pointer_error(-EIO);
+    }
+    if (count == 0) {
+        return 0;
+    }
+    if (count > 2) {
+        return -EOVERFLOW;
+    }
+    for (i = 0; i < count; ++i) {
+        if (jfce->pending_events[i] == send_jfc->jfc) {
+            *ready_mask |= URMA_LAB_JFCE_SEND_READY;
+        } else if (jfce->pending_events[i] == recv_jfc->jfc) {
+            *ready_mask |= URMA_LAB_JFCE_RECV_READY;
+        } else {
+            urma_ack_jfc(jfce->pending_events, event_counts, (uint32_t)count);
+            (void)memset(jfce->pending_events, 0, sizeof(jfce->pending_events));
+            return -EPROTO;
+        }
+    }
+    jfce->pending_event_count = (uint32_t)count;
+    return 1;
+}
+
+int urma_lab_jfce_ack(urma_lab_jfce_t *jfce)
+{
+    uint32_t event_counts[2] = {1, 1};
+
+    if (jfce == NULL || jfce->jfce == NULL ||
+        jfce->pending_event_count == 0 || jfce->pending_event_count > 2) {
+        return -EINVAL;
+    }
+    urma_ack_jfc(jfce->pending_events, event_counts, jfce->pending_event_count);
+    (void)memset(jfce->pending_events, 0, sizeof(jfce->pending_events));
+    jfce->pending_event_count = 0;
     return 0;
 }
 
@@ -802,7 +942,7 @@ int urma_lab_runtime_close(urma_lab_runtime_t *runtime)
     }
     if (runtime->jetty_count != 0 || runtime->segment_count != 0 ||
         runtime->outstanding_wr_count != 0 ||
-        runtime->jfc_count != 0) {
+        runtime->jfc_count != 0 || runtime->jfce_count != 0) {
         return -EBUSY;
     }
 

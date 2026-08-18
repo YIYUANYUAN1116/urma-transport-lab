@@ -111,6 +111,7 @@ mod native {
         buffer_pool: Option<UrmaBufferPool>,
         recv_jfc: Option<UrmaJfc>,
         send_jfc: Option<UrmaJfc>,
+        jfce: Option<ffi::JfceHandle>,
         native: Option<ffi::NativeRuntime>,
         accepting: bool,
         poisoned: bool,
@@ -153,33 +154,73 @@ mod native {
                 Ok(capability) => from_ffi_capability(capability),
                 Err(error) => {
                     let primary = map_ffi_error("query_device", error);
-                    return Err(rollback_startup(primary, None, None, None, Some(native)));
+                    return Err(rollback_startup(
+                        primary,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(native),
+                    ));
                 }
             };
             if let Err(primary) = validate_config(&config, &capability) {
-                return Err(rollback_startup(primary, None, None, None, Some(native)));
+                return Err(rollback_startup(
+                    primary,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(native),
+                ));
             }
 
-            let send_jfc = match UrmaJfc::create(&mut native, JfcKind::Send, config.send_jfc_depth)
-            {
-                Ok(jfc) => jfc,
-                Err(primary) => {
-                    return Err(rollback_startup(primary, None, None, None, Some(native)));
+            let jfce = match ffi::JfceHandle::create(&mut native) {
+                Ok(jfce) => jfce,
+                Err(error) => {
+                    let primary = map_ffi_error("create_jfce", error);
+                    return Err(rollback_startup(
+                        primary,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(native),
+                    ));
                 }
             };
-            let recv_jfc =
-                match UrmaJfc::create(&mut native, JfcKind::Receive, config.recv_jfc_depth) {
+            let send_jfc =
+                match UrmaJfc::create(&mut native, &jfce, JfcKind::Send, config.send_jfc_depth) {
                     Ok(jfc) => jfc,
                     Err(primary) => {
                         return Err(rollback_startup(
                             primary,
                             None,
                             None,
-                            Some(send_jfc),
+                            None,
+                            Some(jfce),
                             Some(native),
                         ));
                     }
                 };
+            let recv_jfc = match UrmaJfc::create(
+                &mut native,
+                &jfce,
+                JfcKind::Receive,
+                config.recv_jfc_depth,
+            ) {
+                Ok(jfc) => jfc,
+                Err(primary) => {
+                    return Err(rollback_startup(
+                        primary,
+                        None,
+                        None,
+                        Some(send_jfc),
+                        Some(jfce),
+                        Some(native),
+                    ));
+                }
+            };
             let buffer_pool = match UrmaBufferPool::create(&mut native, config.buffer_pool.clone())
             {
                 Ok(pool) => pool,
@@ -189,6 +230,7 @@ mod native {
                         None,
                         Some(recv_jfc),
                         Some(send_jfc),
+                        Some(jfce),
                         Some(native),
                     ));
                 }
@@ -202,6 +244,7 @@ mod native {
                 buffer_pool: Some(buffer_pool),
                 recv_jfc: Some(recv_jfc),
                 send_jfc: Some(send_jfc),
+                jfce: Some(jfce),
                 native: Some(native),
                 accepting: true,
                 poisoned: false,
@@ -277,6 +320,10 @@ mod native {
                 .recv_jfc
                 .as_ref()
                 .ok_or_else(|| Error::InvalidConfiguration("receive JFC is closed".into()))?;
+            let jfce = self
+                .jfce
+                .as_ref()
+                .ok_or_else(|| Error::InvalidConfiguration("JFCE is closed".into()))?;
             let buffer_pool = self
                 .buffer_pool
                 .as_mut()
@@ -288,6 +335,7 @@ mod native {
                 buffer_pool,
                 send_jfc.handle(),
                 recv_jfc.handle(),
+                jfce,
                 connection_id,
                 1,
             )
@@ -319,6 +367,11 @@ mod native {
             if let Some(mut send_jfc) = self.send_jfc.take() {
                 if let Err(error) = send_jfc.close() {
                     failures.push(error.to_string());
+                }
+            }
+            if let Some(mut jfce) = self.jfce.take() {
+                if let Err(error) = jfce.close() {
+                    failures.push(map_ffi_error("delete_jfce", error).to_string());
                 }
             }
             if let Some(mut pool) = self.buffer_pool.take() {
@@ -419,6 +472,7 @@ mod native {
         mut buffer_pool: Option<UrmaBufferPool>,
         mut recv_jfc: Option<UrmaJfc>,
         mut send_jfc: Option<UrmaJfc>,
+        mut jfce: Option<ffi::JfceHandle>,
         mut native: Option<ffi::NativeRuntime>,
     ) -> Error {
         let mut cleanup_failures = Vec::new();
@@ -435,6 +489,11 @@ mod native {
         if let Some(jfc) = send_jfc.as_mut() {
             if let Err(error) = jfc.close() {
                 cleanup_failures.push(error.to_string());
+            }
+        }
+        if let Some(jfce) = jfce.as_mut() {
+            if let Err(error) = jfce.close() {
+                cleanup_failures.push(map_ffi_error("delete_jfce", error).to_string());
             }
         }
         if let Some(runtime) = native.as_mut() {
@@ -549,7 +608,7 @@ mod tests {
     #[test]
     fn abi_baseline_matches_verified_m0_contract() {
         let baseline = abi_baseline().expect("C shim must return its ABI baseline");
-        assert_eq!(baseline.shim_abi_version, 4);
+        assert_eq!(baseline.shim_abi_version, 5);
         assert_eq!(baseline.pointer_size as usize, std::mem::size_of::<usize>());
         assert_eq!(baseline.status_size as usize, std::mem::size_of::<i32>());
         assert_eq!(baseline.success_value, 0);
