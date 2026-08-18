@@ -154,6 +154,10 @@ impl PipelineTracker {
         self.current
     }
 
+    pub const fn configured_window(&self) -> usize {
+        self.configured_window
+    }
+
     pub const fn maximum(&self) -> usize {
         self.maximum
     }
@@ -206,6 +210,10 @@ impl ReceiveCreditController {
 
     pub const fn current_credit(&self) -> usize {
         self.current_credit
+    }
+
+    pub const fn configured_credit(&self) -> usize {
+        self.configured
     }
 
     pub const fn remaining_messages(&self) -> usize {

@@ -1,6 +1,6 @@
 # B2 Build Status: URMA bounded pipeline
 
-> 更新日期：2026-08-16  
+> 更新日期：2026-08-18
 > 阶段：B2 correctness；未开始 B3 calibration/性能结论
 
 ## 结论
@@ -155,6 +155,55 @@ cargo test --features urma --no-run
 ```
 
 Feature-on 仍须在有 UMDK 的 Linux 构建机执行，不能用 feature-off 结果推断 provider 行为。
+
+## 真实环境 W>1 诊断
+
+真实双节点 UB 环境已经确认以下证据：
+
+- node3 Parent、node4 Child；
+- Memory 64 MiB、payload 32768 bytes、W=1 成功；
+- W=1 的 `send_post/send_cqe/recv_post/recv_cqe` 均为 2050，`cqe_error=0`，length/CRC32 完整性通过；
+- 相同 bytes/chunk 的 W=4 当前失败：Parent 报 `operation URMA pipeline capacity timed out`，Child 报 `operation URMA benchmark receive timed out`。
+
+当前最高概率推断是 W=4 只维持 4 个 RX credit、没有额外 RQ headroom，Parent 收到 send CQE 后可能在 Child 处理 recv CQE 并 repost 前继续发送，使远端 RQ 短暂耗尽并进入 RNR。该判断属于架构推断，尚未被失败现场统计或 UDMA/provider 日志确认，不能记录为已验证根因。CompletionPoller counter、TX slot 回收或 pipeline tracker 是否在真实失败点发生分叉也仍待现场数据确认。
+
+为收集证据，两个目标 timeout 现在各输出一条 `event=urma_benchmark_timeout` 的单行 JSON，不恢复逐 chunk/逐 CQE 成功日志。
+
+Parent `pipeline_capacity` diagnostic 包含：
+
+```text
+configured_window
+current_outstanding_send
+pipeline_tracker_current
+max_outstanding_send
+send_post / send_cqe
+recv_post / recv_cqe
+cqe_error
+poll_calls / empty_polls
+connection_outstanding_send
+tx_slots.free / allocated / send_posted / send_completed / other
+```
+
+Child `benchmark_receive` diagnostic 包含：
+
+```text
+configured_receive_credit
+current_receive_credit
+benchmark_credit_current
+benchmark_credit_remaining_messages
+recv_post / recv_cqe
+send_post / send_cqe
+cqe_error
+poll_calls / empty_polls
+connection_outstanding_recv
+rx_slots.free / allocated / posted_recv / recv_completed / other
+```
+
+slot 统计来自 BufferPool 当前状态的只读 snapshot；completion 字段直接复用现有 `CompletionStats`，没有维护第二套 counter。该诊断没有改变 window、RX prepost/repost、poll batch、retry/backoff、timeout、slot 状态转换或 native handle ownership。`send_completed`/`recv_completed` 通常会因为 completion path 随即 release slot 而为 0，但保留它们可以在 timeout 时确认是否存在完成后未释放的 slot。
+
+下一步需在 node3/node4 使用原失败参数重新运行 W=4，同时保存 Parent/Child timeout JSON 和 UDMA/provider 日志。只有现场数据能够区分：RQ/RNR、provider 多 outstanding SEND 路径、completion accounting 分叉或其他原因。
+
+本轮本地验证结果：`cargo fmt --check` 通过；`cargo check --features urma` 和 `cargo test --features urma --no-run` 均因开发机找不到 `urma_api.h` 而在 build script 阶段停止，尚未完成 feature-on 类型检查或测试编译。真实 W=4 provider 回归等待 node3/node4 执行。
 
 ## B2 测试方法
 

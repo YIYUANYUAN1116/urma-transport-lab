@@ -28,7 +28,7 @@ pub use benchmark::{
     BenchmarkTransport, CpuUsage, FileCompletionPolicy, FileSink, FileSource, IntegrityResult,
     MemorySink, MemorySource, TimingMode, TimingSample,
 };
-pub use buffer::{BufferPoolConfig, SlotId, SlotKind, SlotState};
+pub use buffer::{BufferPoolConfig, SlotId, SlotKind, SlotState, SlotStateSnapshot};
 pub use completion::{CompletionEvent, CompletionStats};
 pub use connection::ConnectionState;
 #[cfg(feature = "urma")]

@@ -26,7 +26,7 @@ mod native {
         jetty::UrmaJetty,
         message::Message,
         wr::{OperationType, ReceiveCredit, WrToken},
-        JettyDescriptor, SlotKind, UrmaDeviceCapability,
+        JettyDescriptor, SlotKind, SlotStateSnapshot, UrmaDeviceCapability,
     };
     use std::{collections::VecDeque, thread, time::Duration};
 
@@ -264,6 +264,14 @@ mod native {
 
         pub fn receive_credit(&self) -> usize {
             self.receive_credit.current()
+        }
+
+        pub fn tx_slot_state_snapshot(&self) -> SlotStateSnapshot {
+            self.buffer_pool.slot_state_snapshot(SlotKind::Tx)
+        }
+
+        pub fn rx_slot_state_snapshot(&self) -> SlotStateSnapshot {
+            self.buffer_pool.slot_state_snapshot(SlotKind::Rx)
         }
 
         pub(crate) fn fail(&mut self) {

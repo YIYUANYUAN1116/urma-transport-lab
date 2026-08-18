@@ -65,6 +65,31 @@ pub enum SlotState {
     SendCompleted,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SlotStateSnapshot {
+    pub free: usize,
+    pub allocated: usize,
+    pub posted_recv: usize,
+    pub recv_completed: usize,
+    pub send_posted: usize,
+    pub send_completed: usize,
+    pub other: usize,
+}
+
+impl SlotStateSnapshot {
+    fn observe(&mut self, state: SlotState) {
+        match state {
+            SlotState::Free => self.free += 1,
+            SlotState::Allocated => self.allocated += 1,
+            SlotState::PostedRecv => self.posted_recv += 1,
+            SlotState::RecvCompleted => self.recv_completed += 1,
+            SlotState::SendPosted => self.send_posted += 1,
+            SlotState::SendCompleted => self.send_completed += 1,
+            SlotState::Posted | SlotState::Completed | SlotState::Leased => self.other += 1,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct SlotId(usize);
 
@@ -206,6 +231,14 @@ mod native {
 
         pub fn slot_state(&self, id: SlotId) -> Option<SlotState> {
             self.slots.get(id.0).map(|slot| slot.state)
+        }
+
+        pub(crate) fn slot_state_snapshot(&self, kind: SlotKind) -> SlotStateSnapshot {
+            let mut snapshot = SlotStateSnapshot::default();
+            for slot in self.slots.iter().filter(|slot| slot.kind == kind) {
+                snapshot.observe(slot.state);
+            }
+            snapshot
         }
 
         pub fn slot_layout(&self, id: SlotId) -> Option<(usize, usize)> {
@@ -430,5 +463,28 @@ mod tests {
             config.total_len(),
             Err(Error::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn slot_state_snapshot_counts_data_plane_states() {
+        let mut snapshot = SlotStateSnapshot::default();
+        for state in [
+            SlotState::Free,
+            SlotState::Allocated,
+            SlotState::PostedRecv,
+            SlotState::RecvCompleted,
+            SlotState::SendPosted,
+            SlotState::SendCompleted,
+            SlotState::Posted,
+        ] {
+            snapshot.observe(state);
+        }
+        assert_eq!(snapshot.free, 1);
+        assert_eq!(snapshot.allocated, 1);
+        assert_eq!(snapshot.posted_recv, 1);
+        assert_eq!(snapshot.recv_completed, 1);
+        assert_eq!(snapshot.send_posted, 1);
+        assert_eq!(snapshot.send_completed, 1);
+        assert_eq!(snapshot.other, 1);
     }
 }

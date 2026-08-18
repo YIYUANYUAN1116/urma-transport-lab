@@ -328,6 +328,7 @@ pub fn run_urma_child(
     let mut bytes_received = 0u64;
     'receive: loop {
         if Instant::now() >= deadline {
+            log_child_receive_timeout(&connection, &credit);
             return Err(Error::Timeout {
                 operation: "URMA benchmark receive",
             });
@@ -454,6 +455,7 @@ fn post_data(
 ) -> Result<()> {
     while !pipeline.can_post() {
         if Instant::now() >= deadline {
+            log_parent_pipeline_capacity_timeout(connection, pipeline);
             return Err(Error::Timeout {
                 operation: "URMA pipeline capacity",
             });
@@ -513,6 +515,59 @@ fn replenish_credit(
         credit.posted()?;
     }
     Ok(())
+}
+
+fn log_parent_pipeline_capacity_timeout(
+    connection: &UrmaConnection<'_>,
+    pipeline: &PipelineTracker,
+) {
+    let stats = connection.stats();
+    let slots = connection.tx_slot_state_snapshot();
+    eprintln!(
+        "{{\"event\":\"urma_benchmark_timeout\",\"role\":\"parent\",\"operation\":\"pipeline_capacity\",\"configured_window\":{},\"current_outstanding_send\":{},\"pipeline_tracker_current\":{},\"max_outstanding_send\":{},\"send_post\":{},\"send_cqe\":{},\"recv_post\":{},\"recv_cqe\":{},\"cqe_error\":{},\"poll_calls\":{},\"empty_polls\":{},\"connection_outstanding_send\":{},\"tx_slots\":{{\"free\":{},\"allocated\":{},\"send_posted\":{},\"send_completed\":{},\"other\":{}}}}}",
+        pipeline.configured_window(),
+        connection.outstanding_send(),
+        pipeline.current(),
+        stats.max_outstanding_send,
+        stats.send_post,
+        stats.send_cqe,
+        stats.recv_post,
+        stats.recv_cqe,
+        stats.cqe_error,
+        stats.poll_calls,
+        stats.empty_polls,
+        connection.outstanding_send(),
+        slots.free,
+        slots.allocated,
+        slots.send_posted,
+        slots.send_completed,
+        slots.other,
+    );
+}
+
+fn log_child_receive_timeout(connection: &UrmaConnection<'_>, credit: &ReceiveCreditController) {
+    let stats = connection.stats();
+    let slots = connection.rx_slot_state_snapshot();
+    eprintln!(
+        "{{\"event\":\"urma_benchmark_timeout\",\"role\":\"child\",\"operation\":\"benchmark_receive\",\"configured_receive_credit\":{},\"current_receive_credit\":{},\"benchmark_credit_current\":{},\"benchmark_credit_remaining_messages\":{},\"recv_post\":{},\"recv_cqe\":{},\"send_post\":{},\"send_cqe\":{},\"cqe_error\":{},\"poll_calls\":{},\"empty_polls\":{},\"connection_outstanding_recv\":{},\"rx_slots\":{{\"free\":{},\"allocated\":{},\"posted_recv\":{},\"recv_completed\":{},\"other\":{}}}}}",
+        credit.configured_credit(),
+        connection.receive_credit(),
+        credit.current_credit(),
+        credit.remaining_messages(),
+        stats.recv_post,
+        stats.recv_cqe,
+        stats.send_post,
+        stats.send_cqe,
+        stats.cqe_error,
+        stats.poll_calls,
+        stats.empty_polls,
+        connection.outstanding_recv(),
+        slots.free,
+        slots.allocated,
+        slots.posted_recv,
+        slots.recv_completed,
+        slots.other,
+    );
 }
 
 fn read_chunk(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
