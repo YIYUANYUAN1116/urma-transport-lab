@@ -16,6 +16,14 @@ pub(crate) fn idle_timeout_elapsed(
     now.saturating_duration_since(last_progress) >= timeout
 }
 
+pub(crate) fn scaled_ratio(numerator: u64, denominator: u64, scale: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    let scaled = u128::from(numerator) * u128::from(scale) / u128::from(denominator);
+    u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
 /// Derives the registered slot used by the URMA benchmark. `chunk_size`
 /// remains the business payload size; only the backing slot is rounded up.
 pub fn derive_urma_slot_size(case: &BenchmarkCase, alignment: usize) -> Result<usize> {
@@ -516,6 +524,14 @@ mod tests {
 
         assert!(idle_timeout_elapsed(start, now, timeout));
         assert!(!idle_timeout_elapsed(progress, now, timeout));
+    }
+
+    #[test]
+    fn scaled_poll_ratios_are_stable_and_overflow_safe() {
+        assert_eq!(scaled_ratio(3, 4, 1_000_000), 750_000);
+        assert_eq!(scaled_ratio(4, 3, 1_000), 1_333);
+        assert_eq!(scaled_ratio(1, 0, 1_000), 0);
+        assert_eq!(scaled_ratio(u64::MAX, 1, u64::MAX), u64::MAX);
     }
 
     #[test]

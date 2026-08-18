@@ -10,7 +10,47 @@ pub struct CompletionStats {
     pub cqe_error: u64,
     pub poll_calls: u64,
     pub empty_polls: u64,
+    pub send_jfc_poll_calls: u64,
+    pub recv_jfc_poll_calls: u64,
+    pub yield_count: u64,
+    pub sleep_count: u64,
+    pub backoff_sleep_ns: u64,
+    pub max_empty_streak: u64,
+    pub nonempty_polls: u64,
+    pub completion_batch_total: u64,
+    pub max_completion_poll_gap_ns: u64,
     pub max_outstanding_send: u64,
+}
+
+#[cfg(any(feature = "urma", test))]
+const HOT_POLL_LIMIT: u64 = 64;
+#[cfg(any(feature = "urma", test))]
+const YIELD_POLL_LIMIT: u64 = 128;
+#[cfg(any(feature = "urma", test))]
+const EMPTY_POLL_SLEEP: Duration = Duration::from_micros(10);
+
+#[cfg(any(feature = "urma", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmptyPollAction {
+    Spin,
+    Yield,
+    Sleep(Duration),
+}
+
+#[cfg(any(feature = "urma", test))]
+fn empty_poll_action(streak: u64) -> EmptyPollAction {
+    if streak <= HOT_POLL_LIMIT {
+        EmptyPollAction::Spin
+    } else if streak <= YIELD_POLL_LIMIT {
+        EmptyPollAction::Yield
+    } else {
+        EmptyPollAction::Sleep(EMPTY_POLL_SLEEP)
+    }
+}
+
+#[cfg(any(feature = "urma", test))]
+fn duration_ns_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +120,8 @@ mod native {
         outstanding_recv: usize,
         last_completed_send_sequence: Option<u64>,
         last_completed_recv_sequence: Option<u64>,
+        empty_streak: u64,
+        last_poll_started: Option<Instant>,
         stats: CompletionStats,
     }
 
@@ -99,6 +141,8 @@ mod native {
                 outstanding_recv: 0,
                 last_completed_send_sequence: None,
                 last_completed_recv_sequence: None,
+                empty_streak: 0,
+                last_poll_started: None,
                 stats: CompletionStats::default(),
             })
         }
@@ -143,22 +187,63 @@ mod native {
             recv_jfc: &ffi::JfcHandle,
             pool: &mut UrmaBufferPool,
         ) -> Result<Vec<CompletionEvent>> {
+            let poll_started = Instant::now();
+            let poll_gap = self
+                .last_poll_started
+                .map(|last| poll_started.saturating_duration_since(last));
+            self.last_poll_started = Some(poll_started);
             self.stats.poll_calls += 1;
             let mut events = Vec::new();
-            for record in send_jfc
-                .poll(self.batch)
-                .map_err(|error| map_ffi_error("poll_send_jfc", error))?
-            {
-                events.push(self.route(record, false, pool)?);
+            if self.outstanding_send != 0 {
+                self.stats.send_jfc_poll_calls += 1;
+                for record in send_jfc
+                    .poll(self.batch)
+                    .map_err(|error| map_ffi_error("poll_send_jfc", error))?
+                {
+                    events.push(self.route(record, false, pool)?);
+                }
             }
-            for record in recv_jfc
-                .poll(self.batch)
-                .map_err(|error| map_ffi_error("poll_recv_jfc", error))?
-            {
-                events.push(self.route(record, true, pool)?);
+            if self.outstanding_recv != 0 {
+                self.stats.recv_jfc_poll_calls += 1;
+                for record in recv_jfc
+                    .poll(self.batch)
+                    .map_err(|error| map_ffi_error("poll_recv_jfc", error))?
+                {
+                    events.push(self.route(record, true, pool)?);
+                }
             }
             if events.is_empty() {
                 self.stats.empty_polls += 1;
+                self.empty_streak = self.empty_streak.saturating_add(1);
+                self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
+                match empty_poll_action(self.empty_streak) {
+                    EmptyPollAction::Spin => std::hint::spin_loop(),
+                    EmptyPollAction::Yield => {
+                        self.stats.yield_count += 1;
+                        std::thread::yield_now();
+                    }
+                    EmptyPollAction::Sleep(duration) => {
+                        self.stats.sleep_count += 1;
+                        self.stats.backoff_sleep_ns = self
+                            .stats
+                            .backoff_sleep_ns
+                            .saturating_add(duration_ns_saturating(duration));
+                        std::thread::sleep(duration);
+                    }
+                }
+            } else {
+                self.empty_streak = 0;
+                self.stats.nonempty_polls += 1;
+                self.stats.completion_batch_total = self
+                    .stats
+                    .completion_batch_total
+                    .saturating_add(events.len() as u64);
+                if let Some(gap) = poll_gap {
+                    self.stats.max_completion_poll_gap_ns = self
+                        .stats
+                        .max_completion_poll_gap_ns
+                        .max(duration_ns_saturating(gap));
+                }
             }
             Ok(events)
         }
@@ -324,5 +409,25 @@ mod tests {
     fn cqe_error_is_structured() {
         let error = validate_completion_status(9, 0, 42).unwrap_err();
         assert!(error.to_string().contains("status=9"));
+    }
+
+    #[test]
+    fn empty_poll_backoff_keeps_a_hot_phase_before_yield_and_short_sleep() {
+        assert_eq!(empty_poll_action(1), EmptyPollAction::Spin);
+        assert_eq!(empty_poll_action(HOT_POLL_LIMIT), EmptyPollAction::Spin);
+        assert_eq!(
+            empty_poll_action(HOT_POLL_LIMIT + 1),
+            EmptyPollAction::Yield
+        );
+        assert_eq!(empty_poll_action(YIELD_POLL_LIMIT), EmptyPollAction::Yield);
+        assert_eq!(
+            empty_poll_action(YIELD_POLL_LIMIT + 1),
+            EmptyPollAction::Sleep(Duration::from_micros(10))
+        );
+    }
+
+    #[test]
+    fn duration_conversion_saturates_to_transport_counter_width() {
+        assert_eq!(duration_ns_saturating(Duration::from_nanos(42)), 42);
     }
 }

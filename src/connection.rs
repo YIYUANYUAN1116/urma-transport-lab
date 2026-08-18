@@ -29,7 +29,7 @@ mod native {
         wr::{OperationType, ReceiveCredit, WrToken},
         JettyDescriptor, SlotKind, SlotStateSnapshot, UrmaDeviceCapability,
     };
-    use std::{collections::VecDeque, thread, time::Duration};
+    use std::{collections::VecDeque, time::Duration};
 
     /// M2 control-plane owner. It intentionally exposes no data-plane API.
     pub struct UrmaConnection<'runtime> {
@@ -251,7 +251,6 @@ mod native {
                         self.pending_frames.push_back(bytes);
                     }
                 }
-                thread::yield_now();
             }
         }
 
@@ -264,7 +263,6 @@ mod native {
                         self.pending_frames.push_back(bytes);
                     }
                 }
-                thread::yield_now();
             }
             Ok(())
         }
@@ -334,7 +332,6 @@ mod native {
                         Err(Error::Completion { .. }) => {}
                         Err(error) => failures.push(error.to_string()),
                     }
-                    thread::yield_now();
                 }
                 if self.poller.outstanding() != 0 {
                     failures.push("timed out draining outstanding WRs".into());

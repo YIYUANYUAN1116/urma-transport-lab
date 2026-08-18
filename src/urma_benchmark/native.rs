@@ -12,7 +12,6 @@ use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     path::PathBuf,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -121,6 +120,17 @@ pub struct UrmaTransportStats {
     pub cqe_error: u64,
     pub poll_calls: u64,
     pub empty_polls: u64,
+    pub send_jfc_poll_calls: u64,
+    pub recv_jfc_poll_calls: u64,
+    pub yield_count: u64,
+    pub sleep_count: u64,
+    pub backoff_sleep_ns: u64,
+    pub max_empty_streak: u64,
+    pub nonempty_polls: u64,
+    pub completion_batch_total: u64,
+    pub avg_poll_batch_milli: u64,
+    pub empty_poll_ratio_ppm: u64,
+    pub max_completion_poll_gap_ns: u64,
     pub max_outstanding_send: u64,
     pub current_outstanding_send: u64,
     pub current_outstanding_recv: u64,
@@ -145,6 +155,20 @@ impl UrmaTransportStats {
             ("cqe_error", self.cqe_error),
             ("poll_calls", self.poll_calls),
             ("empty_polls", self.empty_polls),
+            ("send_jfc_poll_calls", self.send_jfc_poll_calls),
+            ("recv_jfc_poll_calls", self.recv_jfc_poll_calls),
+            ("yield_count", self.yield_count),
+            ("sleep_count", self.sleep_count),
+            ("backoff_sleep_ns", self.backoff_sleep_ns),
+            ("max_empty_streak", self.max_empty_streak),
+            ("nonempty_polls", self.nonempty_polls),
+            ("completion_batch_total", self.completion_batch_total),
+            ("avg_poll_batch_milli", self.avg_poll_batch_milli),
+            ("empty_poll_ratio_ppm", self.empty_poll_ratio_ppm),
+            (
+                "max_completion_poll_gap_ns",
+                self.max_completion_poll_gap_ns,
+            ),
             ("max_outstanding_send", self.max_outstanding_send),
             ("current_outstanding_send", self.current_outstanding_send),
             ("current_outstanding_recv", self.current_outstanding_recv),
@@ -342,7 +366,6 @@ pub fn run_urma_child(
                     operation: "URMA benchmark receive",
                 });
             }
-            thread::yield_now();
             continue;
         }
         last_progress = Instant::now();
@@ -523,9 +546,6 @@ fn poll_send_completions(
         }
     }
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
-    if pipeline.current() != 0 {
-        thread::yield_now();
-    }
     Ok(completed)
 }
 
@@ -728,14 +748,39 @@ fn combined_stats(
         runtime.buffer_pool.rx_slot_count,
         remaining_messages,
     )?;
+    let poll_calls = parent.poll_calls.saturating_add(child.poll_calls);
+    let empty_polls = parent.empty_polls.saturating_add(child.empty_polls);
+    let nonempty_polls = parent.nonempty_polls.saturating_add(child.nonempty_polls);
+    let completion_batch_total = parent
+        .completion_batch_total
+        .saturating_add(child.completion_batch_total);
     Ok(UrmaTransportStats {
         send_post: parent.send_post,
         recv_post: child.recv_post,
         send_cqe: parent.send_cqe,
         recv_cqe: child.recv_cqe,
         cqe_error: parent.cqe_error + child.cqe_error,
-        poll_calls: parent.poll_calls + child.poll_calls,
-        empty_polls: parent.empty_polls + child.empty_polls,
+        poll_calls,
+        empty_polls,
+        send_jfc_poll_calls: parent
+            .send_jfc_poll_calls
+            .saturating_add(child.send_jfc_poll_calls),
+        recv_jfc_poll_calls: parent
+            .recv_jfc_poll_calls
+            .saturating_add(child.recv_jfc_poll_calls),
+        yield_count: parent.yield_count.saturating_add(child.yield_count),
+        sleep_count: parent.sleep_count.saturating_add(child.sleep_count),
+        backoff_sleep_ns: parent
+            .backoff_sleep_ns
+            .saturating_add(child.backoff_sleep_ns),
+        max_empty_streak: parent.max_empty_streak.max(child.max_empty_streak),
+        nonempty_polls,
+        completion_batch_total,
+        avg_poll_batch_milli: scaled_ratio(completion_batch_total, nonempty_polls, 1_000),
+        empty_poll_ratio_ppm: scaled_ratio(empty_polls, poll_calls, 1_000_000),
+        max_completion_poll_gap_ns: parent
+            .max_completion_poll_gap_ns
+            .max(child.max_completion_poll_gap_ns),
         max_outstanding_send: parent.max_outstanding_send,
         current_outstanding_send: 0,
         current_outstanding_recv: 0,
@@ -846,6 +891,15 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
         done.completion.cqe_error,
         done.completion.poll_calls,
         done.completion.empty_polls,
+        done.completion.send_jfc_poll_calls,
+        done.completion.recv_jfc_poll_calls,
+        done.completion.yield_count,
+        done.completion.sleep_count,
+        done.completion.backoff_sleep_ns,
+        done.completion.max_empty_streak,
+        done.completion.nonempty_polls,
+        done.completion.completion_batch_total,
+        done.completion.max_completion_poll_gap_ns,
         done.completion.max_outstanding_send,
         done.bytes_received,
     ] {
@@ -861,7 +915,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         return Err(Error::Protocol("truncated URMA Done".into()));
     }
     let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
-    let expected_len = 2 + case_len + 14 * 8 + 2 * 4;
+    let expected_len = 2 + case_len + 23 * 8 + 2 * 4;
     if input.len() != expected_len {
         return Err(Error::Protocol("invalid URMA Done length".into()));
     }
@@ -886,6 +940,15 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let cqe_error = next_u64();
     let poll_calls = next_u64();
     let empty_polls = next_u64();
+    let send_jfc_poll_calls = next_u64();
+    let recv_jfc_poll_calls = next_u64();
+    let yield_count = next_u64();
+    let sleep_count = next_u64();
+    let backoff_sleep_ns = next_u64();
+    let max_empty_streak = next_u64();
+    let nonempty_polls = next_u64();
+    let completion_batch_total = next_u64();
+    let max_completion_poll_gap_ns = next_u64();
     let max_outstanding_send = next_u64();
     let bytes_received = next_u64();
     let expected_crc32 = u32::from_be_bytes(input[offset..offset + 4].try_into().expect("fixed"));
@@ -904,6 +967,15 @@ fn decode_done(input: &[u8]) -> Result<Done> {
             cqe_error,
             poll_calls,
             empty_polls,
+            send_jfc_poll_calls,
+            recv_jfc_poll_calls,
+            yield_count,
+            sleep_count,
+            backoff_sleep_ns,
+            max_empty_streak,
+            nonempty_polls,
+            completion_batch_total,
+            max_completion_poll_gap_ns,
             max_outstanding_send,
         },
         bytes_received,
