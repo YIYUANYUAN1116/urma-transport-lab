@@ -75,6 +75,45 @@ static int urma_lab_pointer_error(int fallback)
     return errno > 0 ? -errno : fallback;
 }
 
+/*
+ * Match urma_perftest's provider-facing priority selection.  On current UB
+ * devices the imported Jetty uses an RTP, whose service class is commonly
+ * priority 0.  URMA_MAX_PRIORITY is only the largest valid numeric value; it
+ * does not mean "fastest" and may select a different, rate-limited TP class.
+ */
+static int urma_lab_get_rtp_priority(urma_lab_runtime_t *runtime,
+                                     uint8_t *priority)
+{
+    urma_device_attr_t attr = {0};
+    union urma_tp_type_en rtp = {0};
+    urma_status_t status;
+
+    if (runtime == NULL || runtime->device == NULL ||
+        runtime->context == NULL || priority == NULL) {
+        return -EINVAL;
+    }
+
+    /* The public API does not expose provider ops. Non-UB transports retain
+     * the legacy priority used by perftest when extended import is absent. */
+    if (runtime->device->type != URMA_TRANSPORT_UB) {
+        *priority = 0;
+        return 0;
+    }
+
+    status = urma_query_device(runtime->device, &attr);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    rtp.bs.rtp = 1;
+    for (uint8_t i = 0; i <= URMA_MAX_PRIORITY; ++i) {
+        if (attr.dev_cap.priority_info[i].tp_type.value == rtp.value) {
+            *priority = i;
+            return 0;
+        }
+    }
+    return -ENOTSUP;
+}
+
 int urma_lab_get_abi_baseline(urma_lab_abi_baseline_t *out)
 {
     if (out == NULL) {
@@ -524,6 +563,8 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
     urma_jfr_cfg_t jfr_cfg = {0};
     urma_jetty_cfg_t jetty_cfg = {0};
     urma_lab_jetty_t *jetty;
+    uint8_t rtp_priority;
+    int priority_status;
 
     if (runtime == NULL || runtime->context == NULL || send_jfc == NULL ||
         recv_jfc == NULL || config == NULL || out == NULL ||
@@ -535,6 +576,11 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
         return -EINVAL;
     }
     *out = NULL;
+
+    priority_status = urma_lab_get_rtp_priority(runtime, &rtp_priority);
+    if (priority_status != 0) {
+        return priority_status;
+    }
 
     jetty = calloc(1, sizeof(*jetty));
     if (jetty == NULL) {
@@ -557,7 +603,7 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
 
     jfs_cfg.depth = config->send_depth;
     jfs_cfg.trans_mode = URMA_TM_RC;
-    jfs_cfg.priority = URMA_MAX_PRIORITY;
+    jfs_cfg.priority = rtp_priority;
     jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
     jfs_cfg.max_rsge = 1;
     jfs_cfg.max_inline_data = 0;
