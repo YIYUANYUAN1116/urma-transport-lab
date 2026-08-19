@@ -451,19 +451,31 @@ fn hash_and_write_window(
     window: &RegisteredRxWindowLease,
     position: u64,
 ) -> Result<Crc32Hasher> {
-    let bytes = window.bytes();
     let mut digest = Crc32Hasher::new();
     if let Some(file) = file {
         let write = thread::scope(|scope| {
-            let write = scope.spawn(|| file.write_all_at(bytes, position));
-            digest.update(bytes);
+            let write = scope.spawn(|| -> io::Result<()> {
+                let mut part_position = position;
+                for bytes in window.parts() {
+                    file.write_all_at(bytes, part_position)?;
+                    part_position = part_position
+                        .checked_add(bytes.len() as u64)
+                        .ok_or_else(|| io::Error::other("RX file position overflow"))?;
+                }
+                Ok(())
+            });
+            for bytes in window.parts() {
+                digest.update(bytes);
+            }
             write.join()
         });
         write
             .map_err(|_| Error::Protocol("direct file writer panicked".into()))?
             .map_err(|error| io_error("pwrite registered RX window", error))?;
     } else {
-        digest.update(bytes);
+        for bytes in window.parts() {
+            digest.update(bytes);
+        }
     }
     Ok(digest)
 }
@@ -940,7 +952,7 @@ pub fn run_urma_child_profile(
                     ));
                 }
                 let lease = connection.lease_completed_recvs(std::slice::from_ref(&completion))?;
-                let message = IntegrationMessageV3::decode(lease.bytes())?;
+                let message = IntegrationMessageV3::decode(lease.single_span_bytes()?)?;
                 connection.recycle_recv_lease(lease)?;
                 received_end = Some(message);
             }
@@ -1969,8 +1981,8 @@ mod tests {
         pipeline
             .push(
                 chunks[0].len() as u64,
-                RegisteredRxWindowLease::from_test_bytes(
-                    [chunks[1], chunks[2]].concat(),
+                RegisteredRxWindowLease::from_test_parts(
+                    vec![chunks[1].to_vec(), chunks[2].to_vec()],
                     vec![(Some(1), chunks[1].len()), (Some(2), chunks[2].len())],
                 ),
             )

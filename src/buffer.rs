@@ -139,18 +139,25 @@ mod native {
         pub(crate) length: usize,
     }
 
-    /// Read-only ownership of a contiguous completed RX window. The Segment
-    /// handle stays on the transport thread; only this stable memory view may
-    /// cross threads. Slots remain `Leased` until the transport consumes this
-    /// value in `recycle_recv_lease`.
-    pub(crate) struct RegisteredRxWindowLease {
+    #[derive(Clone, Copy)]
+    struct RegisteredRxSpan {
         data: NonNull<u8>,
+        length: usize,
+    }
+
+    /// Read-only ownership of a logical completed RX window. Its registered
+    /// slots need not be physically contiguous: provider receive matching and
+    /// slot reuse order are transport details, while `spans` retains wire
+    /// order. Slots remain `Leased` until the transport consumes this value in
+    /// `recycle_recv_lease`.
+    pub(crate) struct RegisteredRxWindowLease {
+        spans: Vec<RegisteredRxSpan>,
         length: usize,
         chunks: Vec<RegisteredRxChunk>,
         slots: Vec<SlotId>,
         tracker: Arc<AtomicUsize>,
         #[cfg(test)]
-        _owned_test_bytes: Option<Box<[u8]>>,
+        _owned_test_bytes: Vec<Box<[u8]>>,
     }
 
     // SAFETY: construction requires a successful CQE for every covered slot,
@@ -158,15 +165,26 @@ mod native {
     // shared. The slots cannot be reposted until this value is consumed by the
     // owning UrmaBufferPool. Pool close refuses to free an active lease.
     unsafe impl Send for RegisteredRxWindowLease {}
-    // SAFETY: bytes() returns shared immutable access only. Concurrent CRC and
-    // pwrite readers cannot mutate the registered range.
+    // SAFETY: parts() returns shared immutable access only. Concurrent CRC and
+    // pwrite readers cannot mutate the registered ranges.
     unsafe impl Sync for RegisteredRxWindowLease {}
 
     impl RegisteredRxWindowLease {
-        pub(crate) fn bytes(&self) -> &[u8] {
-            // SAFETY: `data..data+length` was validated against the live
-            // Segment during construction and remains leased from repost.
-            unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.length) }
+        pub(crate) fn parts(&self) -> impl Iterator<Item = &[u8]> {
+            self.spans.iter().map(|span| {
+                // SAFETY: every span was validated against the live Segment
+                // during construction and remains leased from repost.
+                unsafe { std::slice::from_raw_parts(span.data.as_ptr(), span.length) }
+            })
+        }
+
+        pub(crate) fn single_span_bytes(&self) -> Result<&[u8]> {
+            if self.spans.len() != 1 {
+                return Err(Error::Protocol(
+                    "control RX lease unexpectedly spans multiple slots".into(),
+                ));
+            }
+            Ok(self.parts().next().expect("one span was checked"))
         }
 
         pub(crate) fn chunks(&self) -> &[RegisteredRxChunk] {
@@ -179,18 +197,35 @@ mod native {
 
         #[cfg(test)]
         pub(crate) fn from_test_bytes(bytes: Vec<u8>, chunks: Vec<(Option<u64>, usize)>) -> Self {
-            let owned = bytes.into_boxed_slice();
-            let data = NonNull::new(owned.as_ptr().cast_mut()).expect("test bytes are non-empty");
+            Self::from_test_parts(vec![bytes], chunks)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn from_test_parts(
+            parts: Vec<Vec<u8>>,
+            chunks: Vec<(Option<u64>, usize)>,
+        ) -> Self {
+            let owned = parts
+                .into_iter()
+                .map(Vec::into_boxed_slice)
+                .collect::<Vec<_>>();
+            let spans = owned
+                .iter()
+                .map(|bytes| RegisteredRxSpan {
+                    data: NonNull::new(bytes.as_ptr().cast_mut()).expect("test span is non-empty"),
+                    length: bytes.len(),
+                })
+                .collect::<Vec<_>>();
             Self {
-                data,
-                length: owned.len(),
+                length: owned.iter().map(|bytes| bytes.len()).sum(),
+                spans,
                 chunks: chunks
                     .into_iter()
                     .map(|(sequence, length)| RegisteredRxChunk { sequence, length })
                     .collect(),
                 slots: Vec::new(),
                 tracker: Arc::new(AtomicUsize::new(1)),
-                _owned_test_bytes: Some(owned),
+                _owned_test_bytes: owned,
             }
         }
     }
@@ -576,9 +611,14 @@ mod native {
             }
             let mut slots = Vec::with_capacity(completions.len());
             let mut chunks = Vec::with_capacity(completions.len());
-            let mut start = None;
-            let mut expected_offset = 0usize;
+            let mut spans: Vec<RegisteredRxSpan> = Vec::with_capacity(completions.len());
             let mut total = 0usize;
+            let mut previous_end = None;
+            let base = self
+                .segment_handle()?
+                .base_ptr()
+                .map_err(|error| map_ffi_error("borrow_rx_window", error))?;
+            let registered_len = self.registered_len();
             for (index, &(slot, sequence, length)) in completions.iter().enumerate() {
                 let (offset, capacity, kind, state) = self.slot_fields(slot)?;
                 if kind != SlotKind::Rx || state != SlotState::RecvCompleted {
@@ -596,52 +636,47 @@ mod native {
                         "only the final RX lease chunk may be short".into(),
                     ));
                 }
-                if start.is_some() {
-                    if offset != expected_offset {
-                        return Err(Error::Protocol(
-                            "RX lease slots are not contiguous in receive order".into(),
-                        ));
-                    }
-                } else {
-                    start = Some(offset);
-                }
-                expected_offset = offset
-                    .checked_add(capacity)
+                let end = offset
+                    .checked_add(length)
                     .ok_or_else(|| Error::Protocol("RX lease offset overflow".into()))?;
+                if end > registered_len {
+                    return Err(Error::Protocol(
+                        "RX lease span exceeds registered Segment".into(),
+                    ));
+                }
+                // SAFETY: offset..end was checked against the live registered
+                // Segment, and the slot cannot be reposted while leased.
+                let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(offset)) };
+                if previous_end == Some(offset) {
+                    let previous = spans
+                        .last_mut()
+                        .expect("a previous end implies a previous span");
+                    previous.length = previous
+                        .length
+                        .checked_add(length)
+                        .ok_or_else(|| Error::Protocol("RX lease span length overflow".into()))?;
+                } else {
+                    spans.push(RegisteredRxSpan { data, length });
+                }
+                previous_end = Some(end);
                 total = total
                     .checked_add(length)
                     .ok_or_else(|| Error::Protocol("RX lease length overflow".into()))?;
                 slots.push(slot);
                 chunks.push(RegisteredRxChunk { sequence, length });
             }
-            let base = self
-                .segment_handle()?
-                .base_ptr()
-                .map_err(|error| map_ffi_error("borrow_rx_window", error))?;
-            let start = start.expect("non-empty completions set start");
-            let end = start
-                .checked_add(total)
-                .ok_or_else(|| Error::Protocol("RX lease address overflow".into()))?;
-            if end > self.registered_len() {
-                return Err(Error::Protocol(
-                    "RX lease exceeds registered Segment".into(),
-                ));
-            }
-            // SAFETY: every slot range was validated against Segment metadata,
-            // and their checked contiguity proves this starting address.
-            let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(start)) };
             for &slot in &slots {
                 self.transition(slot, SlotState::RecvCompleted, SlotState::Leased)?;
             }
             self.active_rx_leases.fetch_add(1, Ordering::AcqRel);
             Ok(RegisteredRxWindowLease {
-                data,
+                spans,
                 length: total,
                 chunks,
                 slots,
                 tracker: self.active_rx_leases.clone(),
                 #[cfg(test)]
-                _owned_test_bytes: None,
+                _owned_test_bytes: Vec::new(),
             })
         }
 
