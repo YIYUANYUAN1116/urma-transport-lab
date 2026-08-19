@@ -162,7 +162,7 @@ M3 Ping/Pong 兼容模式：
 ```text
 RECV CQE
 -> slot 保持 RecvCompleted
--> 连续 slot 聚合为只读 RegisteredRxWindowLease
+-> 按 receive/wire 顺序聚合为只读 scatter RegisteredRxWindowLease
 -> sink worker 原地 CRC32
 -> file 场景同时从相同 registered window 执行 positional write
 -> worker 返回 lease
@@ -176,7 +176,7 @@ RECV CQE
 - lease 存活期间 slot 状态为 `Leased`，不能重新 post。
 - BufferPool 在仍有 active lease 时拒绝注销 Segment；异常析构宁可泄漏注册内存，也不提前释放形成 UAF。
 - sink pipeline 在 connection/runtime shutdown 前关闭 channel、等待 worker，并回收成功返回的 lease。
-- RX window chunk 数必须整除物理 RX slot 数；非整除的 application window 自动降到不大于它的最大整除值，避免 RQ 环回后形成非连续 window。
+- RX window chunk 数仍按物理 RX slot 数选择稳定批次大小；lease 不再假设 slot 地址连续，不连续 registered span 由 CRC/pwrite 按 wire order 遍历。
 
 本地验证：feature-on 完整单元测试通过；包括 registered window 顺序与 CRC、worker 错误传播、window/RQ 分区，以及 direct positional write 完整性。真实 UB provider 性能与 shutdown 行为仍待目标机器验证，不能标记为硬件通过。
 
@@ -188,7 +188,7 @@ benchmark fast path 继续加入以下实验性优化：
 - completed window 分派到多个 CRC worker，worker 数按 CPU affinity 自动选择，预留一个 polling CPU，最大为 8；
 - 每个 window 独立计算 CRC32，完成结果可以乱序返回，但使用 `crc32fast::Hasher::combine` 按 wire order 合并；
 - file 模式的 positional write 与该 window 的 CRC 仍并发执行，不提前复用 lease；
-- RX free list 改为 FIFO，使新的 backing 先于已回收 backing 使用，并保持 window 内物理地址顺序；
+- RX free list 改为 FIFO，使新的 backing 先于已回收 backing 使用；正确性不再依赖回收后形成连续物理地址；
 - 新增 `--urma-profile transport-only`。该模式为完整 payload 加 End 分配注册 RX backing，传输期间暂停 CRC worker，在收到 End 后先结束 transport timing，再启动完整 CRC/可选 pwrite 校验；
 - transport-only 仍输出真实 length/CRC integrity，不是跳过校验，但注册内存约等于 payload 大小，因此只用于硬件数据面诊断。
 
@@ -202,4 +202,6 @@ registered_rx_window_count
 total_registered_bytes
 ```
 
-本地测试只验证并行 CRC combine、乱序 worker 结果的有序合并、direct pwrite、profile RX sizing 和生命周期；真实 provider 的吞吐、2 GiB Segment 注册能力及 memlock 需求仍需目标节点验证。
+本地测试验证并行 CRC combine、乱序 worker 结果的有序合并与 lease retirement、scatter span CRC、direct pwrite、profile RX sizing 和生命周期。
+
+后续真实 provider 已验证 normal verified profile：2 GiB、64 KiB chunk、window 128、8 个 CRC worker 达到 6938.63 MiB/s，length/CRC32 均通过，`rx_bounce_copy=0`。详细复盘见 `docs/b3.2-urma-performance-optimization-summary-2026-08-19.md`。transport-only profile 仍未获得真实 provider 性能数据；跨节点 64-byte SEND 同时在 demo 和官方 `urma_perftest` 报 `CR status 2`，因此跨节点 UB 环境仍未验证通过。
