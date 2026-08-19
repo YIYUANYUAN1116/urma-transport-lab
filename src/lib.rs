@@ -53,7 +53,8 @@ pub use tcp_benchmark::{
 pub use transfer::{digest_reader, hex_digest, ReceiveState, TransferSummary};
 pub use urma_benchmark::{
     derive_urma_slot_size, validate_urma_case, PipelineTracker, ReceiveCreditController,
-    UrmaPipelineLimits, UrmaReceiveState, URMA_PROTOCOL_HEADER_LEN,
+    RemoteCreditReturn, RemoteReceiveCredit, UrmaPipelineLimits, UrmaReceiveState,
+    URMA_PROTOCOL_HEADER_LEN,
 };
 #[cfg(feature = "urma")]
 pub use urma_benchmark::{

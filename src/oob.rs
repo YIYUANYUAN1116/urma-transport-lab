@@ -244,7 +244,12 @@ mod native {
         connection: &mut UrmaConnection<'_>,
     ) -> Result<OobSession> {
         match result {
-            Ok(()) => Ok(OobSession { stream }),
+            Ok(()) => {
+                stream
+                    .set_nodelay(true)
+                    .map_err(|error| io_error("configure OOB TCP_NODELAY", error))?;
+                Ok(OobSession { stream })
+            }
             Err(error) => {
                 connection.fail();
                 let _ = stream.shutdown(Shutdown::Both);

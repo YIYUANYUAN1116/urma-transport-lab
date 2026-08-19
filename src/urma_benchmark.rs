@@ -174,6 +174,189 @@ pub struct ReceiveCreditController {
     next_post_sequence: u64,
 }
 
+/// Sender-side accounting for receive work requests that the peer has
+/// explicitly confirmed as posted. Local SEND completion never replenishes
+/// this credit: it only proves that the local TX buffer may be reclaimed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteReceiveCredit {
+    initial: usize,
+    available: usize,
+    returned: usize,
+    consumed: usize,
+    updates: usize,
+    waits: usize,
+}
+
+impl RemoteReceiveCredit {
+    pub fn new(initial: usize) -> Result<Self> {
+        if initial == 0 {
+            return Err(invalid("initial remote receive credit must be non-zero"));
+        }
+        Ok(Self {
+            initial,
+            available: initial,
+            returned: 0,
+            consumed: 0,
+            updates: 0,
+            waits: 0,
+        })
+    }
+
+    pub const fn can_send(&self) -> bool {
+        self.available != 0
+    }
+
+    pub fn consume(&mut self) -> Result<()> {
+        self.available = self
+            .available
+            .checked_sub(1)
+            .ok_or_else(|| Error::Protocol("SEND without remote receive credit".into()))?;
+        self.consumed = self
+            .consumed
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("remote receive credit consumption overflow".into()))?;
+        Ok(())
+    }
+
+    pub fn grant(&mut self, count: usize) -> Result<()> {
+        if count == 0 {
+            return Err(Error::Protocol("zero remote receive credit update".into()));
+        }
+        let available = self
+            .available
+            .checked_add(count)
+            .ok_or_else(|| Error::Protocol("remote receive credit overflow".into()))?;
+        if available > self.initial {
+            return Err(Error::Protocol(format!(
+                "remote receive credit {available} exceeds posted RQ capacity {}",
+                self.initial
+            )));
+        }
+        self.available = available;
+        self.returned = self
+            .returned
+            .checked_add(count)
+            .ok_or_else(|| Error::Protocol("returned remote receive credit overflow".into()))?;
+        self.updates = self
+            .updates
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("remote receive credit update overflow".into()))?;
+        Ok(())
+    }
+
+    pub fn waited(&mut self) -> Result<()> {
+        self.waits = self
+            .waits
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("remote receive credit wait overflow".into()))?;
+        Ok(())
+    }
+
+    pub const fn initial(&self) -> usize {
+        self.initial
+    }
+
+    pub const fn available(&self) -> usize {
+        self.available
+    }
+
+    pub const fn returned(&self) -> usize {
+        self.returned
+    }
+
+    pub const fn consumed(&self) -> usize {
+        self.consumed
+    }
+
+    pub const fn updates(&self) -> usize {
+        self.updates
+    }
+
+    pub const fn waits(&self) -> usize {
+        self.waits
+    }
+}
+
+/// Receiver-side batching for credits that became safe only after the RX WRs
+/// were successfully reposted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RemoteCreditReturn {
+    threshold: usize,
+    pending: usize,
+    returned: usize,
+    updates: usize,
+}
+
+impl RemoteCreditReturn {
+    pub fn new(posted_credit: usize) -> Result<Self> {
+        if posted_credit == 0 {
+            return Err(invalid("posted receive credit must be non-zero"));
+        }
+        Ok(Self {
+            threshold: (posted_credit / 4).max(1),
+            pending: 0,
+            returned: 0,
+            updates: 0,
+        })
+    }
+
+    pub fn reposted(&mut self, count: usize) -> Result<Option<usize>> {
+        self.pending = self
+            .pending
+            .checked_add(count)
+            .ok_or_else(|| Error::Protocol("pending remote credit overflow".into()))?;
+        if self.pending < self.threshold {
+            return Ok(None);
+        }
+        let count = self.pending / self.threshold * self.threshold;
+        self.pending -= count;
+        self.returned = self
+            .returned
+            .checked_add(count)
+            .ok_or_else(|| Error::Protocol("returned receive credit overflow".into()))?;
+        self.updates = self
+            .updates
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("receive credit update overflow".into()))?;
+        Ok(Some(count))
+    }
+
+    /// Returns a final partial batch when the sender has posted every Data
+    /// message but still needs one receive credit for End.
+    pub fn flush(&mut self) -> Result<Option<usize>> {
+        if self.pending == 0 {
+            return Ok(None);
+        }
+        let count = self.pending;
+        self.pending = 0;
+        self.returned = self
+            .returned
+            .checked_add(count)
+            .ok_or_else(|| Error::Protocol("returned receive credit overflow".into()))?;
+        self.updates = self
+            .updates
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("receive credit update overflow".into()))?;
+        Ok(Some(count))
+    }
+
+    pub const fn threshold(&self) -> usize {
+        self.threshold
+    }
+
+    pub const fn pending(&self) -> usize {
+        self.pending
+    }
+
+    pub const fn returned(&self) -> usize {
+        self.returned
+    }
+
+    pub const fn updates(&self) -> usize {
+        self.updates
+    }
+}
+
 pub(crate) fn receive_credit_target(
     _window: usize,
     rx_slot_count: usize,
@@ -513,6 +696,81 @@ mod tests {
         assert_eq!(credit.remaining_messages(), 0);
         assert_eq!(credit.current_credit(), 0);
         assert_eq!(credit.next_post_sequence(), 7);
+    }
+
+    #[test]
+    fn remote_receive_credit_is_independent_of_local_completion() {
+        let mut credit = RemoteReceiveCredit::new(4).unwrap();
+        for _ in 0..4 {
+            assert!(credit.can_send());
+            credit.consume().unwrap();
+        }
+        assert!(!credit.can_send());
+        assert!(credit.consume().is_err());
+        credit.waited().unwrap();
+        credit.grant(2).unwrap();
+        assert_eq!(credit.initial(), 4);
+        assert_eq!(credit.available(), 2);
+        assert_eq!(credit.returned(), 2);
+        assert_eq!(credit.consumed(), 4);
+        assert_eq!(credit.updates(), 1);
+        assert_eq!(credit.waits(), 1);
+        assert!(credit.grant(0).is_err());
+    }
+
+    #[test]
+    fn remote_credit_is_returned_only_in_reposted_batches() {
+        let mut returned = RemoteCreditReturn::new(512).unwrap();
+        assert_eq!(returned.threshold(), 128);
+        assert_eq!(returned.reposted(127).unwrap(), None);
+        assert_eq!(returned.reposted(1).unwrap(), Some(128));
+        assert_eq!(returned.reposted(300).unwrap(), Some(256));
+        assert_eq!(returned.pending(), 44);
+        assert_eq!(returned.returned(), 384);
+        assert_eq!(returned.updates(), 2);
+        assert_eq!(returned.flush().unwrap(), Some(44));
+        assert_eq!(returned.pending(), 0);
+        assert_eq!(returned.returned(), 428);
+        assert_eq!(returned.updates(), 3);
+        assert_eq!(returned.flush().unwrap(), None);
+
+        let returned = RemoteCreditReturn::new(3).unwrap();
+        assert_eq!(returned.threshold(), 1);
+    }
+
+    #[test]
+    fn batched_remote_credit_preserves_one_final_end_receive() {
+        let data_messages = 32_768usize;
+        let total_messages = data_messages + 1;
+        let mut local = ReceiveCreditController::new(512, total_messages).unwrap();
+        while local.posts_needed() != 0 {
+            local.posted().unwrap();
+        }
+        let mut remote = RemoteReceiveCredit::new(local.current_credit()).unwrap();
+        let mut returned = RemoteCreditReturn::new(local.current_credit()).unwrap();
+
+        for _ in 0..data_messages {
+            assert!(remote.can_send());
+            remote.consume().unwrap();
+            local.completed().unwrap();
+            let mut reposted = 0;
+            while local.posts_needed() != 0 {
+                local.posted().unwrap();
+                reposted += 1;
+            }
+            if let Some(count) = returned.reposted(reposted).unwrap() {
+                remote.grant(count).unwrap();
+            }
+        }
+
+        if let Some(count) = returned.flush().unwrap() {
+            remote.grant(count).unwrap();
+        }
+        assert!(remote.can_send(), "End must retain one remote RQE");
+        remote.consume().unwrap();
+        local.completed().unwrap();
+        assert_eq!(local.remaining_messages(), 0);
+        assert_eq!(local.current_credit(), 0);
     }
 
     #[test]

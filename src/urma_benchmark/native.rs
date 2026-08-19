@@ -19,12 +19,13 @@ use std::{
 const REQUEST_ID: u64 = 1;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_MAGIC: u32 = 0x4252_4d41;
-const CONTROL_VERSION: u16 = 1;
+const CONTROL_VERSION: u16 = 2;
 const CONTROL_HEADER_LEN: usize = 12;
 const MAX_CONTROL_PAYLOAD: usize = 4096;
 const READY: u16 = 1;
 const START: u16 = 2;
 const DONE: u16 = 3;
+const CREDIT: u16 = 4;
 const SEND_COMPLETION_INTERVAL: usize = 100;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -284,6 +285,7 @@ pub fn run_urma_parent_profile(
         .accept()
         .map_err(|error| io_error("accept URMA OOB", error))?;
     let mut session = parent_handshake(stream, &mut connection)?;
+    configure_control_stream(session.stream_mut())?;
 
     let request = IntegrationMessageV3::decode(&connection.wait_for_frame(TIMEOUT)?)?;
     match &request.body {
@@ -313,7 +315,15 @@ pub fn run_urma_parent_profile(
     connection.send_frame(&metadata.encode()?)?;
     connection.drain_completions(TIMEOUT)?;
 
-    expect_case_control(&mut session, READY, &case.case_id)?;
+    let remaining_messages = usize::try_from(case.chunk_count()? + 1)
+        .map_err(|_| invalid("receive message count exceeds usize"))?;
+    let expected_remote_credit = receive_credit_target(
+        case.window as usize,
+        runtime_config.buffer_pool.rx_slot_count,
+        remaining_messages,
+    )?;
+    let initial_remote_credit = expect_ready(&mut session, &case.case_id, expected_remote_credit)?;
+    let mut remote_credit = RemoteReceiveCredit::new(initial_remote_credit)?;
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
         None => Measurement::start(case.timing_mode)?,
@@ -332,6 +342,8 @@ pub fn run_urma_parent_profile(
             case.chunk_count()?,
             &mut connection,
             &mut pipeline,
+            session.stream_mut(),
+            &mut remote_credit,
             &mut bytes_sent,
         )?
     } else {
@@ -340,12 +352,16 @@ pub fn run_urma_parent_profile(
             case.chunk_size_usize()?,
             &mut connection,
             &mut pipeline,
+            session.stream_mut(),
+            &mut remote_credit,
             &mut bytes_sent,
         )?
     };
     drain_pipeline(&mut connection, &mut pipeline)?;
     let end = IntegrationMessageV3::end(REQUEST_ID, data_messages, case.transfer_bytes);
+    wait_for_remote_credit(session.stream_mut(), &mut remote_credit)?;
     connection.send_frame(&end.encode()?)?;
+    remote_credit.consume()?;
     connection.drain_completions(TIMEOUT)?;
     if pipeline.current() != 0 || connection.outstanding_send() != 0 {
         return Err(Error::Protocol("URMA pipeline did not fully drain".into()));
@@ -357,7 +373,7 @@ pub fn run_urma_parent_profile(
     }
     let (parent_sample, parent_cpu) = measurement.finish()?;
 
-    let done = decode_done(&read_control(session.stream_mut(), DONE)?)?;
+    let done = decode_done(&read_done(session.stream_mut(), &mut remote_credit)?)?;
     if done.case_id != case.case_id || !done.integrity.is_ok() {
         return Err(Error::Protocol("invalid URMA benchmark Done".into()));
     }
@@ -376,6 +392,7 @@ pub fn run_urma_parent_profile(
     result.parent_cpu = Some(parent_cpu);
     result.child_cpu = Some(done.child_cpu);
     stats.insert_all(&mut result.transport_stats);
+    insert_remote_credit_stats(&mut result, &remote_credit);
     result
         .transport_stats
         .insert("fixed_tx_profile".into(), u64::from(profile.fixed_tx()));
@@ -431,6 +448,7 @@ pub fn run_urma_child_profile(
     let mut connection = runtime.create_connection(jetty_config)?;
     let stream = TcpStream::connect(parent).map_err(|error| io_error("connect URMA OOB", error))?;
     let mut session = child_handshake(stream, &mut connection)?;
+    configure_control_stream(session.stream_mut())?;
 
     let request = IntegrationMessageV3::request(REQUEST_ID, case.case_id.clone(), case.repeat);
     connection.send_frame(&request.encode()?)?;
@@ -458,11 +476,16 @@ pub fn run_urma_child_profile(
         remaining_messages,
     )?;
     let mut credit = ReceiveCreditController::new(credit_target, remaining_messages)?;
-    replenish_credit(&mut connection, &mut credit)?;
+    let initial_credit = replenish_credit(&mut connection, &mut credit)?;
     if connection.receive_credit() != credit.current_credit() {
         return Err(Error::Protocol("RX credit accounting mismatch".into()));
     }
-    write_control(session.stream_mut(), READY, case.case_id.as_bytes())?;
+    let mut credit_return = RemoteCreditReturn::new(initial_credit)?;
+    write_control(
+        session.stream_mut(),
+        READY,
+        &encode_ready(&case.case_id, initial_credit)?,
+    )?;
     expect_case_control(&mut session, START, &case.case_id)?;
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
@@ -502,7 +525,18 @@ pub fn run_urma_child_profile(
         last_progress = Instant::now();
         // The callback consumed bytes directly from completed registered RX
         // slots. Refill the deep RQ before the next CQ batch.
-        replenish_credit(&mut connection, &mut credit)?;
+        let reposted = replenish_credit(&mut connection, &mut credit)?;
+        if let Some(returned) = credit_return.reposted(reposted)? {
+            write_credit(session.stream_mut(), returned)?;
+        }
+        // Data and End share the same RQ. If Data consumed an exact multiple
+        // of the batching threshold, a partial repost may be the only credit
+        // that lets the parent send End, so it must be flushed here.
+        if received_data_messages == expected_data_messages && !transfer_complete {
+            if let Some(returned) = credit_return.flush()? {
+                write_credit(session.stream_mut(), returned)?;
+            }
+        }
         if transfer_complete {
             break 'receive;
         }
@@ -534,6 +568,31 @@ pub fn run_urma_child_profile(
         bytes_received,
     )?
     .insert_all(&mut result.transport_stats);
+    result.transport_stats.insert(
+        "remote_credit_initial".into(),
+        u64::try_from(initial_credit).map_err(|_| invalid("initial credit does not fit u64"))?,
+    );
+    result.transport_stats.insert(
+        "remote_credit_returned".into(),
+        u64::try_from(credit_return.returned())
+            .map_err(|_| invalid("returned credit does not fit u64"))?,
+    );
+    result.transport_stats.insert(
+        "remote_credit_updates".into(),
+        u64::try_from(credit_return.updates())
+            .map_err(|_| invalid("credit update count does not fit u64"))?,
+    );
+    result.transport_stats.insert(
+        "remote_credit_pending".into(),
+        u64::try_from(credit_return.pending())
+            .map_err(|_| invalid("pending credit does not fit u64"))?,
+    );
+    result
+        .transport_stats
+        .insert("remote_credit_wait_count".into(), 0);
+    result
+        .transport_stats
+        .insert("remote_credit_consumed".into(), 0);
     let done = Done {
         case_id: case.case_id.clone(),
         integrity,
@@ -555,6 +614,8 @@ fn send_source(
     chunk_size: usize,
     connection: &mut UrmaConnection<'_>,
     pipeline: &mut PipelineTracker,
+    control: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
 ) -> Result<u32> {
     let mut last_progress = Instant::now();
@@ -572,6 +633,8 @@ fn send_source(
                     sequence,
                     chunk,
                     u64::from(sequence) + 1 == chunk_count,
+                    control,
+                    remote_credit,
                     &mut last_progress,
                 )?;
                 *bytes_sent += chunk.len() as u64;
@@ -594,6 +657,8 @@ fn send_source(
                     sequence,
                     &buffer[..read],
                     u64::from(sequence) + 1 == chunk_count,
+                    control,
+                    remote_credit,
                     &mut last_progress,
                 )?;
                 *bytes_sent += read as u64;
@@ -619,6 +684,8 @@ fn send_fixed_payload(
     chunk_count: u64,
     connection: &mut UrmaConnection<'_>,
     pipeline: &mut PipelineTracker,
+    control: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
 ) -> Result<u32> {
     let mut last_progress = Instant::now();
@@ -635,11 +702,13 @@ fn send_fixed_payload(
                 });
             }
         }
+        wait_for_remote_credit(control, remote_credit)?;
         connection.send_prepared_tracked(
             payload_len,
             u64::from(sequence),
             sequence + 1 == count,
         )?;
+        remote_credit.consume()?;
         pipeline.posted()?;
         *bytes_sent = bytes_sent
             .checked_add(payload_len as u64)
@@ -654,6 +723,8 @@ fn post_data(
     sequence: u32,
     payload: &[u8],
     is_last: bool,
+    control: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
     last_progress: &mut Instant,
 ) -> Result<()> {
     while !pipeline.can_post() {
@@ -667,11 +738,13 @@ fn post_data(
             });
         }
     }
+    wait_for_remote_credit(control, remote_credit)?;
     if is_last {
         connection.send_frame_tracked_tail(payload, u64::from(sequence))?;
     } else {
         connection.send_frame_tracked(payload, u64::from(sequence))?;
     }
+    remote_credit.consume()?;
     pipeline.posted()?;
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
     Ok(())
@@ -721,12 +794,14 @@ fn poll_send_completions(
 fn replenish_credit(
     connection: &mut UrmaConnection<'_>,
     credit: &mut ReceiveCreditController,
-) -> Result<()> {
+) -> Result<usize> {
+    let mut posted = 0usize;
     while credit.posts_needed() != 0 {
         connection.recv_ready_tracked(credit.next_post_sequence())?;
         credit.posted()?;
+        posted += 1;
     }
-    Ok(())
+    Ok(posted)
 }
 
 fn log_parent_pipeline_capacity_timeout(
@@ -1010,6 +1085,132 @@ fn expect_case_control(session: &mut OobSession, kind: u16, case_id: &str) -> Re
     Ok(())
 }
 
+fn configure_control_stream(stream: &TcpStream) -> Result<()> {
+    stream
+        .set_read_timeout(Some(TIMEOUT))
+        .and_then(|_| stream.set_write_timeout(Some(TIMEOUT)))
+        .map_err(|error| io_error("configure URMA benchmark control timeout", error))
+}
+
+fn encode_ready(case_id: &str, initial_credit: usize) -> Result<Vec<u8>> {
+    let case = case_id.as_bytes();
+    let case_len = u16::try_from(case.len()).map_err(|_| invalid("case_id too long"))?;
+    let credit = u32::try_from(initial_credit)
+        .map_err(|_| invalid("initial remote receive credit exceeds u32"))?;
+    let mut payload = Vec::with_capacity(2 + case.len() + 4);
+    payload.extend_from_slice(&case_len.to_be_bytes());
+    payload.extend_from_slice(case);
+    payload.extend_from_slice(&credit.to_be_bytes());
+    Ok(payload)
+}
+
+fn decode_ready(payload: &[u8]) -> Result<(String, usize)> {
+    if payload.len() < 6 {
+        return Err(Error::Protocol("truncated URMA READY payload".into()));
+    }
+    let case_len = u16::from_be_bytes(payload[..2].try_into().expect("fixed slice")) as usize;
+    let expected_len = 2usize
+        .checked_add(case_len)
+        .and_then(|length| length.checked_add(4))
+        .ok_or_else(|| Error::Protocol("URMA READY length overflow".into()))?;
+    if payload.len() != expected_len {
+        return Err(Error::Protocol("invalid URMA READY payload length".into()));
+    }
+    let case_id = std::str::from_utf8(&payload[2..2 + case_len])
+        .map_err(|_| Error::Protocol("URMA READY case_id is not UTF-8".into()))?
+        .to_owned();
+    let credit = u32::from_be_bytes(
+        payload[2 + case_len..expected_len]
+            .try_into()
+            .expect("fixed slice"),
+    ) as usize;
+    if credit == 0 {
+        return Err(Error::Protocol(
+            "URMA READY advertised zero receive credit".into(),
+        ));
+    }
+    Ok((case_id, credit))
+}
+
+fn expect_ready(session: &mut OobSession, case_id: &str, expected_credit: usize) -> Result<usize> {
+    let (received_case_id, credit) = decode_ready(&read_control(session.stream_mut(), READY)?)?;
+    if received_case_id != case_id || credit != expected_credit {
+        return Err(Error::Protocol(format!(
+            "URMA READY mismatch: case_id={received_case_id:?}, credit={credit}, expected case_id={case_id:?}, credit={expected_credit}"
+        )));
+    }
+    Ok(credit)
+}
+
+fn write_credit(stream: &mut TcpStream, count: usize) -> Result<()> {
+    let count = u32::try_from(count).map_err(|_| invalid("remote credit update exceeds u32"))?;
+    if count == 0 {
+        return Err(invalid("remote credit update must be non-zero"));
+    }
+    write_control(stream, CREDIT, &count.to_be_bytes())
+}
+
+fn decode_credit(payload: &[u8]) -> Result<usize> {
+    if payload.len() != 4 {
+        return Err(Error::Protocol("invalid URMA CREDIT payload length".into()));
+    }
+    let count = u32::from_be_bytes(payload.try_into().expect("fixed slice")) as usize;
+    if count == 0 {
+        return Err(Error::Protocol("zero URMA CREDIT update".into()));
+    }
+    Ok(count)
+}
+
+fn wait_for_remote_credit(
+    stream: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
+) -> Result<()> {
+    if remote_credit.can_send() {
+        return Ok(());
+    }
+    remote_credit.waited()?;
+    while !remote_credit.can_send() {
+        let (kind, payload) = read_control_frame(stream)?;
+        if kind != CREDIT {
+            return Err(Error::Protocol(format!(
+                "received control kind {kind} while waiting for remote RX credit"
+            )));
+        }
+        remote_credit.grant(decode_credit(&payload)?)?;
+    }
+    Ok(())
+}
+
+fn read_done(stream: &mut TcpStream, remote_credit: &mut RemoteReceiveCredit) -> Result<Vec<u8>> {
+    loop {
+        let (kind, payload) = read_control_frame(stream)?;
+        match kind {
+            CREDIT => remote_credit.grant(decode_credit(&payload)?)?,
+            DONE => return Ok(payload),
+            _ => {
+                return Err(Error::Protocol(format!(
+                    "received control kind {kind} while waiting for DONE"
+                )))
+            }
+        }
+    }
+}
+
+fn insert_remote_credit_stats(result: &mut BenchmarkResult, credit: &RemoteReceiveCredit) {
+    for (name, value) in [
+        ("remote_credit_initial", credit.initial()),
+        ("remote_credit_returned", credit.returned()),
+        ("remote_credit_consumed", credit.consumed()),
+        ("remote_credit_updates", credit.updates()),
+        ("remote_credit_wait_count", credit.waits()),
+        ("remote_credit_pending", credit.available()),
+    ] {
+        result
+            .transport_stats
+            .insert(name.into(), u64::try_from(value).unwrap_or(u64::MAX));
+    }
+}
+
 fn write_control(stream: &mut TcpStream, kind: u16, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_CONTROL_PAYLOAD {
         return Err(invalid("URMA benchmark control payload too large"));
@@ -1026,6 +1227,16 @@ fn write_control(stream: &mut TcpStream, kind: u16, payload: &[u8]) -> Result<()
 }
 
 fn read_control(stream: &mut TcpStream, expected_kind: u16) -> Result<Vec<u8>> {
+    let (kind, payload) = read_control_frame(stream)?;
+    if kind != expected_kind {
+        return Err(Error::Protocol(format!(
+            "received URMA control kind {kind}, expected {expected_kind}"
+        )));
+    }
+    Ok(payload)
+}
+
+fn read_control_frame(stream: &mut TcpStream) -> Result<(u16, Vec<u8>)> {
     let mut header = [0u8; CONTROL_HEADER_LEN];
     stream
         .read_exact(&mut header)
@@ -1034,11 +1245,7 @@ fn read_control(stream: &mut TcpStream, expected_kind: u16) -> Result<Vec<u8>> {
     let version = u16::from_be_bytes(header[4..6].try_into().expect("fixed slice"));
     let kind = u16::from_be_bytes(header[6..8].try_into().expect("fixed slice"));
     let length = u32::from_be_bytes(header[8..12].try_into().expect("fixed slice")) as usize;
-    if magic != CONTROL_MAGIC
-        || version != CONTROL_VERSION
-        || kind != expected_kind
-        || length > MAX_CONTROL_PAYLOAD
-    {
+    if magic != CONTROL_MAGIC || version != CONTROL_VERSION || length > MAX_CONTROL_PAYLOAD {
         return Err(Error::Protocol(
             "invalid URMA benchmark control frame".into(),
         ));
@@ -1047,7 +1254,7 @@ fn read_control(stream: &mut TcpStream, expected_kind: u16) -> Result<Vec<u8>> {
     stream
         .read_exact(&mut payload)
         .map_err(|error| io_error("read URMA benchmark control payload", error))?;
-    Ok(payload)
+    Ok((kind, payload))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1204,6 +1411,29 @@ fn io_error(operation: &'static str, error: io::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_control_round_trip_binds_case_and_posted_credit() {
+        let payload = encode_ready("credit-case", 512).unwrap();
+        assert_eq!(
+            decode_ready(&payload).unwrap(),
+            ("credit-case".to_string(), 512)
+        );
+
+        let mut truncated = payload.clone();
+        truncated.pop();
+        assert!(decode_ready(&truncated).is_err());
+
+        let zero = encode_ready("credit-case", 0).unwrap();
+        assert!(decode_ready(&zero).is_err());
+    }
+
+    #[test]
+    fn credit_control_rejects_zero_and_wrong_length() {
+        assert_eq!(decode_credit(&128u32.to_be_bytes()).unwrap(), 128);
+        assert!(decode_credit(&0u32.to_be_bytes()).is_err());
+        assert!(decode_credit(&[0, 1]).is_err());
+    }
 
     #[test]
     fn done_control_round_trip_preserves_hybrid_polling_stats() {
