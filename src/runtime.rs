@@ -14,8 +14,8 @@ impl RuntimeConfig {
         Self {
             device_name: device_name.into(),
             eid_index,
-            send_jfc_depth: 64,
-            recv_jfc_depth: 64,
+            send_jfc_depth: 4096,
+            recv_jfc_depth: 4096,
             buffer_pool: BufferPoolConfig::default(),
         }
     }
@@ -591,8 +591,8 @@ mod tests {
         let config = RuntimeConfig::new("urma0", 2);
         assert_eq!(config.device_name, "urma0");
         assert_eq!(config.eid_index, 2);
-        assert_eq!(config.send_jfc_depth, 64);
-        assert_eq!(config.recv_jfc_depth, 64);
+        assert_eq!(config.send_jfc_depth, 4096);
+        assert_eq!(config.recv_jfc_depth, 4096);
         assert_eq!(config.buffer_pool, BufferPoolConfig::default());
     }
 
@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn abi_baseline_matches_verified_m0_contract() {
         let baseline = abi_baseline().expect("C shim must return its ABI baseline");
-        assert_eq!(baseline.shim_abi_version, 5);
+        assert_eq!(baseline.shim_abi_version, 6);
         assert_eq!(baseline.pointer_size as usize, std::mem::size_of::<usize>());
         assert_eq!(baseline.status_size as usize, std::mem::size_of::<i32>());
         assert_eq!(baseline.success_value, 0);

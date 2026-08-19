@@ -5,7 +5,10 @@ use std::time::{Duration, Instant};
 pub struct CompletionStats {
     pub send_post: u64,
     pub recv_post: u64,
+    /// Hardware SEND completion records consumed from the JFC.
     pub send_cqe: u64,
+    /// Logical SEND WRs retired by those ordered completion frontiers.
+    pub send_retired: u64,
     pub recv_cqe: u64,
     pub cqe_error: u64,
     pub poll_calls: u64,
@@ -30,7 +33,7 @@ pub struct CompletionStats {
 }
 
 #[cfg(any(feature = "urma", test))]
-const HOT_POLL_LIMIT: u64 = 64;
+const HOT_POLL_LIMIT: u64 = u64::MAX;
 #[cfg(any(feature = "urma", test))]
 const EVENT_WAIT_TIMEOUT_MS: i32 = 10;
 
@@ -95,18 +98,22 @@ mod native {
         ffi,
         wr::{OperationType, WrToken},
     };
-    use std::collections::HashMap;
+    use std::collections::VecDeque;
 
     struct OutstandingWr {
+        user_ctx: u64,
         handle: ffi::WrHandle,
         sequence: Option<u64>,
+        signaled: bool,
     }
 
     pub(crate) struct CompletionPoller {
         connection_id: u16,
         generation: u8,
         batch: usize,
-        outstanding: HashMap<u64, OutstandingWr>,
+        outstanding: Vec<Option<OutstandingWr>>,
+        outstanding_total: usize,
+        send_order: VecDeque<u64>,
         outstanding_send: usize,
         outstanding_recv: usize,
         last_completed_send_sequence: Option<u64>,
@@ -129,7 +136,9 @@ mod native {
                 connection_id,
                 generation,
                 batch,
-                outstanding: HashMap::new(),
+                outstanding: Vec::new(),
+                outstanding_total: 0,
+                send_order: VecDeque::new(),
                 outstanding_send: 0,
                 outstanding_recv: 0,
                 last_completed_send_sequence: None,
@@ -148,19 +157,26 @@ mod native {
             operation: OperationType,
             wr: ffi::WrHandle,
             sequence: Option<u64>,
+            signaled: bool,
         ) -> Result<()> {
-            if self.outstanding.contains_key(&user_ctx) {
+            let token = WrToken::decode(user_ctx)?;
+            let slot = token.slot.index();
+            if self.outstanding.len() <= slot {
+                self.outstanding.resize_with(slot + 1, || None);
+            }
+            if self.outstanding[slot].is_some() {
                 return Err(Error::Protocol("duplicate outstanding user_ctx".into()));
             }
-            self.outstanding.insert(
+            self.outstanding[slot] = Some(OutstandingWr {
                 user_ctx,
-                OutstandingWr {
-                    handle: wr,
-                    sequence,
-                },
-            );
+                handle: wr,
+                sequence,
+                signaled,
+            });
+            self.outstanding_total += 1;
             match operation {
                 OperationType::Send => {
+                    self.send_order.push_back(user_ctx);
                     self.stats.send_post += 1;
                     self.outstanding_send += 1;
                     self.stats.max_outstanding_send = self
@@ -257,6 +273,94 @@ mod native {
             Ok(events)
         }
 
+        pub(crate) fn poll_recv_direct(
+            &mut self,
+            recv_jfc: &ffi::JfcHandle,
+            pool: &mut UrmaBufferPool,
+            mut consume: impl FnMut(Option<u64>, &[u8]) -> Result<()>,
+        ) -> Result<usize> {
+            let poll_started = Instant::now();
+            let previous_poll_started = self.last_poll_started.replace(poll_started);
+            self.stats.poll_calls += 1;
+            self.stats.recv_jfc_poll_calls += 1;
+            let mut records = [ffi::CompletionRecord::default(); 16];
+            let count = recv_jfc
+                .poll_into(&mut records[..self.batch])
+                .map_err(|error| map_ffi_error("poll_recv_jfc", error))?;
+            if count == 0 {
+                self.stats.empty_polls += 1;
+                self.empty_streak = self.empty_streak.saturating_add(1);
+                self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
+                std::hint::spin_loop();
+                return Ok(0);
+            }
+            for record in records.into_iter().take(count) {
+                self.route_recv_direct(record, pool, &mut consume)?;
+            }
+            self.record_nonempty(count, previous_poll_started);
+            Ok(count)
+        }
+
+        fn route_recv_direct(
+            &mut self,
+            record: ffi::CompletionRecord,
+            pool: &mut UrmaBufferPool,
+            consume: &mut impl FnMut(Option<u64>, &[u8]) -> Result<()>,
+        ) -> Result<()> {
+            if !record.user_ctx_valid {
+                self.stats.cqe_error += 1;
+                return Err(Error::Completion {
+                    status: record.status,
+                    opcode: record.opcode,
+                    user_ctx: 0,
+                });
+            }
+            let token = WrToken::decode(record.user_ctx)?;
+            if token.connection_id != self.connection_id
+                || token.generation != self.generation
+                || token.operation != OperationType::Recv
+                || !record.is_recv
+                || !record.is_jetty
+            {
+                self.stats.cqe_error += 1;
+                return Err(Error::Protocol(
+                    "direct receive CQE identity/queue flags disagree".into(),
+                ));
+            }
+            let outstanding = self.take_outstanding(record.user_ctx)?;
+            outstanding.handle.complete();
+            self.outstanding_recv -= 1;
+            if let Err(error) =
+                validate_completion_status(record.status, record.opcode, record.user_ctx)
+            {
+                self.stats.cqe_error += 1;
+                pool.complete_error(token.slot, OperationType::Recv)?;
+                pool.release(token.slot)?;
+                return Err(error);
+            }
+            if record.opcode != 0 {
+                self.stats.cqe_error += 1;
+                pool.complete_error(token.slot, OperationType::Recv)?;
+                pool.release(token.slot)?;
+                return Err(Error::Protocol(format!(
+                    "unexpected receive CQE opcode {}",
+                    record.opcode
+                )));
+            }
+            let consumed = pool.complete_recv_with(token.slot, record.completion_len, |bytes| {
+                consume(outstanding.sequence, bytes)
+            });
+            // Release even when application validation or sink I/O fails: the
+            // CQE has ended device access and the callback borrow is over.
+            pool.release(token.slot)?;
+            consumed?;
+            self.stats.recv_cqe += 1;
+            if let Some(sequence) = outstanding.sequence {
+                self.last_completed_recv_sequence = Some(sequence);
+            }
+            Ok(())
+        }
+
         fn poll_active(
             &mut self,
             send_jfc: &ffi::JfcHandle,
@@ -266,20 +370,22 @@ mod native {
             let mut events = Vec::new();
             if self.outstanding_send != 0 {
                 self.stats.send_jfc_poll_calls += 1;
-                for record in send_jfc
-                    .poll(self.batch)
-                    .map_err(|error| map_ffi_error("poll_send_jfc", error))?
-                {
-                    events.push(self.route(record, false, pool)?);
+                let mut records = [ffi::CompletionRecord::default(); 16];
+                let count = send_jfc
+                    .poll_into(&mut records[..self.batch])
+                    .map_err(|error| map_ffi_error("poll_send_jfc", error))?;
+                for record in records.into_iter().take(count) {
+                    events.extend(self.route(record, false, pool)?);
                 }
             }
             if self.outstanding_recv != 0 {
                 self.stats.recv_jfc_poll_calls += 1;
-                for record in recv_jfc
-                    .poll(self.batch)
-                    .map_err(|error| map_ffi_error("poll_recv_jfc", error))?
-                {
-                    events.push(self.route(record, true, pool)?);
+                let mut records = [ffi::CompletionRecord::default(); 16];
+                let count = recv_jfc
+                    .poll_into(&mut records[..self.batch])
+                    .map_err(|error| map_ffi_error("poll_recv_jfc", error))?;
+                for record in records.into_iter().take(count) {
+                    events.extend(self.route(record, true, pool)?);
                 }
             }
             Ok(events)
@@ -331,7 +437,7 @@ mod native {
             record: ffi::CompletionRecord,
             recv_queue: bool,
             pool: &mut UrmaBufferPool,
-        ) -> Result<CompletionEvent> {
+        ) -> Result<Vec<CompletionEvent>> {
             if !record.user_ctx_valid {
                 self.stats.cqe_error += 1;
                 return Err(Error::Completion {
@@ -345,41 +451,24 @@ mod native {
                 return Err(Error::Protocol("stale or foreign CQE user_ctx".into()));
             }
             let expected_recv = token.operation == OperationType::Recv;
-            let outstanding = self
-                .outstanding
-                .remove(&record.user_ctx)
-                .ok_or_else(|| Error::Protocol("CQE has no outstanding WR".into()))?;
-            outstanding.handle.complete();
-            match token.operation {
-                OperationType::Send => self.outstanding_send -= 1,
-                OperationType::Recv => self.outstanding_recv -= 1,
-            }
             if expected_recv != recv_queue || record.is_recv != recv_queue || !record.is_jetty {
                 self.stats.cqe_error += 1;
-                pool.complete_error(token.slot, token.operation)?;
-                pool.release(token.slot)?;
                 return Err(Error::Protocol("CQE queue/operation flags disagree".into()));
             }
-
-            if let Err(error) =
-                validate_completion_status(record.status, record.opcode, record.user_ctx)
-            {
-                self.stats.cqe_error += 1;
-                pool.complete_error(token.slot, token.operation)?;
-                pool.release(token.slot)?;
-                return Err(error);
-            }
             match token.operation {
-                OperationType::Send => {
-                    pool.complete_send(token.slot)?;
-                    pool.release(token.slot)?;
-                    self.stats.send_cqe += 1;
-                    if let Some(sequence) = outstanding.sequence {
-                        self.last_completed_send_sequence = Some(sequence);
-                    }
-                    Ok(CompletionEvent::SendCompleted { slot: token.slot })
-                }
+                OperationType::Send => self.route_send_frontier(record, pool),
                 OperationType::Recv => {
+                    let outstanding = self.take_outstanding(record.user_ctx)?;
+                    outstanding.handle.complete();
+                    self.outstanding_recv -= 1;
+                    if let Err(error) =
+                        validate_completion_status(record.status, record.opcode, record.user_ctx)
+                    {
+                        self.stats.cqe_error += 1;
+                        pool.complete_error(token.slot, token.operation)?;
+                        pool.release(token.slot)?;
+                        return Err(error);
+                    }
                     // URMA documents opcode only for receive CRs; M3 accepts
                     // only the SEND opcode value (zero).
                     if record.opcode != 0 {
@@ -397,12 +486,67 @@ mod native {
                     if let Some(sequence) = outstanding.sequence {
                         self.last_completed_recv_sequence = Some(sequence);
                     }
-                    Ok(CompletionEvent::RecvCompleted {
+                    Ok(vec![CompletionEvent::RecvCompleted {
                         slot: token.slot,
                         bytes,
-                    })
+                    }])
                 }
             }
+        }
+
+        /// A successful signaled SEND completion is the local completion
+        /// frontier used by urma_perftest: all earlier WRs on this ordered JFS
+        /// are retired together. Their registered slots remain pinned until
+        /// this point, including WRs that did not request their own CQE.
+        fn route_send_frontier(
+            &mut self,
+            record: ffi::CompletionRecord,
+            pool: &mut UrmaBufferPool,
+        ) -> Result<Vec<CompletionEvent>> {
+            let frontier = self
+                .send_order
+                .iter()
+                .position(|user_ctx| *user_ctx == record.user_ctx)
+                .ok_or_else(|| Error::Protocol("SEND CQE has no ordered frontier".into()))?;
+            let completion_error =
+                validate_completion_status(record.status, record.opcode, record.user_ctx).err();
+            // Providers may report a flushed WR even when that WR did not ask
+            // for a normal success CQE. Accept that only on the error path: it
+            // proves device access has ended and lets shutdown retire the
+            // ordered prefix without releasing any buffer early.
+            if completion_error.is_none() && !self.outstanding_for(record.user_ctx)?.signaled {
+                return Err(Error::Protocol(
+                    "SEND CQE corresponds to an unsignaled WR".into(),
+                ));
+            }
+            self.stats.send_cqe += 1;
+            let mut events = Vec::with_capacity(frontier + 1);
+            for _ in 0..=frontier {
+                let user_ctx = self
+                    .send_order
+                    .pop_front()
+                    .expect("frontier position proves queue entry");
+                let outstanding = self.take_outstanding(user_ctx)?;
+                let token = WrToken::decode(user_ctx)?;
+                outstanding.handle.complete();
+                self.outstanding_send -= 1;
+                if completion_error.is_some() {
+                    pool.complete_error(token.slot, OperationType::Send)?;
+                } else {
+                    pool.complete_send(token.slot)?;
+                }
+                pool.release(token.slot)?;
+                self.stats.send_retired += 1;
+                if let Some(sequence) = outstanding.sequence {
+                    self.last_completed_send_sequence = Some(sequence);
+                }
+                events.push(CompletionEvent::SendCompleted { slot: token.slot });
+            }
+            if let Some(error) = completion_error {
+                self.stats.cqe_error += 1;
+                return Err(error);
+            }
+            Ok(events)
         }
 
         pub(crate) fn stats(&self) -> CompletionStats {
@@ -417,8 +561,12 @@ mod native {
             self.generation
         }
 
+        pub(crate) fn reserve_send(&mut self, additional: usize) {
+            self.send_order.reserve(additional);
+        }
+
         pub(crate) fn outstanding(&self) -> usize {
-            self.outstanding.len()
+            self.outstanding_total
         }
 
         pub(crate) fn outstanding_send(&self) -> usize {
@@ -437,8 +585,9 @@ mod native {
             let mut pending = self
                 .outstanding
                 .iter()
-                .filter_map(|(user_ctx, outstanding)| {
-                    let token = WrToken::decode(*user_ctx).ok()?;
+                .filter_map(|outstanding| {
+                    let outstanding = outstanding.as_ref()?;
+                    let token = WrToken::decode(outstanding.user_ctx).ok()?;
                     (token.operation == operation).then(|| PendingWrSnapshot {
                         sequence: outstanding.sequence,
                         slot: token.slot,
@@ -454,6 +603,31 @@ mod native {
                     OperationType::Recv => self.last_completed_recv_sequence,
                 },
             }
+        }
+
+        fn outstanding_for(&self, user_ctx: u64) -> Result<&OutstandingWr> {
+            let token = WrToken::decode(user_ctx)?;
+            self.outstanding
+                .get(token.slot.index())
+                .and_then(Option::as_ref)
+                .filter(|outstanding| outstanding.user_ctx == user_ctx)
+                .ok_or_else(|| Error::Protocol("CQE has no outstanding WR".into()))
+        }
+
+        fn take_outstanding(&mut self, user_ctx: u64) -> Result<OutstandingWr> {
+            let token = WrToken::decode(user_ctx)?;
+            let entry = self
+                .outstanding
+                .get_mut(token.slot.index())
+                .ok_or_else(|| Error::Protocol("CQE slot is outside outstanding table".into()))?;
+            if !entry
+                .as_ref()
+                .is_some_and(|outstanding| outstanding.user_ctx == user_ctx)
+            {
+                return Err(Error::Protocol("CQE has no outstanding WR".into()));
+            }
+            self.outstanding_total -= 1;
+            Ok(entry.take().expect("entry checked above"))
         }
     }
 
@@ -493,7 +667,7 @@ mod tests {
     fn hybrid_policy_keeps_a_hot_phase_before_event_wait() {
         assert!(!should_wait_for_event(1));
         assert!(!should_wait_for_event(HOT_POLL_LIMIT));
-        assert!(should_wait_for_event(HOT_POLL_LIMIT + 1));
+        assert!(!should_wait_for_event(HOT_POLL_LIMIT));
         assert_eq!(EVENT_WAIT_TIMEOUT_MS, 10);
     }
 

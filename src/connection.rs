@@ -43,6 +43,8 @@ mod native {
         poller: CompletionPoller,
         receive_credit: ReceiveCredit,
         pending_frames: VecDeque<Vec<u8>>,
+        send_completion_interval: usize,
+        sends_since_completion: usize,
     }
 
     impl<'runtime> UrmaConnection<'runtime> {
@@ -67,6 +69,8 @@ mod native {
                 poller: CompletionPoller::new(connection_id, generation, 16)?,
                 receive_credit: ReceiveCredit::default(),
                 pending_frames: VecDeque::new(),
+                send_completion_interval: 1,
+                sends_since_completion: 0,
             };
             connection.transition(ConnectionState::JettyCreated);
             Ok(connection)
@@ -161,7 +165,7 @@ mod native {
                 }
             };
             self.poller
-                .track(user_ctx, OperationType::Recv, wr, sequence)?;
+                .track(user_ctx, OperationType::Recv, wr, sequence, true)?;
             self.receive_credit.posted();
             Ok(())
         }
@@ -172,16 +176,40 @@ mod native {
 
         /// Post one encoded message without imposing a completion drain.
         pub fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
-            self.send_frame_with_sequence(bytes, None)
+            self.send_frame_with_sequence(bytes, None, true)
         }
 
         pub fn send_frame_tracked(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
-            self.send_frame_with_sequence(bytes, Some(sequence))
+            self.send_frame_with_sequence(bytes, Some(sequence), false)
         }
 
-        fn send_frame_with_sequence(&mut self, bytes: &[u8], sequence: Option<u64>) -> Result<()> {
+        pub fn send_frame_tracked_tail(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
+            self.send_frame_with_sequence(bytes, Some(sequence), true)
+        }
+
+        pub fn configure_send_completion_interval(&mut self, interval: usize) -> Result<()> {
+            if interval == 0 || self.poller.outstanding_send() != 0 {
+                return Err(Error::InvalidConfiguration(
+                    "completion interval must be non-zero and changed only with an empty SQ".into(),
+                ));
+            }
+            self.send_completion_interval = interval;
+            self.sends_since_completion = 0;
+            self.poller
+                .reserve_send(self.buffer_pool.config().tx_slot_count);
+            Ok(())
+        }
+
+        fn send_frame_with_sequence(
+            &mut self,
+            bytes: &[u8],
+            sequence: Option<u64>,
+            force_completion: bool,
+        ) -> Result<()> {
             self.require(ConnectionState::Ready)?;
             self.receive_credit.require_before_send()?;
+            let complete_enable = force_completion
+                || self.sends_since_completion + 1 >= self.send_completion_interval;
             let slot = self
                 .buffer_pool
                 .allocate(SlotKind::Tx)
@@ -201,9 +229,13 @@ mod native {
             };
             let user_ctx = token.encode()?;
             self.buffer_pool.mark_posted(slot, SlotKind::Tx)?;
-            let result =
-                self.jetty
-                    .post_send(self.buffer_pool.segment_handle()?, offset, length, user_ctx);
+            let result = self.jetty.post_send(
+                self.buffer_pool.segment_handle()?,
+                offset,
+                length,
+                user_ctx,
+                complete_enable,
+            );
             let wr = match result {
                 Ok(wr) => wr,
                 Err(error) => {
@@ -213,7 +245,13 @@ mod native {
                 }
             };
             self.poller
-                .track(user_ctx, OperationType::Send, wr, sequence)
+                .track(user_ctx, OperationType::Send, wr, sequence, complete_enable)?;
+            if complete_enable {
+                self.sends_since_completion = 0;
+            } else {
+                self.sends_since_completion += 1;
+            }
+            Ok(())
         }
 
         pub fn poll_once(&mut self) -> Result<Vec<CompletionEvent>> {
@@ -236,6 +274,27 @@ mod native {
                 }
             }
             Ok(events)
+        }
+
+        pub fn poll_recv_direct(
+            &mut self,
+            consume: impl FnMut(Option<u64>, &[u8]) -> Result<()>,
+        ) -> Result<usize> {
+            self.require(ConnectionState::Ready)?;
+            let count = match self
+                .poller
+                .poll_recv_direct(self.recv_jfc, self.buffer_pool, consume)
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    self.fail();
+                    return Err(error);
+                }
+            };
+            for _ in 0..count {
+                self.receive_credit.completed();
+            }
+            Ok(count)
         }
 
         pub fn wait_for_message(&mut self, timeout: Duration) -> Result<Message> {

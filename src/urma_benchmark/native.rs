@@ -24,6 +24,7 @@ const MAX_CONTROL_PAYLOAD: usize = 4096;
 const READY: u16 = 1;
 const START: u16 = 2;
 const DONE: u16 = 3;
+const SEND_COMPLETION_INTERVAL: usize = 100;
 
 #[derive(Clone, Debug)]
 pub enum UrmaBenchmarkSource {
@@ -116,6 +117,7 @@ pub struct UrmaTransportStats {
     pub send_post: u64,
     pub recv_post: u64,
     pub send_cqe: u64,
+    pub send_retired: u64,
     pub recv_cqe: u64,
     pub cqe_error: u64,
     pub poll_calls: u64,
@@ -158,6 +160,7 @@ impl UrmaTransportStats {
             ("send_post", self.send_post),
             ("recv_post", self.recv_post),
             ("send_cqe", self.send_cqe),
+            ("send_retired", self.send_retired),
             ("recv_cqe", self.recv_cqe),
             ("cqe_error", self.cqe_error),
             ("poll_calls", self.poll_calls),
@@ -256,6 +259,8 @@ pub fn run_urma_parent(
     };
     write_control(session.stream_mut(), START, case.case_id.as_bytes())?;
     let mut pipeline = PipelineTracker::new(case.window as usize)?;
+    connection
+        .configure_send_completion_interval((case.window as usize).min(SEND_COMPLETION_INTERVAL))?;
     let mut bytes_sent = 0u64;
     let data_messages = send_source(
         &source,
@@ -371,9 +376,26 @@ pub fn run_urma_child(
 
     let mut last_progress = Instant::now();
     let mut bytes_received = 0u64;
+    let expected_data_messages = u32::try_from(case.chunk_count()?)
+        .map_err(|_| Error::Protocol("URMA Data sequence count exceeds u32".into()))?;
+    let mut received_data_messages = 0u32;
     'receive: loop {
-        let events = connection.poll_once()?;
-        if events.is_empty() {
+        let mut transfer_complete = false;
+        let completed = connection.poll_recv_direct(|_posted_sequence, bytes| {
+            credit.completed()?;
+            if received_data_messages < expected_data_messages {
+                receiver.accept_data(received_data_messages, bytes, &mut sink)?;
+                bytes_received = bytes_received
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| Error::Protocol("received byte count overflow".into()))?;
+                received_data_messages += 1;
+            } else {
+                let message = IntegrationMessageV3::decode(bytes)?;
+                transfer_complete = receiver.accept_payload(&message, &mut sink)?;
+            }
+            Ok(())
+        })?;
+        if completed == 0 {
             if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
                 log_child_receive_timeout(&connection, &credit);
                 return Err(Error::Timeout {
@@ -383,31 +405,11 @@ pub fn run_urma_child(
             continue;
         }
         last_progress = Instant::now();
-        for event in events {
-            match event {
-                CompletionEvent::SendCompleted { .. } => {
-                    return Err(Error::Protocol(
-                        "unexpected send CQE in URMA receive loop".into(),
-                    ))
-                }
-                CompletionEvent::RecvCompleted { bytes, .. } => {
-                    credit.completed()?;
-                    // The CQ poller has already copied to owned bytes and freed
-                    // the registered slot. Restore credit before sink I/O.
-                    replenish_credit(&mut connection, &mut credit)?;
-                    let message = IntegrationMessageV3::decode(&bytes)?;
-                    if let IntegrationMessageBodyV3::Data(payload) = &message.body {
-                        bytes_received = bytes_received
-                            .checked_add(payload.len() as u64)
-                            .ok_or_else(|| {
-                                Error::Protocol("received byte count overflow".into())
-                            })?;
-                    }
-                    if receiver.accept_payload(&message, &mut sink)? {
-                        break 'receive;
-                    }
-                }
-            }
+        // The callback consumed bytes directly from completed registered RX
+        // slots. Refill the deep RQ before the next CQ batch.
+        replenish_credit(&mut connection, &mut credit)?;
+        if transfer_complete {
+            break 'receive;
         }
     }
     if credit.remaining_messages() != 0
@@ -462,10 +464,21 @@ fn send_source(
 ) -> Result<u32> {
     let mut last_progress = Instant::now();
     let mut sequence = 0u32;
+    let chunk_count = match source {
+        UrmaBenchmarkSource::Memory(source) => source.length().div_ceil(chunk_size as u64),
+        UrmaBenchmarkSource::File(source) => source.length().div_ceil(chunk_size as u64),
+    };
     match source {
         UrmaBenchmarkSource::Memory(source) => {
             for chunk in source.chunks(chunk_size)? {
-                post_data(connection, pipeline, sequence, chunk, &mut last_progress)?;
+                post_data(
+                    connection,
+                    pipeline,
+                    sequence,
+                    chunk,
+                    u64::from(sequence) + 1 == chunk_count,
+                    &mut last_progress,
+                )?;
                 *bytes_sent += chunk.len() as u64;
                 sequence = sequence
                     .checked_add(1)
@@ -485,6 +498,7 @@ fn send_source(
                     pipeline,
                     sequence,
                     &buffer[..read],
+                    u64::from(sequence) + 1 == chunk_count,
                     &mut last_progress,
                 )?;
                 *bytes_sent += read as u64;
@@ -502,6 +516,7 @@ fn post_data(
     pipeline: &mut PipelineTracker,
     sequence: u32,
     payload: &[u8],
+    is_last: bool,
     last_progress: &mut Instant,
 ) -> Result<()> {
     while !pipeline.can_post() {
@@ -515,8 +530,11 @@ fn post_data(
             });
         }
     }
-    let message = IntegrationMessageV3::data(REQUEST_ID, sequence, payload.to_vec());
-    connection.send_frame_tracked(&message.encode()?, u64::from(sequence))?;
+    if is_last {
+        connection.send_frame_tracked_tail(payload, u64::from(sequence))?;
+    } else {
+        connection.send_frame_tracked(payload, u64::from(sequence))?;
+    }
     pipeline.posted()?;
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
     Ok(())
@@ -772,6 +790,7 @@ fn combined_stats(
         send_post: parent.send_post,
         recv_post: child.recv_post,
         send_cqe: parent.send_cqe,
+        send_retired: parent.send_retired,
         recv_cqe: child.recv_cqe,
         cqe_error: parent.cqe_error + child.cqe_error,
         poll_calls,
@@ -916,6 +935,7 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
         done.completion.send_post,
         done.completion.recv_post,
         done.completion.send_cqe,
+        done.completion.send_retired,
         done.completion.recv_cqe,
         done.completion.cqe_error,
         done.completion.poll_calls,
@@ -951,7 +971,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         return Err(Error::Protocol("truncated URMA Done".into()));
     }
     let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
-    let expected_len = 2 + case_len + 30 * 8 + 2 * 4;
+    let expected_len = 2 + case_len + 31 * 8 + 2 * 4;
     if input.len() != expected_len {
         return Err(Error::Protocol("invalid URMA Done length".into()));
     }
@@ -972,6 +992,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let send_post = next_u64();
     let recv_post = next_u64();
     let send_cqe = next_u64();
+    let send_retired = next_u64();
     let recv_cqe = next_u64();
     let cqe_error = next_u64();
     let poll_calls = next_u64();
@@ -1006,6 +1027,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
             send_post,
             recv_post,
             send_cqe,
+            send_retired,
             recv_cqe,
             cqe_error,
             poll_calls,
@@ -1057,27 +1079,28 @@ mod tests {
                 send_post: 1,
                 recv_post: 2,
                 send_cqe: 3,
-                recv_cqe: 4,
-                cqe_error: 5,
-                poll_calls: 6,
-                empty_polls: 7,
-                send_jfc_poll_calls: 8,
-                recv_jfc_poll_calls: 9,
-                yield_count: 10,
-                sleep_count: 11,
-                backoff_sleep_ns: 12,
-                jfc_rearm_count: 13,
-                event_wait_count: 14,
-                event_wakeup_count: 15,
-                event_timeout_count: 16,
-                spurious_wakeup_count: 17,
-                event_wait_ns: 18,
-                max_event_wait_ns: 19,
-                max_empty_streak: 20,
-                nonempty_polls: 21,
-                completion_batch_total: 22,
-                max_completion_poll_gap_ns: 23,
-                max_outstanding_send: 24,
+                send_retired: 4,
+                recv_cqe: 5,
+                cqe_error: 6,
+                poll_calls: 7,
+                empty_polls: 8,
+                send_jfc_poll_calls: 9,
+                recv_jfc_poll_calls: 10,
+                yield_count: 11,
+                sleep_count: 12,
+                backoff_sleep_ns: 13,
+                jfc_rearm_count: 14,
+                event_wait_count: 15,
+                event_wakeup_count: 16,
+                event_timeout_count: 17,
+                spurious_wakeup_count: 18,
+                event_wait_ns: 19,
+                max_event_wait_ns: 20,
+                max_empty_streak: 21,
+                nonempty_polls: 22,
+                completion_batch_total: 23,
+                max_completion_poll_gap_ns: 24,
+                max_outstanding_send: 25,
             },
             bytes_received: 64,
         };

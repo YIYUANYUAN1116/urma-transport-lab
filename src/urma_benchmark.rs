@@ -1,7 +1,7 @@
 //! B2 bounded-pipeline policy and the URMA benchmark data path.
 
 use crate::{
-    BenchmarkCase, BenchmarkSink, BenchmarkTransport, Crc32Hasher, DigestAlgorithm, Error,
+    BenchmarkCase, BenchmarkSink, BenchmarkTransport, DigestAlgorithm, Error,
     IntegrationMessageBodyV3, IntegrationMessageV3, Result,
 };
 use std::time::{Duration, Instant};
@@ -33,10 +33,11 @@ pub fn derive_urma_slot_size(case: &BenchmarkCase, alignment: usize) -> Result<u
         ));
     }
     let chunk_size = case.chunk_size_usize()?;
-    let required = URMA_PROTOCOL_HEADER_LEN
-        .checked_add(chunk_size)
-        .ok_or_else(|| invalid("URMA header + chunk_size overflow"))?;
-    required
+    // Bulk Data is sent as a raw URMA message. Request/Metadata/End remain
+    // framed control messages, but they are much smaller than a data slot.
+    // This mirrors Dragonfly's RDMA path and lets a provider with a 64 KiB
+    // max_msg_size carry a full 64 KiB piece chunk.
+    chunk_size
         .checked_add(alignment - 1)
         .map(|value| value & !(alignment - 1))
         .ok_or_else(|| invalid("aligned URMA slot_size overflow"))
@@ -95,29 +96,14 @@ pub fn validate_urma_case(case: &BenchmarkCase, limits: UrmaPipelineLimits) -> R
             )));
         }
     }
-    let slot_size_u64 = u64::try_from(limits.slot_size)
+    let slot_payload = u64::try_from(limits.slot_size)
         .map_err(|_| invalid("registered slot_size does not fit u64"))?;
-    if slot_size_u64 > limits.provider_max_message_size {
-        return Err(invalid(format!(
-            "slot_size={} exceeds provider max message size {}",
-            limits.slot_size, limits.provider_max_message_size
-        )));
-    }
-    let slot_payload = limits
-        .slot_size
-        .checked_sub(URMA_PROTOCOL_HEADER_LEN)
-        .ok_or_else(|| invalid("registered slot is smaller than the protocol header"))?;
-    let provider_payload = limits
-        .provider_max_message_size
-        .checked_sub(URMA_PROTOCOL_HEADER_LEN as u64)
-        .ok_or_else(|| invalid("provider max message size is smaller than the protocol header"))?;
-    let maximum_payload = (slot_payload as u64).min(provider_payload);
+    let maximum_payload = slot_payload.min(limits.provider_max_message_size);
     if case.chunk_size > maximum_payload {
         return Err(invalid(format!(
-            "chunk_size={} exceeds effective URMA payload limit {maximum_payload} (slot_size={}, header={}, provider_max_message_size={})",
+            "chunk_size={} exceeds effective URMA payload limit {maximum_payload} (slot_size={}, provider_max_message_size={})",
             case.chunk_size,
             limits.slot_size,
-            URMA_PROTOCOL_HEADER_LEN,
             limits.provider_max_message_size
         )));
     }
@@ -189,14 +175,15 @@ pub struct ReceiveCreditController {
 }
 
 pub(crate) fn receive_credit_target(
-    window: usize,
+    _window: usize,
     rx_slot_count: usize,
     remaining_messages: usize,
 ) -> Result<usize> {
-    let doubled_window = window
-        .checked_mul(2)
-        .ok_or_else(|| invalid("receive credit window multiplication overflow"))?;
-    let target = doubled_window.min(rx_slot_count).min(remaining_messages);
+    // Match urma_perftest's receive model: the physical RQ is kept deep and
+    // independent of the sender's application window. A CQ poll may consume a
+    // complete batch before Rust can repost; retaining hundreds of posted
+    // receives prevents that batch boundary from taking the RQ to zero.
+    let target = rx_slot_count.min(remaining_messages);
     if target == 0 {
         return Err(invalid("receive credit target must be non-zero"));
     }
@@ -271,7 +258,6 @@ pub struct UrmaReceiveState {
     expected_crc32: u32,
     next_sequence: u32,
     actual_bytes: u64,
-    hasher: Crc32Hasher,
     metadata_seen: bool,
     complete: bool,
 }
@@ -287,7 +273,6 @@ impl UrmaReceiveState {
             expected_crc32,
             next_sequence: 0,
             actual_bytes: 0,
-            hasher: Crc32Hasher::new(),
             metadata_seen: false,
             complete: false,
         })
@@ -331,28 +316,7 @@ impl UrmaReceiveState {
         }
         match &message.body {
             IntegrationMessageBodyV3::Data(payload) => {
-                if message.sequence != self.next_sequence {
-                    return Err(Error::Protocol(format!(
-                        "URMA Data sequence {}, expected {}",
-                        message.sequence, self.next_sequence
-                    )));
-                }
-                let next = self
-                    .actual_bytes
-                    .checked_add(payload.len() as u64)
-                    .ok_or_else(|| Error::Protocol("URMA received length overflow".into()))?;
-                if next > self.expected_bytes {
-                    return Err(Error::Protocol(
-                        "URMA Data exceeds advertised length".into(),
-                    ));
-                }
-                sink.write_chunk(payload)?;
-                self.hasher.update(payload);
-                self.actual_bytes = next;
-                self.next_sequence = self
-                    .next_sequence
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Protocol("URMA Data sequence overflow".into()))?;
+                self.accept_data(message.sequence, payload, sink)?;
                 Ok(false)
             }
             IntegrationMessageBodyV3::End {
@@ -368,13 +332,6 @@ impl UrmaReceiveState {
                 {
                     return Err(Error::Protocol("URMA End/received length mismatch".into()));
                 }
-                let actual_crc32 = self.hasher.clone().finalize();
-                if actual_crc32 != self.expected_crc32 {
-                    return Err(Error::Protocol(format!(
-                        "URMA CRC32 mismatch: expected {}, got {actual_crc32}",
-                        self.expected_crc32
-                    )));
-                }
                 self.complete = true;
                 Ok(true)
             }
@@ -383,6 +340,49 @@ impl UrmaReceiveState {
             ))),
             _ => Err(Error::Protocol("expected URMA Data, End, or Error".into())),
         }
+    }
+
+    /// Accepts one raw bulk message. Sequence is carried by receive-post order,
+    /// not by a per-message transport header. The sink is the sole digest
+    /// owner, avoiding the previous duplicate CRC scan.
+    pub fn accept_data(
+        &mut self,
+        sequence: u32,
+        payload: &[u8],
+        sink: &mut impl BenchmarkSink,
+    ) -> Result<()> {
+        if !self.metadata_seen || self.complete {
+            return Err(Error::Protocol(
+                "URMA payload outside receiving phase".into(),
+            ));
+        }
+        if sequence != self.next_sequence {
+            return Err(Error::Protocol(format!(
+                "URMA Data sequence {sequence}, expected {}",
+                self.next_sequence
+            )));
+        }
+        if payload.is_empty() {
+            return Err(Error::Protocol(
+                "URMA Data payload must not be empty".into(),
+            ));
+        }
+        let next = self
+            .actual_bytes
+            .checked_add(payload.len() as u64)
+            .ok_or_else(|| Error::Protocol("URMA received length overflow".into()))?;
+        if next > self.expected_bytes {
+            return Err(Error::Protocol(
+                "URMA Data exceeds advertised length".into(),
+            ));
+        }
+        sink.write_chunk(payload)?;
+        self.actual_bytes = next;
+        self.next_sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::Protocol("URMA Data sequence overflow".into()))?;
+        Ok(())
     }
 
     fn check_identity(&self, message: &IntegrationMessageV3) -> Result<()> {
@@ -447,7 +447,7 @@ mod tests {
     fn validates_window_and_chunk_against_every_limit() {
         validate_urma_case(&case(1024, 1024, 8), limits()).unwrap();
         assert!(validate_urma_case(&case(1024, 1024, 9), limits()).is_err());
-        assert!(validate_urma_case(&case(65_513, 65_513, 1), limits()).is_err());
+        assert!(validate_urma_case(&case(65_537, 65_537, 1), limits()).is_err());
     }
 
     #[test]
@@ -455,7 +455,7 @@ mod tests {
         for payload in [64 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024] {
             let benchmark = case(payload as u64, payload as u64, 4);
             let slot = derive_urma_slot_size(&benchmark, 4096).unwrap();
-            assert!(slot >= payload + URMA_PROTOCOL_HEADER_LEN);
+            assert!(slot >= payload);
             assert_eq!(slot % 4096, 0);
             let mut candidate = limits();
             candidate.slot_size = slot;
@@ -469,7 +469,7 @@ mod tests {
         let benchmark = case(256 * 1024, 256 * 1024, 4);
         let slot = derive_urma_slot_size(&benchmark, 4096).unwrap();
         let mut candidate = limits();
-        candidate.slot_size = 256 * 1024 + URMA_PROTOCOL_HEADER_LEN - 1;
+        candidate.slot_size = 256 * 1024 - 1;
         candidate.provider_max_message_size = slot as u64;
         assert!(validate_urma_case(&benchmark, candidate).is_err());
 
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(receive_credit_target(4, 8, 100), Ok(8));
         assert_eq!(receive_credit_target(8, 8, 100), Ok(8));
         assert_eq!(receive_credit_target(4, 16, 3), Ok(3));
-        assert!(receive_credit_target(usize::MAX, 8, 100).is_err());
+        assert_eq!(receive_credit_target(usize::MAX, 8, 100), Ok(8));
     }
 
     #[test]
@@ -615,6 +615,7 @@ mod tests {
             .unwrap();
         assert!(state
             .accept_payload(&IntegrationMessageV3::end(3, 1, 1), &mut sink)
-            .is_err());
+            .unwrap());
+        assert!(!sink.finish().unwrap().is_ok());
     }
 }

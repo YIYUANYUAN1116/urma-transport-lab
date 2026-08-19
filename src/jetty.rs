@@ -112,8 +112,8 @@ pub struct JettyConfig {
 impl Default for JettyConfig {
     fn default() -> Self {
         Self {
-            send_depth: 64,
-            recv_depth: 64,
+            send_depth: 128,
+            recv_depth: 512,
             max_send_sge: 1,
             max_recv_sge: 1,
             token: 0,
@@ -214,9 +214,10 @@ mod native {
             offset: u64,
             length: u32,
             user_ctx: u64,
+            complete_enable: bool,
         ) -> Result<ffi::WrHandle> {
             self.handle
-                .post_send(segment, offset, length, user_ctx)
+                .post_send(segment, offset, length, user_ctx, complete_enable)
                 .map_err(|error| map_ffi_error("post_jetty_send_wr", error))
         }
 

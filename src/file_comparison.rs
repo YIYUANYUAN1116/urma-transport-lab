@@ -541,6 +541,7 @@ fn validate_b4_result(
                 "send_post",
                 "recv_post",
                 "send_cqe",
+                "send_retired",
                 "recv_cqe",
                 "cqe_error",
                 "poll_calls",
@@ -578,7 +579,7 @@ fn validate_b4_result(
             }
             if stat("current_outstanding_send")? != 0
                 || stat("current_outstanding_recv")? != 0
-                || stat("send_post")? != stat("send_cqe")?
+                || stat("send_post")? != stat("send_retired")?
                 || stat("recv_post")? != stat("recv_cqe")?
                 || stat("cqe_error")? != 0
                 || stat("configured_window")? != u64::from(case.window)
@@ -804,6 +805,7 @@ mod tests {
                     ("send_post", 6),
                     ("recv_post", 6),
                     ("send_cqe", 6),
+                    ("send_retired", 6),
                     ("recv_cqe", 6),
                     ("cqe_error", 0),
                     ("poll_calls", 3),
@@ -984,7 +986,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(BufferPoolConfig::default().tx_slot_count, 8);
+        assert_eq!(BufferPoolConfig::default().tx_slot_count, 128);
+        assert_eq!(BufferPoolConfig::default().rx_slot_count, 512);
         assert_eq!(
             B4FileRunRecord::success(case.clone(), result(case, 10.0)).status,
             B4CaseStatus::Success

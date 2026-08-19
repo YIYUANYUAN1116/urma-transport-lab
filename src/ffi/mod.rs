@@ -69,7 +69,7 @@ pub(crate) struct JettyDescriptorData {
     pub opaque_data: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct CompletionRecord {
     pub status: i32,
     pub opcode: u32,
@@ -361,32 +361,30 @@ impl JfcHandle {
         }
     }
 
-    pub(crate) fn poll(&self, capacity: usize) -> Result<Vec<CompletionRecord>, FfiError> {
-        if capacity == 0 || capacity > 16 {
+    pub(crate) fn poll_into(&self, out: &mut [CompletionRecord]) -> Result<usize, FfiError> {
+        if out.is_empty() || out.len() > 16 {
             return Err(FfiError::Contract("poll capacity must be in 1..=16"));
         }
         let raw = self.raw.ok_or(FfiError::Contract("JFC is closed"))?;
-        let mut records: Vec<std::mem::MaybeUninit<sys::urma_lab_completion_t>> =
-            Vec::with_capacity(capacity);
-        records.resize_with(capacity, std::mem::MaybeUninit::uninit);
-        // SAFETY: `records` has `capacity` writable entries and the live JFC is
+        let mut records: [std::mem::MaybeUninit<sys::urma_lab_completion_t>; 16] =
+            std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+        // SAFETY: `records` has `out.len()` writable entries and the live JFC is
         // only polled synchronously on its owner thread.
         let count = unsafe {
-            sys::urma_lab_jfc_poll(raw.as_ptr(), capacity as u32, records.as_mut_ptr().cast())
+            sys::urma_lab_jfc_poll(raw.as_ptr(), out.len() as u32, records.as_mut_ptr().cast())
         };
         if count < 0 {
             return Err(FfiError::Status(count));
         }
         let count = usize::try_from(count)
             .map_err(|_| FfiError::Contract("poll count does not fit usize"))?;
-        if count > capacity {
+        if count > out.len() {
             return Err(FfiError::Contract("provider returned too many completions"));
         }
-        let mut out = Vec::with_capacity(count);
-        for record in records.into_iter().take(count) {
+        for (destination, record) in out.iter_mut().zip(records.into_iter()).take(count) {
             // SAFETY: the shim initializes exactly the first `count` entries.
             let record = unsafe { record.assume_init() };
-            out.push(CompletionRecord {
+            *destination = CompletionRecord {
                 status: record.status,
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,
@@ -394,9 +392,9 @@ impl JfcHandle {
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
-            });
+            };
         }
-        Ok(out)
+        Ok(count)
     }
 
     pub(crate) fn rearm(&self) -> Result<(), FfiError> {
@@ -482,6 +480,29 @@ impl SegmentHandle {
             sys::urma_lab_segment_read(raw.as_ptr(), offset, out.as_mut_ptr(), length)
         })?;
         Ok(out)
+    }
+
+    pub(crate) fn with_read<R>(
+        &self,
+        offset: u64,
+        length: u32,
+        read: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        if length == 0 {
+            return Err(FfiError::Contract("zero-length Segment read"));
+        }
+        let mut data = std::ptr::null();
+        // SAFETY: the shim validates the range. Segment ownership guarantees
+        // that the returned storage remains live and stable for this call; the
+        // slice cannot escape the closure's lifetime.
+        status_result(unsafe {
+            sys::urma_lab_segment_get_const(raw.as_ptr(), offset, length, &mut data)
+        })?;
+        let data = NonNull::new(data.cast_mut()).ok_or(FfiError::NullHandle)?;
+        // SAFETY: the shim returned a valid range of exactly `length` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), length as usize) };
+        Ok(read(bytes))
     }
 }
 
@@ -612,8 +633,9 @@ impl JettyHandle {
         offset: u64,
         length: u32,
         user_ctx: u64,
+        complete_enable: bool,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, true)
+        self.post(segment, offset, length, user_ctx, true, complete_enable)
     }
 
     pub(crate) fn post_recv(
@@ -623,7 +645,7 @@ impl JettyHandle {
         length: u32,
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
-        self.post(segment, offset, length, user_ctx, false)
+        self.post(segment, offset, length, user_ctx, false, true)
     }
 
     fn post(
@@ -633,6 +655,7 @@ impl JettyHandle {
         length: u32,
         user_ctx: u64,
         send: bool,
+        complete_enable: bool,
     ) -> Result<WrHandle, FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
@@ -647,6 +670,7 @@ impl JettyHandle {
                     offset,
                     length,
                     user_ctx,
+                    u8::from(complete_enable),
                     &mut raw,
                 )
             } else {

@@ -26,7 +26,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut transport = BenchmarkTransport::TcpUserspace;
     let mut bytes = 0u64;
     let mut chunk_size = 64 * 1024u64;
-    let mut window = 1u32;
+    let mut window = 128u32;
     let mut timing_mode = TimingMode::SteadyState;
     let mut completion_policy = FileCompletionPolicy::Buffered;
     let mut data_seed = 0u64;
@@ -208,7 +208,7 @@ fn print_usage() {
                                          default: tcp-userspace\n\
            --bytes N                     default: 0\n\
            --chunk-size N                default: 65536\n\
-           --window N                    default: 1\n\
+           --window N                    default: 128\n\
            --timing-mode steady-state|setup-included\n\
                                          default: steady-state\n\
            --completion-policy buffered|durable\n\

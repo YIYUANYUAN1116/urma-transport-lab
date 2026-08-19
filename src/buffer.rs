@@ -12,8 +12,8 @@ impl Default for BufferPoolConfig {
     fn default() -> Self {
         Self {
             slot_size: 64 * 1024,
-            tx_slot_count: 8,
-            rx_slot_count: 8,
+            tx_slot_count: 128,
+            rx_slot_count: 512,
             alignment: 4096,
         }
     }
@@ -152,6 +152,8 @@ mod native {
         config: BufferPoolConfig,
         segment: Option<UrmaRegisteredSegment>,
         slots: Vec<BufferSlot>,
+        free_tx: Vec<usize>,
+        free_rx: Vec<usize>,
         accepting: bool,
     }
 
@@ -188,10 +190,14 @@ mod native {
                     state: SlotState::Free,
                 });
             }
+            let free_tx = (0..config.tx_slot_count).rev().collect();
+            let free_rx = (config.tx_slot_count..slot_count).rev().collect();
             Ok(Self {
                 config,
                 segment: Some(segment),
                 slots,
+                free_tx,
+                free_rx,
                 accepting: true,
             })
         }
@@ -204,11 +210,13 @@ mod native {
             if !self.accepting {
                 return None;
             }
-            let (index, slot) = self
-                .slots
-                .iter_mut()
-                .enumerate()
-                .find(|(_, slot)| slot.kind == kind && slot.state == SlotState::Free)?;
+            let index = match kind {
+                SlotKind::Tx => self.free_tx.pop()?,
+                SlotKind::Rx => self.free_rx.pop()?,
+            };
+            let slot = self.slots.get_mut(index)?;
+            debug_assert_eq!(slot.kind, kind);
+            debug_assert_eq!(slot.state, SlotState::Free);
             slot.state = SlotState::Allocated;
             Some(SlotId(index))
         }
@@ -226,6 +234,10 @@ mod native {
                 ));
             }
             slot.state = SlotState::Free;
+            match slot.kind {
+                SlotKind::Tx => self.free_tx.push(id.0),
+                SlotKind::Rx => self.free_rx.push(id.0),
+            }
             Ok(())
         }
 
@@ -358,6 +370,35 @@ mod native {
                 .map_err(|error| map_ffi_error("read_rx_slot", error))?;
             self.transition(id, SlotState::PostedRecv, SlotState::RecvCompleted)?;
             Ok(bytes)
+        }
+
+        pub(crate) fn complete_recv_with<R>(
+            &mut self,
+            id: SlotId,
+            length: u32,
+            consume: impl FnOnce(&[u8]) -> Result<R>,
+        ) -> Result<R> {
+            let (offset, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Rx || state != SlotState::PostedRecv {
+                return Err(Error::Protocol(
+                    "RECV CQE does not match a posted RX slot".into(),
+                ));
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
+            if length == 0 || length > capacity {
+                return Err(Error::Protocol(format!(
+                    "RECV completion length {length} is outside 1..={capacity}"
+                )));
+            }
+            // The CQE proves the provider no longer mutates this receive
+            // range. Keep the slot non-reusable while the consumer borrows it.
+            let consumed = self
+                .segment_handle()?
+                .with_read(offset as u64, length as u32, consume)
+                .map_err(|error| map_ffi_error("borrow_rx_slot", error))?;
+            self.transition(id, SlotState::PostedRecv, SlotState::RecvCompleted)?;
+            consumed
         }
 
         fn slot_fields(&self, id: SlotId) -> Result<(usize, usize, SlotKind, SlotState)> {
