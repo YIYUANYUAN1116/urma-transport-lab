@@ -41,6 +41,10 @@ fn registered_rx_window_chunks(application_window: usize, rx_slots: usize) -> Re
         .ok_or_else(|| invalid("cannot partition RX slots into registered windows"))
 }
 
+fn bounded_repost_count(posts_needed: usize, free_rx_slots: usize) -> usize {
+    posts_needed.min(free_rx_slots)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum UrmaBenchmarkProfile {
     #[default]
@@ -1176,8 +1180,14 @@ fn replenish_credit(
     connection: &mut UrmaConnection<'_>,
     credit: &mut ReceiveCreditController,
 ) -> Result<usize> {
+    // A completed slot leased to the sink is no longer posted, but it is not
+    // physically reusable until the sink returns the whole registered window.
+    // Keep the protocol credit accounting separate from physical slot
+    // availability and only refill slots that are actually Free.
+    let free_rx_slots = connection.rx_slot_state_snapshot().free;
+    let repost_count = bounded_repost_count(credit.posts_needed(), free_rx_slots);
     let mut posted = 0usize;
-    while credit.posts_needed() != 0 {
+    while posted < repost_count {
         connection.recv_ready_tracked(credit.next_post_sequence())?;
         credit.posted()?;
         posted += 1;
@@ -1799,6 +1809,13 @@ mod tests {
         assert_eq!(registered_rx_window_chunks(100, 512).unwrap(), 64);
         assert_eq!(registered_rx_window_chunks(128, 128).unwrap(), 128);
         assert_eq!(registered_rx_window_chunks(3, 8).unwrap(), 2);
+    }
+
+    #[test]
+    fn receive_refill_is_bounded_by_physically_free_slots() {
+        assert_eq!(bounded_repost_count(16, 0), 0);
+        assert_eq!(bounded_repost_count(128, 32), 32);
+        assert_eq!(bounded_repost_count(64, 512), 64);
     }
 
     #[test]
