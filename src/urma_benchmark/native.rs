@@ -6,7 +6,7 @@ use crate::{
     oob::{child_handshake, parent_handshake, OobSession},
     BenchmarkResult, BenchmarkScenario, BenchmarkTimer, CompletionEvent, CompletionStats, CpuUsage,
     Crc32Hasher, DigestDescriptor, FileCompletionPolicy, FileSource, IntegrityResult, JettyConfig,
-    MemorySink, MemorySource, RuntimeConfig, TimingMode, TimingSample, UrmaConnection, UrmaRuntime,
+    MemorySource, RuntimeConfig, TimingMode, TimingSample, UrmaConnection, UrmaRuntime,
 };
 use std::{
     collections::BTreeMap,
@@ -15,7 +15,10 @@ use std::{
     net::{TcpListener, TcpStream, ToSocketAddrs},
     os::unix::fs::FileExt,
     path::PathBuf,
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError},
+    sync::{
+        mpsc::{self, Receiver, Sender, TryRecvError},
+        Arc, Condvar, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -31,7 +34,8 @@ const START: u16 = 2;
 const DONE: u16 = 3;
 const CREDIT: u16 = 4;
 const SEND_COMPLETION_INTERVAL: usize = 100;
-const MAX_REGISTERED_RX_WINDOWS: usize = 4;
+const VERIFIED_RX_POOL_WINDOWS: usize = 16;
+const MAX_CRC_WORKERS: usize = 8;
 
 fn registered_rx_window_chunks(application_window: usize, rx_slots: usize) -> Result<usize> {
     let upper = application_window.min(rx_slots);
@@ -54,6 +58,9 @@ pub enum UrmaBenchmarkProfile {
     FixedTx,
     Rx128,
     FixedTxRx128,
+    /// Time the data plane independently, but retain every registered receive
+    /// window until its full CRC has been computed after the transport sample.
+    TransportOnly,
 }
 
 impl UrmaBenchmarkProfile {
@@ -61,11 +68,30 @@ impl UrmaBenchmarkProfile {
         matches!(self, Self::FixedTx | Self::FixedTxRx128)
     }
 
-    fn rx_slots(self) -> usize {
+    fn transport_only(self) -> bool {
+        self == Self::TransportOnly
+    }
+
+    fn rx_slots(self, case: &BenchmarkCase, child: bool) -> Result<usize> {
+        if self.transport_only() && child {
+            return usize::try_from(case.chunk_count()?.saturating_add(1))
+                .map_err(|_| invalid("transport-only RX slot count exceeds usize"));
+        }
         if matches!(self, Self::Rx128 | Self::FixedTxRx128) {
-            128
+            Ok(128)
+        } else if child {
+            let window = case.window as usize;
+            let pipeline_slots = window
+                .checked_mul(VERIFIED_RX_POOL_WINDOWS)
+                .ok_or_else(|| invalid("verified RX pool slot count overflow"))?;
+            let minimum_slots = 512usize
+                .checked_add(window - 1)
+                .ok_or_else(|| invalid("verified RX pool rounding overflow"))?
+                / window
+                * window;
+            Ok(pipeline_slots.max(minimum_slots))
         } else {
-            512
+            Ok(512)
         }
     }
 }
@@ -119,64 +145,32 @@ impl UrmaBenchmarkDestination {
         expected_bytes: u64,
         expected_crc32: u32,
         policy: FileCompletionPolicy,
-    ) -> Result<ActiveSink> {
+    ) -> Result<WindowSink> {
         match self {
-            Self::Memory => Ok(ActiveSink::Memory(MemorySink::new(
-                expected_bytes,
-                expected_crc32,
-            ))),
-            Self::File(path) => Ok(ActiveSink::File(DirectFileSink::create(
-                path,
-                expected_bytes,
-                expected_crc32,
-                policy,
-            )?)),
+            Self::Memory => Ok(WindowSink::memory(expected_bytes, expected_crc32)),
+            Self::File(path) => WindowSink::file(path, expected_bytes, expected_crc32, policy),
         }
     }
 }
 
-enum ActiveSink {
-    Memory(MemorySink),
-    File(DirectFileSink),
-}
-
-impl ActiveSink {
-    fn write_window(&mut self, bytes: &[u8]) -> Result<()> {
-        match self {
-            Self::Memory(sink) => sink.write_chunk(bytes),
-            Self::File(sink) => sink.write_window(bytes),
-        }
-    }
-
-    fn finish(self) -> Result<IntegrityResult> {
-        match self {
-            Self::Memory(sink) => sink.finish(),
-            Self::File(sink) => sink.finish(),
-        }
-    }
-}
-
-impl BenchmarkSink for ActiveSink {
-    fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
-        self.write_window(bytes)
-    }
-
-    fn finish(self) -> Result<IntegrityResult> {
-        ActiveSink::finish(self)
-    }
-}
-
-struct DirectFileSink {
-    file: File,
+struct WindowSink {
+    file: Option<Arc<File>>,
     expected_bytes: u64,
     expected_crc32: u32,
-    actual_bytes: u64,
-    hasher: Crc32Hasher,
     completion_policy: FileCompletionPolicy,
 }
 
-impl DirectFileSink {
-    fn create(
+impl WindowSink {
+    fn memory(expected_bytes: u64, expected_crc32: u32) -> Self {
+        Self {
+            file: None,
+            expected_bytes,
+            expected_crc32,
+            completion_policy: FileCompletionPolicy::Buffered,
+        }
+    }
+
+    fn file(
         path: &PathBuf,
         expected_bytes: u64,
         expected_crc32: u32,
@@ -189,117 +183,157 @@ impl DirectFileSink {
             .open(path)
             .map_err(|error| io_error("create direct URMA benchmark sink", error))?;
         Ok(Self {
-            file,
+            file: Some(Arc::new(file)),
             expected_bytes,
             expected_crc32,
-            actual_bytes: 0,
-            hasher: Crc32Hasher::new(),
             completion_policy,
         })
     }
 
-    fn write_window(&mut self, bytes: &[u8]) -> Result<()> {
-        let position = self.actual_bytes;
-        let next = position
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| invalid("direct file sink length overflow"))?;
-        if next > self.expected_bytes {
-            return Err(Error::Protocol(
-                "direct file sink exceeds expected length".into(),
-            ));
-        }
-        let file = &self.file;
-        let hasher = &mut self.hasher;
-        let write = thread::scope(|scope| {
-            let write = scope.spawn(|| file.write_all_at(bytes, position));
-            hasher.update(bytes);
-            write.join()
-        });
-        write
-            .map_err(|_| Error::Protocol("direct file writer panicked".into()))?
-            .map_err(|error| io_error("pwrite registered RX window", error))?;
-        self.actual_bytes = next;
-        Ok(())
-    }
-
-    fn finish(self) -> Result<IntegrityResult> {
+    fn finish(&self, actual_bytes: u64, actual_crc32: u32) -> Result<IntegrityResult> {
         if self.completion_policy == FileCompletionPolicy::Durable {
-            self.file
-                .sync_data()
-                .map_err(|error| io_error("sync direct URMA benchmark sink", error))?;
+            if let Some(file) = &self.file {
+                file.sync_data()
+                    .map_err(|error| io_error("sync direct URMA benchmark sink", error))?;
+            }
         }
         Ok(IntegrityResult::new(
             self.expected_bytes,
-            self.actual_bytes,
+            actual_bytes,
             self.expected_crc32,
-            self.hasher.finalize(),
+            actual_crc32,
         ))
     }
 }
 
-enum SinkCommand {
-    Window(RegisteredRxWindowLease),
-    End(IntegrationMessageV3),
+struct WindowJob {
+    order: u64,
+    position: u64,
+    window: RegisteredRxWindowLease,
 }
 
-enum SinkEvent {
-    Window(RegisteredRxWindowLease),
-    Finished(IntegrityResult),
-    Failed(Error),
+struct WindowOutcome {
+    order: u64,
+    length: usize,
+    digest: Result<Crc32Hasher>,
+    window: RegisteredRxWindowLease,
 }
 
-/// Runs CRC/file consumption on completed registered windows. A window is
-/// returned to the transport only after every reader has joined.
+/// Hashes independent registered windows on multiple workers. Window digests
+/// may complete out of order, but are combined in wire order. A lease is
+/// returned to the transport only after its CRC and optional pwrite complete.
 struct SinkPipeline {
-    command: Option<SyncSender<SinkCommand>>,
-    event: Receiver<SinkEvent>,
-    worker: Option<JoinHandle<()>>,
+    sink: WindowSink,
+    commands: Vec<Sender<WindowJob>>,
+    event: Receiver<WindowOutcome>,
+    workers: Vec<JoinHandle<()>>,
+    start_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+    next_worker: usize,
+    next_order: u64,
+    next_combine: u64,
+    outstanding: usize,
+    pending: BTreeMap<u64, (usize, Crc32Hasher)>,
+    combined: Crc32Hasher,
+    actual_bytes: u64,
     recycled: Vec<RegisteredRxWindowLease>,
     failure: Option<Error>,
 }
 
 impl SinkPipeline {
-    fn start(receiver: UrmaReceiveState, sink: ActiveSink) -> Result<Self> {
-        let (command_tx, command_rx) = mpsc::sync_channel(MAX_REGISTERED_RX_WINDOWS);
+    fn start(sink: WindowSink, worker_count: usize, defer_processing: bool) -> Result<Self> {
+        if worker_count == 0 {
+            return Err(invalid("CRC worker count must be non-zero"));
+        }
         let (event_tx, event_rx) = mpsc::channel();
-        let worker = thread::Builder::new()
-            .name("urma-rx-sink".into())
-            .spawn(move || run_sink_worker(receiver, sink, command_rx, event_tx))
-            .map_err(|error| io_error("spawn URMA RX sink worker", error))?;
+        let start_gate = defer_processing.then(|| Arc::new((Mutex::new(false), Condvar::new())));
+        let mut commands = Vec::with_capacity(worker_count);
+        let mut workers = Vec::with_capacity(worker_count);
+        for index in 0..worker_count {
+            let (command_tx, command_rx) = mpsc::channel();
+            let event = event_tx.clone();
+            let file = sink.file.clone();
+            let worker_gate = start_gate.clone();
+            let worker = thread::Builder::new()
+                .name(format!("urma-rx-crc-{index}"))
+                .spawn(move || run_window_worker(file, command_rx, event, worker_gate))
+                .map_err(|error| io_error("spawn URMA RX CRC worker", error))?;
+            commands.push(command_tx);
+            workers.push(worker);
+        }
+        drop(event_tx);
         Ok(Self {
-            command: Some(command_tx),
+            sink,
+            commands,
             event: event_rx,
-            worker: Some(worker),
-            recycled: Vec::with_capacity(MAX_REGISTERED_RX_WINDOWS),
+            workers,
+            start_gate,
+            next_worker: 0,
+            next_order: 0,
+            next_combine: 0,
+            outstanding: 0,
+            pending: BTreeMap::new(),
+            combined: Crc32Hasher::new(),
+            actual_bytes: 0,
+            recycled: Vec::new(),
             failure: None,
         })
     }
 
-    fn push(&mut self, window: RegisteredRxWindowLease) -> Result<()> {
-        self.send(SinkCommand::Window(window))
+    fn push(&mut self, position: u64, window: RegisteredRxWindowLease) -> Result<()> {
+        self.collect_recycled()?;
+        validate_registered_window_layout(&window)?;
+        let end = position
+            .checked_add(window.len() as u64)
+            .ok_or_else(|| invalid("registered RX window position overflow"))?;
+        if end > self.sink.expected_bytes {
+            return Err(Error::Protocol(
+                "registered RX window exceeds expected sink length".into(),
+            ));
+        }
+        let order = self.next_order;
+        self.next_order = self
+            .next_order
+            .checked_add(1)
+            .ok_or_else(|| invalid("registered RX window order overflow"))?;
+        let worker = self.next_worker;
+        self.next_worker = (self.next_worker + 1) % self.commands.len();
+        self.outstanding = self
+            .outstanding
+            .checked_add(1)
+            .ok_or_else(|| invalid("CRC pipeline outstanding overflow"))?;
+        if self.commands[worker]
+            .send(WindowJob {
+                order,
+                position,
+                window,
+            })
+            .is_err()
+        {
+            self.outstanding -= 1;
+            return Err(Error::Protocol("URMA RX CRC worker disconnected".into()));
+        }
+        Ok(())
     }
 
-    fn finish(
-        mut self,
-        end: IntegrationMessageV3,
-    ) -> Result<(IntegrityResult, Vec<RegisteredRxWindowLease>)> {
-        self.send(SinkCommand::End(end))?;
-        loop {
-            match self.event.recv() {
-                Ok(SinkEvent::Window(window)) => self.recycled.push(window),
-                Ok(SinkEvent::Finished(integrity)) => {
-                    self.command.take();
-                    self.join_worker()?;
-                    return Ok((integrity, std::mem::take(&mut self.recycled)));
-                }
-                Ok(SinkEvent::Failed(error)) => {
-                    self.command.take();
-                    self.join_worker()?;
-                    return Err(error);
-                }
-                Err(_) => return self.worker_disconnected(),
-            }
+    fn finish(mut self) -> Result<(IntegrityResult, Vec<RegisteredRxWindowLease>)> {
+        self.release_workers();
+        while self.outstanding != 0 {
+            let outcome = self.event.recv().map_err(|_| {
+                Error::Protocol("URMA RX CRC workers disconnected with pending windows".into())
+            })?;
+            self.accept_outcome(outcome);
         }
+        self.commands.clear();
+        self.join_workers()?;
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        if !self.pending.is_empty() || self.next_combine != self.next_order {
+            return Err(Error::Protocol("CRC window result sequence gap".into()));
+        }
+        let actual_crc32 = std::mem::take(&mut self.combined).finalize();
+        let integrity = self.sink.finish(self.actual_bytes, actual_crc32)?;
+        Ok((integrity, std::mem::take(&mut self.recycled)))
     }
 
     fn take_recycled(&mut self) -> Result<Vec<RegisteredRxWindowLease>> {
@@ -310,144 +344,164 @@ impl SinkPipeline {
     fn collect_recycled(&mut self) -> Result<()> {
         loop {
             match self.event.try_recv() {
-                Ok(SinkEvent::Window(window)) => self.recycled.push(window),
-                Ok(SinkEvent::Failed(error)) => {
-                    self.failure = Some(error);
-                    break;
-                }
-                Ok(SinkEvent::Finished(_)) => {
-                    return Err(Error::Protocol("URMA RX sink finished before End".into()));
-                }
+                Ok(outcome) => self.accept_outcome(outcome),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return self.worker_disconnected(),
+                Err(TryRecvError::Disconnected) if self.outstanding == 0 => break,
+                Err(TryRecvError::Disconnected) => {
+                    return Err(Error::Protocol(
+                        "URMA RX CRC workers disconnected with pending windows".into(),
+                    ));
+                }
             }
         }
-        if let Some(error) = self.failure.take() {
-            return Err(error);
-        }
         Ok(())
     }
 
-    fn send(&mut self, command: SinkCommand) -> Result<()> {
-        self.collect_recycled()?;
-        self.command
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("URMA RX sink is closed".into()))?
-            .send(command)
-            .map_err(|_| Error::Protocol("URMA RX sink worker disconnected".into()))
+    fn accept_outcome(&mut self, outcome: WindowOutcome) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        match outcome.digest {
+            Ok(digest) => {
+                if self
+                    .pending
+                    .insert(outcome.order, (outcome.length, digest))
+                    .is_some()
+                    && self.failure.is_none()
+                {
+                    self.failure = Some(Error::Protocol("duplicate CRC window result".into()));
+                }
+                while let Some((length, digest)) = self.pending.remove(&self.next_combine) {
+                    self.combined.combine(&digest);
+                    self.actual_bytes = self.actual_bytes.saturating_add(length as u64);
+                    self.next_combine = self.next_combine.saturating_add(1);
+                }
+            }
+            Err(error) if self.failure.is_none() => self.failure = Some(error),
+            Err(_) => {}
+        }
+        self.recycled.push(outcome.window);
     }
 
-    fn worker_disconnected<T>(&mut self) -> Result<T> {
-        self.command.take();
-        self.join_worker()?;
-        Err(Error::Protocol(
-            "URMA RX sink worker disconnected without a result".into(),
-        ))
-    }
-
-    fn join_worker(&mut self) -> Result<()> {
-        if let Some(worker) = self.worker.take() {
+    fn join_workers(&mut self) -> Result<()> {
+        for worker in self.workers.drain(..) {
             worker
                 .join()
-                .map_err(|_| Error::Protocol("URMA RX sink worker panicked".into()))?;
+                .map_err(|_| Error::Protocol("URMA RX CRC worker panicked".into()))?;
         }
         Ok(())
+    }
+
+    fn release_workers(&mut self) {
+        let Some(gate) = self.start_gate.take() else {
+            return;
+        };
+        let (started, ready) = &*gate;
+        if let Ok(mut started) = started.lock() {
+            *started = true;
+            ready.notify_all();
+        };
     }
 }
 
 impl Drop for SinkPipeline {
     fn drop(&mut self) {
-        self.command.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        self.commands.clear();
+        self.release_workers();
+        let _ = self.join_workers();
+    }
+}
+
+fn run_window_worker(
+    file: Option<Arc<File>>,
+    command: Receiver<WindowJob>,
+    event: mpsc::Sender<WindowOutcome>,
+    start_gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+) {
+    if let Some(gate) = start_gate {
+        let (started, ready) = &*gate;
+        let mut started = match started.lock() {
+            Ok(started) => started,
+            Err(_) => return,
+        };
+        while !*started {
+            started = match ready.wait(started) {
+                Ok(started) => started,
+                Err(_) => return,
+            };
+        }
+    }
+    while let Ok(job) = command.recv() {
+        let length = job.window.len();
+        let digest = hash_and_write_window(file.as_ref(), &job.window, job.position);
+        if event
+            .send(WindowOutcome {
+                order: job.order,
+                length,
+                digest,
+                window: job.window,
+            })
+            .is_err()
+        {
+            return;
         }
     }
 }
 
-fn run_sink_worker(
-    mut receiver: UrmaReceiveState,
-    mut sink: ActiveSink,
-    command: Receiver<SinkCommand>,
-    event: mpsc::Sender<SinkEvent>,
-) {
-    while let Ok(command) = command.recv() {
-        let result = match command {
-            SinkCommand::Window(window) => {
-                let mut offset = 0usize;
-                let mut result = Ok(());
-                for chunk in window.chunks() {
-                    let end = match offset.checked_add(chunk.length) {
-                        Some(end) if end <= window.len() => end,
-                        _ => {
-                            result = Err(Error::Protocol(
-                                "invalid registered RX window bounds".into(),
-                            ));
-                            break;
-                        }
-                    };
-                    let sequence = match chunk.sequence.and_then(|value| u32::try_from(value).ok())
-                    {
-                        Some(sequence) => sequence,
-                        None => {
-                            result = Err(Error::Protocol(
-                                "registered RX window lacks a valid sequence".into(),
-                            ));
-                            break;
-                        }
-                    };
-                    if let Err(error) = receiver.accept_data_length(sequence, chunk.length) {
-                        result = Err(error);
-                        break;
-                    }
-                    offset = end;
-                }
-                if result.is_ok() && offset != window.len() {
-                    result = Err(Error::Protocol(
-                        "registered RX window has trailing bytes".into(),
-                    ));
-                }
-                if result.is_ok() {
-                    result = sink.write_window(window.bytes());
-                }
-                match result {
-                    Ok(()) => {
-                        if event.send(SinkEvent::Window(window)).is_err() {
-                            return;
-                        }
-                        continue;
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            SinkCommand::End(end) => {
-                receiver
-                    .accept_payload(&end, &mut sink)
-                    .and_then(|complete| {
-                        if complete {
-                            Ok(())
-                        } else {
-                            Err(Error::Protocol(
-                                "URMA RX End did not complete transfer".into(),
-                            ))
-                        }
-                    })
-            }
-        };
-        if let Err(error) = result {
-            let _ = event.send(SinkEvent::Failed(error));
-            return;
-        }
-        let result = sink.finish();
-        match result {
-            Ok(integrity) => {
-                let _ = event.send(SinkEvent::Finished(integrity));
-            }
-            Err(error) => {
-                let _ = event.send(SinkEvent::Failed(error));
-            }
-        }
-        return;
+fn hash_and_write_window(
+    file: Option<&Arc<File>>,
+    window: &RegisteredRxWindowLease,
+    position: u64,
+) -> Result<Crc32Hasher> {
+    let bytes = window.bytes();
+    let mut digest = Crc32Hasher::new();
+    if let Some(file) = file {
+        let write = thread::scope(|scope| {
+            let write = scope.spawn(|| file.write_all_at(bytes, position));
+            digest.update(bytes);
+            write.join()
+        });
+        write
+            .map_err(|_| Error::Protocol("direct file writer panicked".into()))?
+            .map_err(|error| io_error("pwrite registered RX window", error))?;
+    } else {
+        digest.update(bytes);
     }
+    Ok(digest)
+}
+
+fn validate_registered_window_layout(window: &RegisteredRxWindowLease) -> Result<()> {
+    let mut total = 0usize;
+    let mut previous_sequence = None;
+    for chunk in window.chunks() {
+        let sequence = chunk
+            .sequence
+            .ok_or_else(|| Error::Protocol("registered RX window lacks a sequence".into()))?;
+        if let Some(previous) = previous_sequence {
+            if sequence != previous + 1 {
+                return Err(Error::Protocol(
+                    "registered RX window sequence is not contiguous".into(),
+                ));
+            }
+        }
+        previous_sequence = Some(sequence);
+        total = total
+            .checked_add(chunk.length)
+            .ok_or_else(|| invalid("registered RX window length overflow"))?;
+    }
+    if total != window.len() {
+        return Err(Error::Protocol(
+            "registered RX window chunk lengths do not match its byte range".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn crc_worker_count(window_count: usize) -> usize {
+    thread::available_parallelism()
+        .map_or(1, usize::from)
+        .saturating_sub(1)
+        .max(1)
+        .min(MAX_CRC_WORKERS)
+        .min(window_count.max(1))
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -577,8 +631,9 @@ pub fn run_urma_parent_profile(
             "fixed-tx profile requires a non-empty, chunk-aligned memory case",
         ));
     }
-    let runtime_config = benchmark_runtime_config(case, device, eid_index, profile)?;
+    let runtime_config = benchmark_runtime_config(case, device, eid_index, profile, false)?;
     let jetty_config = JettyConfig::default();
+    let recv_depth = jetty_config.recv_depth as usize;
     validate_urma_case(
         case,
         UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config),
@@ -628,11 +683,9 @@ pub fn run_urma_parent_profile(
 
     let remaining_messages = usize::try_from(case.chunk_count()? + 1)
         .map_err(|_| invalid("receive message count exceeds usize"))?;
-    let expected_remote_credit = receive_credit_target(
-        case.window as usize,
-        runtime_config.buffer_pool.rx_slot_count,
-        remaining_messages,
-    )?;
+    let remote_rx_capacity = profile.rx_slots(case, true)?.min(recv_depth);
+    let expected_remote_credit =
+        receive_credit_target(case.window as usize, remote_rx_capacity, remaining_messages)?;
     let initial_remote_credit = expect_ready(&mut session, &case.case_id, expected_remote_credit)?;
     let mut remote_credit = RemoteReceiveCredit::new(initial_remote_credit)?;
     let measurement = match setup_measurement {
@@ -696,6 +749,7 @@ pub fn run_urma_parent_profile(
         done.completion,
         bytes_sent,
         done.bytes_received,
+        initial_remote_credit,
     )?;
     let child_sample =
         TimingSample::from_duration(case.timing_mode, Duration::from_nanos(done.elapsed_ns));
@@ -743,8 +797,9 @@ pub fn run_urma_child_profile(
     profile: UrmaBenchmarkProfile,
 ) -> Result<BenchmarkResult> {
     destination.validate(case)?;
-    let runtime_config = benchmark_runtime_config(case, device, eid_index, profile)?;
+    let runtime_config = benchmark_runtime_config(case, device, eid_index, profile, true)?;
     let jetty_config = JettyConfig::default();
+    let recv_depth = jetty_config.recv_depth as usize;
     validate_urma_case(
         case,
         UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config),
@@ -779,16 +834,22 @@ pub fn run_urma_child_profile(
     receiver.accept_metadata(&metadata)?;
     let sink =
         destination.create_sink(case.transfer_bytes, expected_crc32, case.completion_policy)?;
-    let mut sink_pipeline = SinkPipeline::start(receiver, sink)?;
-    let rx_window_chunks = registered_rx_window_chunks(
-        case.window as usize,
-        runtime_config.buffer_pool.rx_slot_count,
-    )?;
+    let rx_window_chunks = if profile.transport_only() {
+        case.window as usize
+    } else {
+        registered_rx_window_chunks(
+            case.window as usize,
+            runtime_config.buffer_pool.rx_slot_count,
+        )?
+    };
+    let registered_window_count = runtime_config.buffer_pool.rx_slot_count / rx_window_chunks;
+    let sink_worker_count = crc_worker_count(registered_window_count);
+    let mut sink_pipeline = SinkPipeline::start(sink, sink_worker_count, profile.transport_only())?;
     let remaining_messages = usize::try_from(case.chunk_count()? + 1)
         .map_err(|_| invalid("receive message count exceeds usize"))?;
     let credit_target = receive_credit_target(
         case.window as usize,
-        runtime_config.buffer_pool.rx_slot_count,
+        recv_depth.min(runtime_config.buffer_pool.rx_slot_count),
         remaining_messages,
     )?;
     let mut credit = ReceiveCreditController::new(credit_target, remaining_messages)?;
@@ -807,6 +868,7 @@ pub fn run_urma_child_profile(
         Some(measurement) => measurement,
         None => Measurement::start(case.timing_mode)?,
     };
+    let mut measurement = Some(measurement);
 
     let mut last_progress = Instant::now();
     let mut bytes_received = 0u64;
@@ -853,13 +915,17 @@ pub fn run_urma_child_profile(
                 bytes_received = bytes_received
                     .checked_add(u64::from(completion.length))
                     .ok_or_else(|| Error::Protocol("received byte count overflow".into()))?;
+                receiver.accept_data_length(received_data_messages, completion.length as usize)?;
                 pending_window.push(completion);
                 received_data_messages += 1;
                 if pending_window.len() == rx_window_chunks
                     || received_data_messages == expected_data_messages
                 {
                     let lease = connection.lease_completed_recvs(&pending_window)?;
-                    sink_pipeline.push(lease)?;
+                    let position = bytes_received
+                        .checked_sub(lease.len() as u64)
+                        .ok_or_else(|| invalid("registered RX window position underflow"))?;
+                    sink_pipeline.push(position, lease)?;
                     pending_window.clear();
                 }
             } else {
@@ -899,7 +965,24 @@ pub fn run_urma_child_profile(
             break 'receive message;
         }
     };
-    let (integrity, recycled) = sink_pipeline.finish(end_message)?;
+    receiver.accept_end(&end_message)?;
+    let transport_measurement = if profile.transport_only() {
+        Some(
+            measurement
+                .take()
+                .expect("measurement is present")
+                .finish()?,
+        )
+    } else {
+        None
+    };
+    let verification_started = Instant::now();
+    let (integrity, recycled) = sink_pipeline.finish()?;
+    let post_transport_verification_ns = if profile.transport_only() {
+        u64::try_from(verification_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
     for lease in recycled {
         connection.recycle_recv_lease(lease)?;
     }
@@ -916,7 +999,13 @@ pub fn run_urma_child_profile(
             "URMA sink integrity verification failed".into(),
         ));
     }
-    let (sample, child_cpu) = measurement.finish()?;
+    let (sample, child_cpu) = match transport_measurement {
+        Some(measurement) => measurement,
+        None => measurement
+            .take()
+            .expect("measurement is present")
+            .finish()?,
+    };
     let completion = connection.stats();
     let mut result = BenchmarkResult::from_sample(case, sample, integrity)?;
     result.child_cpu = Some(child_cpu);
@@ -927,6 +1016,7 @@ pub fn run_urma_child_profile(
         completion,
         0,
         bytes_received,
+        credit_target,
     )?
     .insert_all(&mut result.transport_stats);
     result.transport_stats.insert(
@@ -956,7 +1046,7 @@ pub fn run_urma_child_profile(
         .insert("remote_credit_consumed".into(), 0);
     result.transport_stats.insert(
         "registered_rx_window_count".into(),
-        u64::try_from(runtime_config.buffer_pool.rx_slot_count / rx_window_chunks)
+        u64::try_from(registered_window_count)
             .map_err(|_| invalid("registered RX window count does not fit u64"))?,
     );
     result.transport_stats.insert(
@@ -974,6 +1064,18 @@ pub fn run_urma_child_profile(
         .map_err(|_| invalid("registered RX window byte size does not fit u64"))?,
     );
     result.transport_stats.insert("rx_bounce_copy".into(), 0);
+    result.transport_stats.insert(
+        "parallel_crc_workers".into(),
+        u64::try_from(sink_worker_count)
+            .map_err(|_| invalid("CRC worker count does not fit u64"))?,
+    );
+    result
+        .transport_stats
+        .insert("transport_only".into(), u64::from(profile.transport_only()));
+    result.transport_stats.insert(
+        "post_transport_verification_ns".into(),
+        post_transport_verification_ns,
+    );
     result.transport_stats.insert(
         "direct_file_pwrite".into(),
         u64::from(case.scenario == BenchmarkScenario::File),
@@ -1374,15 +1476,9 @@ fn combined_stats(
     child: CompletionStats,
     bytes_sent: u64,
     bytes_received: u64,
+    configured_receive_credit: usize,
 ) -> Result<UrmaTransportStats> {
     let total_registered_bytes = runtime.buffer_pool.total_len()?;
-    let remaining_messages = usize::try_from(case.chunk_count()? + 1)
-        .map_err(|_| invalid("receive message count exceeds usize"))?;
-    let configured_receive_credit = receive_credit_target(
-        case.window as usize,
-        runtime.buffer_pool.rx_slot_count,
-        remaining_messages,
-    )?;
     let poll_calls = parent.poll_calls.saturating_add(child.poll_calls);
     let empty_polls = parent.empty_polls.saturating_add(child.empty_polls);
     let nonempty_polls = parent.nonempty_polls.saturating_add(child.nonempty_polls);
@@ -1457,11 +1553,12 @@ fn benchmark_runtime_config(
     device: impl Into<String>,
     eid_index: u32,
     profile: UrmaBenchmarkProfile,
+    child: bool,
 ) -> Result<RuntimeConfig> {
     let mut config = RuntimeConfig::new(device, eid_index);
     config.buffer_pool.slot_size = derive_urma_slot_size(case, config.buffer_pool.alignment)?;
     config.buffer_pool.alias_tx_slots = profile.fixed_tx();
-    config.buffer_pool.rx_slot_count = profile.rx_slots();
+    config.buffer_pool.rx_slot_count = profile.rx_slots(case, child)?;
     config.buffer_pool.total_len()?;
     Ok(config)
 }
@@ -1803,6 +1900,41 @@ fn io_error(operation: &'static str, error: io::Error) -> Error {
 mod tests {
     use super::*;
 
+    fn memory_case(bytes: u64, window: u32) -> BenchmarkCase {
+        BenchmarkCase::new(
+            "native-test",
+            1,
+            BenchmarkScenario::Memory,
+            crate::BenchmarkTransport::Urma,
+            bytes,
+            64 * 1024,
+            window,
+            TimingMode::SteadyState,
+            FileCompletionPolicy::Buffered,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn performance_profiles_size_rx_backing_independently_of_jfr_depth() {
+        let case = memory_case(2 * 1024 * 1024 * 1024, 128);
+        assert_eq!(
+            UrmaBenchmarkProfile::Normal.rx_slots(&case, false).unwrap(),
+            512
+        );
+        assert_eq!(
+            UrmaBenchmarkProfile::Normal.rx_slots(&case, true).unwrap(),
+            2048
+        );
+        assert_eq!(
+            UrmaBenchmarkProfile::TransportOnly
+                .rx_slots(&case, true)
+                .unwrap(),
+            32_769
+        );
+    }
+
     #[test]
     fn registered_windows_partition_the_physical_rq() {
         assert_eq!(registered_rx_window_chunks(128, 512).unwrap(), 128);
@@ -1823,33 +1955,47 @@ mod tests {
         let chunks: [&[u8]; 3] = [b"abcd", b"efgh", b"ijk"];
         let payload = chunks.concat();
         let expected_crc32 = crate::crc32_bytes(&payload);
-        let metadata = IntegrationMessageV3::metadata(
-            REQUEST_ID,
-            0,
-            payload.len() as u64,
-            DigestDescriptor::crc32(expected_crc32),
-        );
-        let mut receiver =
-            UrmaReceiveState::new(REQUEST_ID, payload.len() as u64, expected_crc32).unwrap();
-        receiver.accept_metadata(&metadata).unwrap();
-        let sink = ActiveSink::Memory(MemorySink::new(payload.len() as u64, expected_crc32));
-        let mut pipeline = SinkPipeline::start(receiver, sink).unwrap();
-        let window = RegisteredRxWindowLease::from_test_bytes(
-            payload.clone(),
-            chunks
-                .iter()
-                .enumerate()
-                .map(|(sequence, chunk)| (Some(sequence as u64), chunk.len()))
-                .collect(),
-        );
-        pipeline.push(window).unwrap();
-        let (integrity, recycled) = pipeline
-            .finish(IntegrationMessageV3::end(
-                REQUEST_ID,
-                chunks.len() as u32,
-                payload.len() as u64,
-            ))
+        let sink = WindowSink::memory(payload.len() as u64, expected_crc32);
+        let mut pipeline = SinkPipeline::start(sink, 2, false).unwrap();
+        pipeline
+            .push(
+                0,
+                RegisteredRxWindowLease::from_test_bytes(
+                    chunks[0].to_vec(),
+                    vec![(Some(0), chunks[0].len())],
+                ),
+            )
             .unwrap();
+        pipeline
+            .push(
+                chunks[0].len() as u64,
+                RegisteredRxWindowLease::from_test_bytes(
+                    [chunks[1], chunks[2]].concat(),
+                    vec![(Some(1), chunks[1].len()), (Some(2), chunks[2].len())],
+                ),
+            )
+            .unwrap();
+        let (integrity, recycled) = pipeline.finish().unwrap();
+        assert!(integrity.is_ok());
+        assert_eq!(recycled.len(), 2);
+    }
+
+    #[test]
+    fn transport_only_defers_crc_until_finish() {
+        let payload = b"deferred-transport-verification".to_vec();
+        let sink = WindowSink::memory(payload.len() as u64, crate::crc32_bytes(&payload));
+        let mut pipeline = SinkPipeline::start(sink, 2, true).unwrap();
+        pipeline
+            .push(
+                0,
+                RegisteredRxWindowLease::from_test_bytes(
+                    payload.clone(),
+                    vec![(Some(0), payload.len())],
+                ),
+            )
+            .unwrap();
+        assert!(pipeline.take_recycled().unwrap().is_empty());
+        let (integrity, recycled) = pipeline.finish().unwrap();
         assert!(integrity.is_ok());
         assert_eq!(recycled.len(), 1);
     }
@@ -1867,18 +2013,8 @@ mod tests {
         let mut receiver =
             UrmaReceiveState::new(REQUEST_ID, payload.len() as u64, expected_crc32).unwrap();
         receiver.accept_metadata(&metadata).unwrap();
-        let sink = ActiveSink::Memory(MemorySink::new(payload.len() as u64, expected_crc32));
-        let mut pipeline = SinkPipeline::start(receiver, sink).unwrap();
-        pipeline
-            .push(RegisteredRxWindowLease::from_test_bytes(
-                payload,
-                vec![(Some(1), 4), (Some(0), 4)],
-            ))
-            .unwrap();
-        let error = match pipeline.finish(IntegrationMessageV3::end(REQUEST_ID, 2, 8)) {
-            Ok(_) => panic!("out-of-order registered window unexpectedly succeeded"),
-            Err(error) => error,
-        };
+        receiver.accept_data_length(0, 4).unwrap();
+        let error = receiver.accept_data_length(0, 4).unwrap_err();
         assert!(matches!(error, Error::Protocol(_)));
     }
 
@@ -1894,16 +2030,33 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let mut sink = DirectFileSink::create(
+        let sink = WindowSink::file(
             &path,
             payload.len() as u64,
             expected_crc32,
             FileCompletionPolicy::Buffered,
         )
         .unwrap();
-        sink.write_window(&payload[..10]).unwrap();
-        sink.write_window(&payload[10..]).unwrap();
-        assert!(sink.finish().unwrap().is_ok());
+        let mut pipeline = SinkPipeline::start(sink, 2, false).unwrap();
+        pipeline
+            .push(
+                0,
+                RegisteredRxWindowLease::from_test_bytes(
+                    payload[..10].to_vec(),
+                    vec![(Some(0), 10)],
+                ),
+            )
+            .unwrap();
+        pipeline
+            .push(
+                10,
+                RegisteredRxWindowLease::from_test_bytes(
+                    payload[10..].to_vec(),
+                    vec![(Some(1), payload.len() - 10)],
+                ),
+            )
+            .unwrap();
+        assert!(pipeline.finish().unwrap().0.is_ok());
         assert_eq!(std::fs::read(&path).unwrap(), payload);
         std::fs::remove_file(path).unwrap();
     }

@@ -21,6 +21,13 @@ impl Crc32Hasher {
         self.0.update(bytes);
     }
 
+    /// Appends a separately hashed byte range to this digest. This permits
+    /// independent windows to be hashed in parallel and combined in wire
+    /// order without rescanning their payloads.
+    pub fn combine(&mut self, other: &Self) {
+        self.0.combine(&other.0);
+    }
+
     pub fn finalize(self) -> u32 {
         self.0.finalize()
     }
@@ -112,6 +119,16 @@ mod tests {
         let (reader_digest, length) = crc32_reader(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(reader_digest, crc32_bytes(bytes));
         assert_eq!(length, bytes.len() as u64);
+    }
+
+    #[test]
+    fn independently_hashed_ranges_combine_in_order() {
+        let mut first = Crc32Hasher::new();
+        first.update(b"parallel ");
+        let mut second = Crc32Hasher::new();
+        second.update(b"windows");
+        first.combine(&second);
+        assert_eq!(first.finalize(), crc32_bytes(b"parallel windows"));
     }
 
     #[test]

@@ -502,22 +502,7 @@ impl UrmaReceiveState {
                 self.accept_data(message.sequence, payload, sink)?;
                 Ok(false)
             }
-            IntegrationMessageBodyV3::End {
-                total_length,
-                chunk_count,
-            } => {
-                if message.sequence != self.next_sequence || *chunk_count != self.next_sequence {
-                    return Err(Error::Protocol(
-                        "URMA End sequence/chunk count mismatch".into(),
-                    ));
-                }
-                if *total_length != self.expected_bytes || self.actual_bytes != self.expected_bytes
-                {
-                    return Err(Error::Protocol("URMA End/received length mismatch".into()));
-                }
-                self.complete = true;
-                Ok(true)
-            }
+            IntegrationMessageBodyV3::End { .. } => self.accept_end(message).map(|()| true),
             IntegrationMessageBodyV3::Error { code, message } => Err(Error::Protocol(format!(
                 "remote URMA error {code}: {message}"
             ))),
@@ -540,9 +525,36 @@ impl UrmaReceiveState {
         Ok(())
     }
 
+    #[cfg(feature = "urma")]
     pub(crate) fn accept_data_length(&mut self, sequence: u32, length: usize) -> Result<()> {
         let next = self.validate_data(sequence, length)?;
         self.commit_data(next)
+    }
+
+    pub(crate) fn accept_end(&mut self, message: &IntegrationMessageV3) -> Result<()> {
+        self.check_identity(message)?;
+        if !self.metadata_seen || self.complete {
+            return Err(Error::Protocol(
+                "URMA payload outside receiving phase".into(),
+            ));
+        }
+        let IntegrationMessageBodyV3::End {
+            total_length,
+            chunk_count,
+        } = &message.body
+        else {
+            return Err(Error::Protocol("expected URMA End".into()));
+        };
+        if message.sequence != self.next_sequence || *chunk_count != self.next_sequence {
+            return Err(Error::Protocol(
+                "URMA End sequence/chunk count mismatch".into(),
+            ));
+        }
+        if *total_length != self.expected_bytes || self.actual_bytes != self.expected_bytes {
+            return Err(Error::Protocol("URMA End/received length mismatch".into()));
+        }
+        self.complete = true;
+        Ok(())
     }
 
     fn validate_data(&self, sequence: u32, length: usize) -> Result<u64> {

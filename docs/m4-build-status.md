@@ -179,3 +179,27 @@ RECV CQE
 - RX window chunk 数必须整除物理 RX slot 数；非整除的 application window 自动降到不大于它的最大整除值，避免 RQ 环回后形成非连续 window。
 
 本地验证：feature-on 完整单元测试通过；包括 registered window 顺序与 CRC、worker 错误传播、window/RQ 分区，以及 direct positional write 完整性。真实 UB provider 性能与 shutdown 行为仍待目标机器验证，不能标记为硬件通过。
+
+## 2026-08-19：parallel CRC 与 transport-only profile
+
+benchmark fast path 继续加入以下实验性优化：
+
+- verified 模式把 Child RX backing 扩为 16 个 application window，同时保持 provider JFR credit depth 为 512；
+- completed window 分派到多个 CRC worker，worker 数按 CPU affinity 自动选择，预留一个 polling CPU，最大为 8；
+- 每个 window 独立计算 CRC32，完成结果可以乱序返回，但使用 `crc32fast::Hasher::combine` 按 wire order 合并；
+- file 模式的 positional write 与该 window 的 CRC 仍并发执行，不提前复用 lease；
+- RX free list 改为 FIFO，使新的 backing 先于已回收 backing 使用，并保持 window 内物理地址顺序；
+- 新增 `--urma-profile transport-only`。该模式为完整 payload 加 End 分配注册 RX backing，传输期间暂停 CRC worker，在收到 End 后先结束 transport timing，再启动完整 CRC/可选 pwrite 校验；
+- transport-only 仍输出真实 length/CRC integrity，不是跳过校验，但注册内存约等于 payload 大小，因此只用于硬件数据面诊断。
+
+新增统计包括：
+
+```text
+parallel_crc_workers
+transport_only
+post_transport_verification_ns
+registered_rx_window_count
+total_registered_bytes
+```
+
+本地测试只验证并行 CRC combine、乱序 worker 结果的有序合并、direct pwrite、profile RX sizing 和生命周期；真实 provider 的吞吐、2 GiB Segment 注册能力及 memlock 需求仍需目标节点验证。

@@ -115,6 +115,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "fixed-tx" => UrmaBenchmarkProfile::FixedTx,
             "rx128" => UrmaBenchmarkProfile::Rx128,
             "fixed-tx-rx128" => UrmaBenchmarkProfile::FixedTxRx128,
+            "transport-only" => UrmaBenchmarkProfile::TransportOnly,
             value => return Err(format!("invalid --urma-profile {value:?}").into()),
         };
         let result = match role {
@@ -230,7 +231,7 @@ fn print_usage() {
            --output PATH                 required for file Child\n\
            --device NAME                 URMA device, default: urma0\n\
            --eid-index N                 URMA EID index, default: 0\n\
-           --urma-profile normal|fixed-tx|rx128|fixed-tx-rx128\n\
+           --urma-profile normal|fixed-tx|rx128|fixed-tx-rx128|transport-only\n\
                                          URMA diagnostic profile, default: normal"
     );
 }

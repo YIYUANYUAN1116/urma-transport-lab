@@ -125,6 +125,7 @@ mod native {
     use super::*;
     use crate::ffi;
     use std::{
+        collections::VecDeque,
         ptr::NonNull,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -237,7 +238,7 @@ mod native {
         segment: Option<UrmaRegisteredSegment>,
         slots: Vec<BufferSlot>,
         free_tx: Vec<usize>,
-        free_rx: Vec<usize>,
+        free_rx: VecDeque<usize>,
         accepting: bool,
         active_rx_leases: Arc<AtomicUsize>,
     }
@@ -281,7 +282,7 @@ mod native {
                 });
             }
             let free_tx = (0..config.tx_slot_count).rev().collect();
-            let free_rx = (config.tx_slot_count..slot_count).rev().collect();
+            let free_rx = (config.tx_slot_count..slot_count).collect();
             Ok(Self {
                 config,
                 segment: Some(segment),
@@ -303,7 +304,7 @@ mod native {
             }
             let index = match kind {
                 SlotKind::Tx => self.free_tx.pop()?,
-                SlotKind::Rx => self.free_rx.pop()?,
+                SlotKind::Rx => self.free_rx.pop_front()?,
             };
             let slot = self.slots.get_mut(index)?;
             debug_assert_eq!(slot.kind, kind);
@@ -327,7 +328,7 @@ mod native {
             slot.state = SlotState::Free;
             match slot.kind {
                 SlotKind::Tx => self.free_tx.push(id.0),
-                SlotKind::Rx => self.free_rx.push(id.0),
+                SlotKind::Rx => self.free_rx.push_back(id.0),
             }
             Ok(())
         }
@@ -657,9 +658,9 @@ mod native {
                     return Err(Error::Protocol("RX lease slot state mismatch".into()));
                 }
             }
-            // Push in reverse so the stack allocator reposts the same physical
-            // window in ascending address/receive order.
-            for &slot in lease.slots.iter().rev() {
+            // FIFO allocation keeps fresh backing ahead of recycled windows
+            // and preserves each released window's ascending receive order.
+            for &slot in &lease.slots {
                 self.transition(slot, SlotState::Leased, SlotState::RecvCompleted)?;
                 self.release(slot)?;
             }
