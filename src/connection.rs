@@ -176,15 +176,29 @@ mod native {
 
         /// Post one encoded message without imposing a completion drain.
         pub fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
-            self.send_frame_with_sequence(bytes, None, true)
+            self.send_frame_with_sequence(bytes, None, true, None)
         }
 
         pub fn send_frame_tracked(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
-            self.send_frame_with_sequence(bytes, Some(sequence), false)
+            self.send_frame_with_sequence(bytes, Some(sequence), false, None)
         }
 
         pub fn send_frame_tracked_tail(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
-            self.send_frame_with_sequence(bytes, Some(sequence), true)
+            self.send_frame_with_sequence(bytes, Some(sequence), true, None)
+        }
+
+        pub fn prepare_aliased_tx(&mut self, bytes: &[u8]) -> Result<()> {
+            self.require(ConnectionState::Ready)?;
+            self.buffer_pool.prepare_aliased_tx(bytes)
+        }
+
+        pub fn send_prepared_tracked(
+            &mut self,
+            length: usize,
+            sequence: u64,
+            is_tail: bool,
+        ) -> Result<()> {
+            self.send_frame_with_sequence(&[], Some(sequence), is_tail, Some(length))
         }
 
         pub fn configure_send_completion_interval(&mut self, interval: usize) -> Result<()> {
@@ -205,6 +219,7 @@ mod native {
             bytes: &[u8],
             sequence: Option<u64>,
             force_completion: bool,
+            prepared_length: Option<usize>,
         ) -> Result<()> {
             self.require(ConnectionState::Ready)?;
             self.receive_credit.require_before_send()?;
@@ -214,7 +229,12 @@ mod native {
                 .buffer_pool
                 .allocate(SlotKind::Tx)
                 .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
-            let (offset, length) = match self.buffer_pool.write_tx(slot, bytes) {
+            let layout = if let Some(length) = prepared_length {
+                self.buffer_pool.aliased_tx_layout(slot, length)
+            } else {
+                self.buffer_pool.write_tx(slot, bytes)
+            };
+            let (offset, length) = match layout {
                 Ok(layout) => layout,
                 Err(error) => {
                     self.buffer_pool.release(slot)?;

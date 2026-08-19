@@ -3,8 +3,9 @@ use crate::{
     derive_urma_slot_size,
     oob::{child_handshake, parent_handshake, OobSession},
     BenchmarkResult, BenchmarkScenario, BenchmarkTimer, CompletionEvent, CompletionStats, CpuUsage,
-    DigestDescriptor, FileCompletionPolicy, FileSink, FileSource, IntegrityResult, JettyConfig,
-    MemorySink, MemorySource, RuntimeConfig, TimingMode, TimingSample, UrmaConnection, UrmaRuntime,
+    Crc32Hasher, DigestDescriptor, FileCompletionPolicy, FileSink, FileSource, IntegrityResult,
+    JettyConfig, MemorySink, MemorySource, RuntimeConfig, TimingMode, TimingSample, UrmaConnection,
+    UrmaRuntime,
 };
 use std::{
     collections::BTreeMap,
@@ -25,6 +26,31 @@ const READY: u16 = 1;
 const START: u16 = 2;
 const DONE: u16 = 3;
 const SEND_COMPLETION_INTERVAL: usize = 100;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UrmaBenchmarkProfile {
+    #[default]
+    Normal,
+    /// Reuse one immutable registered TX address for every logical SEND while
+    /// preserving distinct WR ownership and end-to-end CRC verification.
+    FixedTx,
+    Rx128,
+    FixedTxRx128,
+}
+
+impl UrmaBenchmarkProfile {
+    fn fixed_tx(self) -> bool {
+        matches!(self, Self::FixedTx | Self::FixedTxRx128)
+    }
+
+    fn rx_slots(self) -> usize {
+        if matches!(self, Self::Rx128 | Self::FixedTxRx128) {
+            128
+        } else {
+            512
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub enum UrmaBenchmarkSource {
@@ -211,8 +237,35 @@ pub fn run_urma_parent(
     listen: impl ToSocketAddrs,
     source: UrmaBenchmarkSource,
 ) -> Result<BenchmarkResult> {
+    run_urma_parent_profile(
+        case,
+        device,
+        eid_index,
+        listen,
+        source,
+        UrmaBenchmarkProfile::Normal,
+    )
+}
+
+pub fn run_urma_parent_profile(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    listen: impl ToSocketAddrs,
+    source: UrmaBenchmarkSource,
+    profile: UrmaBenchmarkProfile,
+) -> Result<BenchmarkResult> {
     source.validate(case)?;
-    let runtime_config = benchmark_runtime_config(case, device, eid_index)?;
+    if profile.fixed_tx()
+        && (case.scenario != BenchmarkScenario::Memory
+            || case.transfer_bytes == 0
+            || case.transfer_bytes % case.chunk_size != 0)
+    {
+        return Err(invalid(
+            "fixed-tx profile requires a non-empty, chunk-aligned memory case",
+        ));
+    }
+    let runtime_config = benchmark_runtime_config(case, device, eid_index, profile)?;
     let jetty_config = JettyConfig::default();
     validate_urma_case(
         case,
@@ -243,11 +296,19 @@ pub fn run_urma_parent(
             && *piece_number == case.repeat => {}
         _ => return Err(Error::Protocol("invalid URMA benchmark Request".into())),
     }
+    let fixed_payload = profile
+        .fixed_tx()
+        .then(|| vec![0x5a; case.chunk_size_usize().expect("case validated")]);
+    let expected_crc32 = if let Some(payload) = fixed_payload.as_deref() {
+        repeated_payload_crc32(payload, case.chunk_count()?)
+    } else {
+        source.expected_crc32()
+    };
     let metadata = IntegrationMessageV3::metadata(
         REQUEST_ID,
         0,
         case.transfer_bytes,
-        DigestDescriptor::crc32(source.expected_crc32()),
+        DigestDescriptor::crc32(expected_crc32),
     );
     connection.send_frame(&metadata.encode()?)?;
     connection.drain_completions(TIMEOUT)?;
@@ -261,14 +322,27 @@ pub fn run_urma_parent(
     let mut pipeline = PipelineTracker::new(case.window as usize)?;
     connection
         .configure_send_completion_interval((case.window as usize).min(SEND_COMPLETION_INTERVAL))?;
+    if let Some(payload) = fixed_payload.as_deref() {
+        connection.prepare_aliased_tx(payload)?;
+    }
     let mut bytes_sent = 0u64;
-    let data_messages = send_source(
-        &source,
-        case.chunk_size_usize()?,
-        &mut connection,
-        &mut pipeline,
-        &mut bytes_sent,
-    )?;
+    let data_messages = if let Some(payload) = fixed_payload.as_deref() {
+        send_fixed_payload(
+            payload.len(),
+            case.chunk_count()?,
+            &mut connection,
+            &mut pipeline,
+            &mut bytes_sent,
+        )?
+    } else {
+        send_source(
+            &source,
+            case.chunk_size_usize()?,
+            &mut connection,
+            &mut pipeline,
+            &mut bytes_sent,
+        )?
+    };
     drain_pipeline(&mut connection, &mut pipeline)?;
     let end = IntegrationMessageV3::end(REQUEST_ID, data_messages, case.transfer_bytes);
     connection.send_frame(&end.encode()?)?;
@@ -304,6 +378,9 @@ pub fn run_urma_parent(
     stats.insert_all(&mut result.transport_stats);
     result
         .transport_stats
+        .insert("fixed_tx_profile".into(), u64::from(profile.fixed_tx()));
+    result
+        .transport_stats
         .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);
 
     session.close()?;
@@ -319,8 +396,26 @@ pub fn run_urma_child(
     parent: impl ToSocketAddrs,
     destination: UrmaBenchmarkDestination,
 ) -> Result<BenchmarkResult> {
+    run_urma_child_profile(
+        case,
+        device,
+        eid_index,
+        parent,
+        destination,
+        UrmaBenchmarkProfile::Normal,
+    )
+}
+
+pub fn run_urma_child_profile(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    parent: impl ToSocketAddrs,
+    destination: UrmaBenchmarkDestination,
+    profile: UrmaBenchmarkProfile,
+) -> Result<BenchmarkResult> {
     destination.validate(case)?;
-    let runtime_config = benchmark_runtime_config(case, device, eid_index)?;
+    let runtime_config = benchmark_runtime_config(case, device, eid_index, profile)?;
     let jetty_config = JettyConfig::default();
     validate_urma_case(
         case,
@@ -509,6 +604,48 @@ fn send_source(
         }
     }
     Ok(sequence)
+}
+
+fn repeated_payload_crc32(payload: &[u8], repetitions: u64) -> u32 {
+    let mut hasher = Crc32Hasher::new();
+    for _ in 0..repetitions {
+        hasher.update(payload);
+    }
+    hasher.finalize()
+}
+
+fn send_fixed_payload(
+    payload_len: usize,
+    chunk_count: u64,
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+    bytes_sent: &mut u64,
+) -> Result<u32> {
+    let mut last_progress = Instant::now();
+    let count = u32::try_from(chunk_count)
+        .map_err(|_| Error::Protocol("URMA sequence count exceeds u32".into()))?;
+    for sequence in 0..count {
+        while !pipeline.can_post() {
+            let completed = poll_send_completions(connection, pipeline)?;
+            if completed != 0 {
+                last_progress = Instant::now();
+            } else if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
+                return Err(Error::Timeout {
+                    operation: "URMA fixed TX pipeline capacity",
+                });
+            }
+        }
+        connection.send_prepared_tracked(
+            payload_len,
+            u64::from(sequence),
+            sequence + 1 == count,
+        )?;
+        pipeline.posted()?;
+        *bytes_sent = bytes_sent
+            .checked_add(payload_len as u64)
+            .ok_or_else(|| Error::Protocol("sent byte count overflow".into()))?;
+    }
+    Ok(count)
 }
 
 fn post_data(
@@ -853,9 +990,12 @@ fn benchmark_runtime_config(
     case: &BenchmarkCase,
     device: impl Into<String>,
     eid_index: u32,
+    profile: UrmaBenchmarkProfile,
 ) -> Result<RuntimeConfig> {
     let mut config = RuntimeConfig::new(device, eid_index);
     config.buffer_pool.slot_size = derive_urma_slot_size(case, config.buffer_pool.alignment)?;
+    config.buffer_pool.alias_tx_slots = profile.fixed_tx();
+    config.buffer_pool.rx_slot_count = profile.rx_slots();
     config.buffer_pool.total_len()?;
     Ok(config)
 }

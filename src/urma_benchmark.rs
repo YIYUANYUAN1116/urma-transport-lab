@@ -403,8 +403,8 @@ mod native;
 
 #[cfg(feature = "urma")]
 pub use native::{
-    run_urma_child, run_urma_parent, UrmaBenchmarkDestination, UrmaBenchmarkSource,
-    UrmaTransportStats,
+    run_urma_child, run_urma_child_profile, run_urma_parent, run_urma_parent_profile,
+    UrmaBenchmarkDestination, UrmaBenchmarkProfile, UrmaBenchmarkSource, UrmaTransportStats,
 };
 
 #[cfg(test)]

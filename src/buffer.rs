@@ -6,6 +6,9 @@ pub struct BufferPoolConfig {
     pub tx_slot_count: usize,
     pub rx_slot_count: usize,
     pub alignment: usize,
+    /// Diagnostic/perftest-style layout: logical TX slots share one immutable
+    /// physical range. Normal writes are forbidden once this is enabled.
+    pub alias_tx_slots: bool,
 }
 
 impl Default for BufferPoolConfig {
@@ -15,6 +18,7 @@ impl Default for BufferPoolConfig {
             tx_slot_count: 128,
             rx_slot_count: 512,
             alignment: 4096,
+            alias_tx_slots: false,
         }
     }
 }
@@ -36,8 +40,12 @@ impl BufferPoolConfig {
                 "alignment must be a power of two and at least pointer-sized".into(),
             ));
         }
-        let slots = self
-            .tx_slot_count
+        let physical_tx_slots = if self.alias_tx_slots {
+            1
+        } else {
+            self.tx_slot_count
+        };
+        let slots = physical_tx_slots
             .checked_add(self.rx_slot_count)
             .ok_or_else(|| Error::InvalidConfiguration("slot count overflow".into()))?;
         self.slot_size
@@ -169,10 +177,15 @@ mod native {
                 .checked_add(config.rx_slot_count)
                 .ok_or_else(|| Error::InvalidConfiguration("slot count overflow".into()))?;
             let mut slots = Vec::with_capacity(slot_count);
+            let physical_tx_slots = if config.alias_tx_slots {
+                1
+            } else {
+                config.tx_slot_count
+            };
             for index in 0..config.tx_slot_count {
                 slots.push(BufferSlot {
                     kind: SlotKind::Tx,
-                    offset: slot_offset(&config, index)?,
+                    offset: slot_offset(&config, if config.alias_tx_slots { 0 } else { index })?,
                     len: config.slot_size,
                     state: SlotState::Free,
                 });
@@ -182,7 +195,7 @@ mod native {
                     kind: SlotKind::Rx,
                     offset: slot_offset(
                         &config,
-                        config.tx_slot_count.checked_add(index).ok_or_else(|| {
+                        physical_tx_slots.checked_add(index).ok_or_else(|| {
                             Error::InvalidConfiguration("slot index overflow".into())
                         })?,
                     )?,
@@ -265,6 +278,19 @@ mod native {
         }
 
         pub(crate) fn write_tx(&mut self, id: SlotId, data: &[u8]) -> Result<(u64, u32)> {
+            if self.config.alias_tx_slots
+                && self
+                    .slots
+                    .iter()
+                    .take(self.config.tx_slot_count)
+                    .enumerate()
+                    .any(|(index, slot)| index != id.0 && slot.state != SlotState::Free)
+            {
+                return Err(Error::Protocol(
+                    "aliased TX memory cannot be rewritten while another TX WR is outstanding"
+                        .into(),
+                ));
+            }
             let (offset, capacity, kind, state) = self.slot_fields(id)?;
             if kind != SlotKind::Tx || state != SlotState::Allocated {
                 return Err(Error::InvalidConfiguration(
@@ -285,6 +311,48 @@ mod native {
             let length = u32::try_from(data.len())
                 .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
             Ok((offset, length))
+        }
+
+        pub(crate) fn prepare_aliased_tx(&mut self, data: &[u8]) -> Result<()> {
+            if !self.config.alias_tx_slots || data.is_empty() || data.len() > self.config.slot_size
+            {
+                return Err(Error::InvalidConfiguration(
+                    "aliased TX preparation requires a non-empty payload within slot_size".into(),
+                ));
+            }
+            if self
+                .slots
+                .iter()
+                .take(self.config.tx_slot_count)
+                .any(|slot| slot.state != SlotState::Free)
+            {
+                return Err(Error::Protocol(
+                    "aliased TX payload can only be prepared with no outstanding TX WR".into(),
+                ));
+            }
+            self.segment_handle()?
+                .write(0, data)
+                .map_err(|error| map_ffi_error("prepare_aliased_tx", error))
+        }
+
+        pub(crate) fn aliased_tx_layout(&self, id: SlotId, length: usize) -> Result<(u64, u32)> {
+            let (offset, capacity, kind, state) = self.slot_fields(id)?;
+            if !self.config.alias_tx_slots || kind != SlotKind::Tx || state != SlotState::Allocated
+            {
+                return Err(Error::InvalidConfiguration(
+                    "prepared TX requires an allocated aliased TX slot".into(),
+                ));
+            }
+            if length == 0 || length > capacity {
+                return Err(Error::InvalidConfiguration(
+                    "prepared TX length is outside the slot capacity".into(),
+                ));
+            }
+            Ok((
+                offset as u64,
+                u32::try_from(length)
+                    .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?,
+            ))
         }
 
         pub(crate) fn recv_post_layout(&self, id: SlotId) -> Result<(u64, u32)> {
@@ -476,8 +544,15 @@ mod tests {
             tx_slot_count: 2,
             rx_slot_count: 3,
             alignment: 4096,
+            alias_tx_slots: false,
         };
         assert_eq!(config.total_len(), Ok(5 * 1024));
+
+        let aliased = BufferPoolConfig {
+            alias_tx_slots: true,
+            ..config
+        };
+        assert_eq!(aliased.total_len(), Ok(4 * 1024));
     }
 
     #[test]
@@ -499,6 +574,7 @@ mod tests {
             tx_slot_count: 1,
             rx_slot_count: 1,
             alignment: 4096,
+            alias_tx_slots: false,
         };
         assert!(matches!(
             config.total_len(),
