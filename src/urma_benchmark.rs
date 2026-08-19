@@ -534,6 +534,18 @@ impl UrmaReceiveState {
         payload: &[u8],
         sink: &mut impl BenchmarkSink,
     ) -> Result<()> {
+        let next = self.validate_data(sequence, payload.len())?;
+        sink.write_chunk(payload)?;
+        self.commit_data(next)?;
+        Ok(())
+    }
+
+    pub(crate) fn accept_data_length(&mut self, sequence: u32, length: usize) -> Result<()> {
+        let next = self.validate_data(sequence, length)?;
+        self.commit_data(next)
+    }
+
+    fn validate_data(&self, sequence: u32, length: usize) -> Result<u64> {
         if !self.metadata_seen || self.complete {
             return Err(Error::Protocol(
                 "URMA payload outside receiving phase".into(),
@@ -545,21 +557,24 @@ impl UrmaReceiveState {
                 self.next_sequence
             )));
         }
-        if payload.is_empty() {
+        if length == 0 {
             return Err(Error::Protocol(
                 "URMA Data payload must not be empty".into(),
             ));
         }
         let next = self
             .actual_bytes
-            .checked_add(payload.len() as u64)
+            .checked_add(length as u64)
             .ok_or_else(|| Error::Protocol("URMA received length overflow".into()))?;
         if next > self.expected_bytes {
             return Err(Error::Protocol(
                 "URMA Data exceeds advertised length".into(),
             ));
         }
-        sink.write_chunk(payload)?;
+        Ok(next)
+    }
+
+    fn commit_data(&mut self, next: u64) -> Result<()> {
         self.actual_bytes = next;
         self.next_sequence = self
             .next_sequence

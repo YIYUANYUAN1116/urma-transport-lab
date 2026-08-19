@@ -60,6 +60,14 @@ pub struct PendingWrSnapshot {
     pub state: SlotState,
 }
 
+#[cfg(feature = "urma")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedRecv {
+    pub(crate) sequence: Option<u64>,
+    pub(crate) slot: SlotId,
+    pub(crate) length: u32,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionDiagnostic {
     pub pending: Vec<PendingWrSnapshot>,
@@ -299,6 +307,91 @@ mod native {
             }
             self.record_nonempty(count, previous_poll_started);
             Ok(count)
+        }
+
+        pub(crate) fn poll_recv_leased(
+            &mut self,
+            recv_jfc: &ffi::JfcHandle,
+            pool: &mut UrmaBufferPool,
+        ) -> Result<Vec<CompletedRecv>> {
+            let poll_started = Instant::now();
+            let previous_poll_started = self.last_poll_started.replace(poll_started);
+            self.stats.poll_calls += 1;
+            self.stats.recv_jfc_poll_calls += 1;
+            let mut records = [ffi::CompletionRecord::default(); 16];
+            let count = recv_jfc
+                .poll_into(&mut records[..self.batch])
+                .map_err(|error| map_ffi_error("poll_recv_jfc", error))?;
+            if count == 0 {
+                self.stats.empty_polls += 1;
+                self.empty_streak = self.empty_streak.saturating_add(1);
+                self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
+                std::hint::spin_loop();
+                return Ok(Vec::new());
+            }
+            let mut completed = Vec::with_capacity(count);
+            for record in records.into_iter().take(count) {
+                completed.push(self.route_recv_leased(record, pool)?);
+            }
+            self.record_nonempty(count, previous_poll_started);
+            Ok(completed)
+        }
+
+        fn route_recv_leased(
+            &mut self,
+            record: ffi::CompletionRecord,
+            pool: &mut UrmaBufferPool,
+        ) -> Result<CompletedRecv> {
+            if !record.user_ctx_valid {
+                self.stats.cqe_error += 1;
+                return Err(Error::Completion {
+                    status: record.status,
+                    opcode: record.opcode,
+                    user_ctx: 0,
+                });
+            }
+            let token = WrToken::decode(record.user_ctx)?;
+            if token.connection_id != self.connection_id
+                || token.generation != self.generation
+                || token.operation != OperationType::Recv
+                || !record.is_recv
+                || !record.is_jetty
+            {
+                self.stats.cqe_error += 1;
+                return Err(Error::Protocol(
+                    "leased receive CQE identity/queue flags disagree".into(),
+                ));
+            }
+            let outstanding = self.take_outstanding(record.user_ctx)?;
+            outstanding.handle.complete();
+            self.outstanding_recv -= 1;
+            if let Err(error) =
+                validate_completion_status(record.status, record.opcode, record.user_ctx)
+            {
+                self.stats.cqe_error += 1;
+                pool.complete_error(token.slot, OperationType::Recv)?;
+                pool.release(token.slot)?;
+                return Err(error);
+            }
+            if record.opcode != 0 {
+                self.stats.cqe_error += 1;
+                pool.complete_error(token.slot, OperationType::Recv)?;
+                pool.release(token.slot)?;
+                return Err(Error::Protocol(format!(
+                    "unexpected receive CQE opcode {}",
+                    record.opcode
+                )));
+            }
+            pool.complete_recv_leased(token.slot, record.completion_len)?;
+            self.stats.recv_cqe += 1;
+            if let Some(sequence) = outstanding.sequence {
+                self.last_completed_recv_sequence = Some(sequence);
+            }
+            Ok(CompletedRecv {
+                sequence: outstanding.sequence,
+                slot: token.slot,
+                length: record.completion_len,
+            })
         }
 
         fn route_recv_direct(

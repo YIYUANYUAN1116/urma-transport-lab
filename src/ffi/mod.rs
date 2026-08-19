@@ -504,6 +504,18 @@ impl SegmentHandle {
         let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), length as usize) };
         Ok(read(bytes))
     }
+
+    /// Returns the stable base address of the registered allocation. The
+    /// caller must keep this Segment alive and prevent provider writes to any
+    /// range exposed through the pointer.
+    pub(crate) fn base_ptr(&self) -> Result<NonNull<u8>, FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let mut data = std::ptr::null();
+        // SAFETY: querying one byte at offset zero validates that the Segment
+        // is live and returns the base of its stable backing allocation.
+        status_result(unsafe { sys::urma_lab_segment_get_const(raw.as_ptr(), 0, 1, &mut data) })?;
+        NonNull::new(data.cast_mut()).ok_or(FfiError::NullHandle)
+    }
 }
 
 impl Drop for SegmentHandle {

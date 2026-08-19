@@ -18,9 +18,10 @@ pub enum ConnectionState {
 mod native {
     use super::*;
     use crate::{
+        buffer::RegisteredRxWindowLease,
         buffer::UrmaBufferPool,
         completion::{
-            check_deadline, deadline_after, CompletionDiagnostic, CompletionEvent,
+            check_deadline, deadline_after, CompletedRecv, CompletionDiagnostic, CompletionEvent,
             CompletionPoller, CompletionStats,
         },
         ffi,
@@ -315,6 +316,42 @@ mod native {
                 self.receive_credit.completed();
             }
             Ok(count)
+        }
+
+        pub(crate) fn poll_recv_leased(&mut self) -> Result<Vec<CompletedRecv>> {
+            self.require(ConnectionState::Ready)?;
+            let completed = match self
+                .poller
+                .poll_recv_leased(self.recv_jfc, self.buffer_pool)
+            {
+                Ok(completed) => completed,
+                Err(error) => {
+                    self.fail();
+                    return Err(error);
+                }
+            };
+            for _ in 0..completed.len() {
+                self.receive_credit.completed();
+            }
+            Ok(completed)
+        }
+
+        pub(crate) fn lease_completed_recvs(
+            &mut self,
+            completed: &[CompletedRecv],
+        ) -> Result<RegisteredRxWindowLease> {
+            let records = completed
+                .iter()
+                .map(|completion| (completion.slot, completion.sequence, completion.length))
+                .collect::<Vec<_>>();
+            self.buffer_pool.lease_completed_recv_window(&records)
+        }
+
+        pub(crate) fn recycle_recv_lease(
+            &mut self,
+            lease: RegisteredRxWindowLease,
+        ) -> Result<usize> {
+            self.buffer_pool.recycle_recv_lease(lease)
         }
 
         pub fn wait_for_message(&mut self, timeout: Duration) -> Result<Message> {

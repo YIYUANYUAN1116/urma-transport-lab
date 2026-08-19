@@ -124,6 +124,82 @@ struct BufferSlot {
 mod native {
     use super::*;
     use crate::ffi;
+    use std::{
+        ptr::NonNull,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) struct RegisteredRxChunk {
+        pub(crate) sequence: Option<u64>,
+        pub(crate) length: usize,
+    }
+
+    /// Read-only ownership of a contiguous completed RX window. The Segment
+    /// handle stays on the transport thread; only this stable memory view may
+    /// cross threads. Slots remain `Leased` until the transport consumes this
+    /// value in `recycle_recv_lease`.
+    pub(crate) struct RegisteredRxWindowLease {
+        data: NonNull<u8>,
+        length: usize,
+        chunks: Vec<RegisteredRxChunk>,
+        slots: Vec<SlotId>,
+        tracker: Arc<AtomicUsize>,
+        #[cfg(test)]
+        _owned_test_bytes: Option<Box<[u8]>>,
+    }
+
+    // SAFETY: construction requires a successful CQE for every covered slot,
+    // changes those slots to Leased, and the only public memory access is
+    // shared. The slots cannot be reposted until this value is consumed by the
+    // owning UrmaBufferPool. Pool close refuses to free an active lease.
+    unsafe impl Send for RegisteredRxWindowLease {}
+    // SAFETY: bytes() returns shared immutable access only. Concurrent CRC and
+    // pwrite readers cannot mutate the registered range.
+    unsafe impl Sync for RegisteredRxWindowLease {}
+
+    impl RegisteredRxWindowLease {
+        pub(crate) fn bytes(&self) -> &[u8] {
+            // SAFETY: `data..data+length` was validated against the live
+            // Segment during construction and remains leased from repost.
+            unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.length) }
+        }
+
+        pub(crate) fn chunks(&self) -> &[RegisteredRxChunk] {
+            &self.chunks
+        }
+
+        pub(crate) fn len(&self) -> usize {
+            self.length
+        }
+
+        #[cfg(test)]
+        pub(crate) fn from_test_bytes(bytes: Vec<u8>, chunks: Vec<(Option<u64>, usize)>) -> Self {
+            let owned = bytes.into_boxed_slice();
+            let data = NonNull::new(owned.as_ptr().cast_mut()).expect("test bytes are non-empty");
+            Self {
+                data,
+                length: owned.len(),
+                chunks: chunks
+                    .into_iter()
+                    .map(|(sequence, length)| RegisteredRxChunk { sequence, length })
+                    .collect(),
+                slots: Vec::new(),
+                tracker: Arc::new(AtomicUsize::new(1)),
+                _owned_test_bytes: Some(owned),
+            }
+        }
+    }
+
+    impl Drop for RegisteredRxWindowLease {
+        fn drop(&mut self) {
+            let previous = self.tracker.fetch_sub(1, Ordering::AcqRel);
+            debug_assert_ne!(previous, 0, "RX lease tracker underflow");
+        }
+    }
 
     /// RAII owner of one local-only registered Segment and its backing memory.
     pub(crate) struct UrmaRegisteredSegment {
@@ -163,6 +239,7 @@ mod native {
         free_tx: Vec<usize>,
         free_rx: Vec<usize>,
         accepting: bool,
+        active_rx_leases: Arc<AtomicUsize>,
     }
 
     impl UrmaBufferPool {
@@ -212,6 +289,7 @@ mod native {
                 free_tx,
                 free_rx,
                 accepting: true,
+                active_rx_leases: Arc::new(AtomicUsize::new(0)),
             })
         }
 
@@ -469,6 +547,127 @@ mod native {
             consumed
         }
 
+        pub(crate) fn complete_recv_leased(&mut self, id: SlotId, length: u32) -> Result<()> {
+            let (_, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Rx || state != SlotState::PostedRecv {
+                return Err(Error::Protocol(
+                    "RECV CQE does not match a posted RX slot".into(),
+                ));
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
+            if length == 0 || length > capacity {
+                return Err(Error::Protocol(format!(
+                    "RECV completion length {length} is outside 1..={capacity}"
+                )));
+            }
+            self.transition(id, SlotState::PostedRecv, SlotState::RecvCompleted)
+        }
+
+        pub(crate) fn lease_completed_recv_window(
+            &mut self,
+            completions: &[(SlotId, Option<u64>, u32)],
+        ) -> Result<RegisteredRxWindowLease> {
+            if completions.is_empty() {
+                return Err(Error::InvalidConfiguration(
+                    "RX lease requires at least one completion".into(),
+                ));
+            }
+            let mut slots = Vec::with_capacity(completions.len());
+            let mut chunks = Vec::with_capacity(completions.len());
+            let mut start = None;
+            let mut expected_offset = 0usize;
+            let mut total = 0usize;
+            for (index, &(slot, sequence, length)) in completions.iter().enumerate() {
+                let (offset, capacity, kind, state) = self.slot_fields(slot)?;
+                if kind != SlotKind::Rx || state != SlotState::RecvCompleted {
+                    return Err(Error::Protocol(
+                        "RX lease requires completed receive slots".into(),
+                    ));
+                }
+                let length = usize::try_from(length)
+                    .map_err(|_| Error::Protocol("completion length exceeds usize".into()))?;
+                if length == 0 || length > capacity {
+                    return Err(Error::Protocol("invalid RX lease chunk length".into()));
+                }
+                if index + 1 != completions.len() && length != capacity {
+                    return Err(Error::Protocol(
+                        "only the final RX lease chunk may be short".into(),
+                    ));
+                }
+                if start.is_some() {
+                    if offset != expected_offset {
+                        return Err(Error::Protocol(
+                            "RX lease slots are not contiguous in receive order".into(),
+                        ));
+                    }
+                } else {
+                    start = Some(offset);
+                }
+                expected_offset = offset
+                    .checked_add(capacity)
+                    .ok_or_else(|| Error::Protocol("RX lease offset overflow".into()))?;
+                total = total
+                    .checked_add(length)
+                    .ok_or_else(|| Error::Protocol("RX lease length overflow".into()))?;
+                slots.push(slot);
+                chunks.push(RegisteredRxChunk { sequence, length });
+            }
+            let base = self
+                .segment_handle()?
+                .base_ptr()
+                .map_err(|error| map_ffi_error("borrow_rx_window", error))?;
+            let start = start.expect("non-empty completions set start");
+            let end = start
+                .checked_add(total)
+                .ok_or_else(|| Error::Protocol("RX lease address overflow".into()))?;
+            if end > self.registered_len() {
+                return Err(Error::Protocol(
+                    "RX lease exceeds registered Segment".into(),
+                ));
+            }
+            // SAFETY: every slot range was validated against Segment metadata,
+            // and their checked contiguity proves this starting address.
+            let data = unsafe { NonNull::new_unchecked(base.as_ptr().add(start)) };
+            for &slot in &slots {
+                self.transition(slot, SlotState::RecvCompleted, SlotState::Leased)?;
+            }
+            self.active_rx_leases.fetch_add(1, Ordering::AcqRel);
+            Ok(RegisteredRxWindowLease {
+                data,
+                length: total,
+                chunks,
+                slots,
+                tracker: self.active_rx_leases.clone(),
+                #[cfg(test)]
+                _owned_test_bytes: None,
+            })
+        }
+
+        pub(crate) fn recycle_recv_lease(
+            &mut self,
+            lease: RegisteredRxWindowLease,
+        ) -> Result<usize> {
+            if !Arc::ptr_eq(&lease.tracker, &self.active_rx_leases) {
+                return Err(Error::Protocol("RX lease belongs to another pool".into()));
+            }
+            for &slot in &lease.slots {
+                let (_, _, kind, state) = self.slot_fields(slot)?;
+                if kind != SlotKind::Rx || state != SlotState::Leased {
+                    return Err(Error::Protocol("RX lease slot state mismatch".into()));
+                }
+            }
+            // Push in reverse so the stack allocator reposts the same physical
+            // window in ascending address/receive order.
+            for &slot in lease.slots.iter().rev() {
+                self.transition(slot, SlotState::Leased, SlotState::RecvCompleted)?;
+                self.release(slot)?;
+            }
+            let count = lease.slots.len();
+            drop(lease);
+            Ok(count)
+        }
+
         fn slot_fields(&self, id: SlotId) -> Result<(usize, usize, SlotKind, SlotState)> {
             self.slots
                 .get(id.0)
@@ -497,6 +696,12 @@ mod native {
 
         pub(crate) fn close(&mut self) -> Result<()> {
             self.stop();
+            let active = self.active_rx_leases.load(Ordering::Acquire);
+            if active != 0 {
+                return Err(Error::InvalidConfiguration(format!(
+                    "cannot close registered Segment with {active} active RX leases"
+                )));
+            }
             let Some(mut segment) = self.segment.take() else {
                 return Ok(());
             };
@@ -511,6 +716,19 @@ mod native {
             self.segment
                 .as_ref()
                 .map_or(self.config.alignment, |segment| segment.alignment)
+        }
+    }
+
+    impl Drop for UrmaBufferPool {
+        fn drop(&mut self) {
+            if self.active_rx_leases.load(Ordering::Acquire) != 0 {
+                // An application violated the required shutdown order. Leak
+                // the registration rather than free memory still readable by
+                // another thread.
+                if let Some(segment) = self.segment.take() {
+                    std::mem::forget(segment);
+                }
+            }
         }
     }
 
@@ -530,6 +748,8 @@ mod native {
     }
 }
 
+#[cfg(feature = "urma")]
+pub(crate) use native::RegisteredRxWindowLease;
 #[cfg(feature = "urma")]
 pub use native::UrmaBufferPool;
 

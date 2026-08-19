@@ -151,3 +151,31 @@ M3 Ping/Pong 兼容模式：
 协议边界、owned chunk 生命周期、流式落盘、sequence/length/digest 状态机和真实 provider 验收脚本已经具备，且与 Dragonfly 当前按 chunk 消费并校验后落盘的边界兼容。因此代码层面可以开始设计 integration adapter。
 
 在将 M4 标记为“真实 UB 完成”或以它作为 integration 的硬件基线前，仍必须在目标 `udmac0d1e2` 环境确认：16 MiB 单次、连续 10 次、JSON/CQE 日志、digest/length 以及无资源释放异常全部通过。
+
+## 2026-08-19：benchmark registered RX window fast path
+
+后续性能实验已在 `benchmark --transport urma` 路径加入 Dragonfly 候选 RDMA
+实现风格的 registered RX window lease。此项不改变上述历史 M4 CLI 协议状态。
+
+当前 benchmark Child 数据路径为：
+
+```text
+RECV CQE
+-> slot 保持 RecvCompleted
+-> 连续 slot 聚合为只读 RegisteredRxWindowLease
+-> sink worker 原地 CRC32
+-> file 场景同时从相同 registered window 执行 positional write
+-> worker 返回 lease
+-> transport 将 slot 归还并 repost
+-> 仅在 repost 成功后返回 remote credit
+```
+
+生命周期约束：
+
+- `SegmentHandle`、BufferPool 和 provider 对象不跨线程；跨线程对象只有只读内存视图和 lease 元数据。
+- lease 存活期间 slot 状态为 `Leased`，不能重新 post。
+- BufferPool 在仍有 active lease 时拒绝注销 Segment；异常析构宁可泄漏注册内存，也不提前释放形成 UAF。
+- sink pipeline 在 connection/runtime shutdown 前关闭 channel、等待 worker，并回收成功返回的 lease。
+- RX window chunk 数必须整除物理 RX slot 数；非整除的 application window 自动降到不大于它的最大整除值，避免 RQ 环回后形成非连续 window。
+
+本地验证：feature-on 完整单元测试通过；包括 registered window 顺序与 CRC、worker 错误传播、window/RQ 分区，以及 direct positional write 完整性。真实 UB provider 性能与 shutdown 行为仍待目标机器验证，不能标记为硬件通过。
