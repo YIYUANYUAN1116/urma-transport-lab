@@ -220,8 +220,9 @@ struct WindowOutcome {
 }
 
 /// Hashes independent registered windows on multiple workers. Window digests
-/// may complete out of order, but are combined in wire order. A lease is
-/// returned to the transport only after its CRC and optional pwrite complete.
+/// may complete out of order, but both digest combination and lease retirement
+/// happen in wire order. In-order retirement is required because the RX pool
+/// reuses each returned contiguous slot run as a future registered window.
 struct SinkPipeline {
     sink: WindowSink,
     commands: Vec<Sender<WindowJob>>,
@@ -232,7 +233,7 @@ struct SinkPipeline {
     next_order: u64,
     next_combine: u64,
     outstanding: usize,
-    pending: BTreeMap<u64, (usize, Crc32Hasher)>,
+    pending: BTreeMap<u64, WindowOutcome>,
     combined: Crc32Hasher,
     actual_bytes: u64,
     recycled: Vec<RegisteredRxWindowLease>,
@@ -359,26 +360,25 @@ impl SinkPipeline {
 
     fn accept_outcome(&mut self, outcome: WindowOutcome) {
         self.outstanding = self.outstanding.saturating_sub(1);
-        match outcome.digest {
-            Ok(digest) => {
-                if self
-                    .pending
-                    .insert(outcome.order, (outcome.length, digest))
-                    .is_some()
-                    && self.failure.is_none()
-                {
-                    self.failure = Some(Error::Protocol("duplicate CRC window result".into()));
-                }
-                while let Some((length, digest)) = self.pending.remove(&self.next_combine) {
-                    self.combined.combine(&digest);
-                    self.actual_bytes = self.actual_bytes.saturating_add(length as u64);
-                    self.next_combine = self.next_combine.saturating_add(1);
-                }
-            }
-            Err(error) if self.failure.is_none() => self.failure = Some(error),
-            Err(_) => {}
+        if self.pending.insert(outcome.order, outcome).is_some() && self.failure.is_none() {
+            self.failure = Some(Error::Protocol("duplicate CRC window result".into()));
         }
-        self.recycled.push(outcome.window);
+        while let Some(outcome) = self.pending.remove(&self.next_combine) {
+            match outcome.digest {
+                Ok(digest) => {
+                    self.combined.combine(&digest);
+                    self.actual_bytes = self.actual_bytes.saturating_add(outcome.length as u64);
+                }
+                Err(error) if self.failure.is_none() => self.failure = Some(error),
+                Err(_) => {}
+            }
+            // Do not recycle a later physical slot run ahead of an earlier
+            // one. Otherwise FIFO RX allocation preserves the worker finish
+            // order rather than receive order and the next window can span
+            // unrelated registered ranges.
+            self.recycled.push(outcome.window);
+            self.next_combine = self.next_combine.saturating_add(1);
+        }
     }
 
     fn join_workers(&mut self) -> Result<()> {
@@ -1978,6 +1978,37 @@ mod tests {
         let (integrity, recycled) = pipeline.finish().unwrap();
         assert!(integrity.is_ok());
         assert_eq!(recycled.len(), 2);
+    }
+
+    #[test]
+    fn out_of_order_worker_results_retire_leases_in_wire_order() {
+        let sink = WindowSink::memory(2, crate::crc32_bytes(b"ab"));
+        let mut pipeline = SinkPipeline::start(sink, 2, true).unwrap();
+
+        let outcome = |order, sequence, byte| {
+            let mut digest = Crc32Hasher::new();
+            digest.update(&[byte]);
+            WindowOutcome {
+                order,
+                length: 1,
+                digest: Ok(digest),
+                window: RegisteredRxWindowLease::from_test_bytes(
+                    vec![byte],
+                    vec![(Some(sequence), 1)],
+                ),
+            }
+        };
+
+        pipeline.accept_outcome(outcome(1, 1, b'b'));
+        assert!(pipeline.recycled.is_empty());
+        pipeline.accept_outcome(outcome(0, 0, b'a'));
+
+        let retired_sequences = pipeline
+            .recycled
+            .iter()
+            .map(|window| window.chunks()[0].sequence.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(retired_sequences, vec![0, 1]);
     }
 
     #[test]
