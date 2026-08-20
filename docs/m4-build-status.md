@@ -207,3 +207,5 @@ total_registered_bytes
 后续真实 provider 已验证 normal verified profile：2 GiB、64 KiB chunk、window 128、8 个 CRC worker 达到 6938.63 MiB/s；transport-only 达到 7042.09 MiB/s；fixed-TX 达到 15224.02 MiB/s。三者 length/CRC32 均通过。详细复盘见 `docs/b3.2-urma-performance-optimization-summary-2026-08-19.md`。
 
 2026-08-20 新增 `fixed-tx-transport-only` 组合 profile，用于同时把 Parent TX payload 构造和 Child CRC 移出 transport sample；READY 交换 profile ID 并拒绝两端配置不一致。该组合 profile 已通过本地 feature-on 单元测试和 release build，尚未经过真实 provider 验证。跨节点 64-byte SEND 同时在 demo 和官方 `urma_perftest` 报 `CR status 2`，因此跨节点 UB 环境仍未验证通过。
+
+同日进一步移除fixed-TX的O(transfer bytes)初始化：Parent使用只保存逻辑长度的虚拟memory source，不再生成完整测试`Vec`；固定payload expected CRC使用二进制CRC combine，由O(transfer bytes)降为O(chunk size + log chunk count)。steady-state数据路径与完整性语义不变。本地14项fast-path单元测试和release build通过，真实provider复测待完成。

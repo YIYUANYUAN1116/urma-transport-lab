@@ -124,6 +124,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let result = match role {
             Role::Parent => {
                 let source = match case.scenario {
+                    BenchmarkScenario::Memory if profile.uses_fixed_tx() => {
+                        UrmaBenchmarkSource::fixed_memory(case.transfer_bytes)
+                    }
                     BenchmarkScenario::Memory => UrmaBenchmarkSource::Memory(
                         MemorySource::generate(case.transfer_bytes, case.data_seed)?,
                     ),

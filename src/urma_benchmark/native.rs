@@ -78,7 +78,7 @@ impl UrmaBenchmarkProfile {
         }
     }
 
-    fn fixed_tx(self) -> bool {
+    pub fn uses_fixed_tx(self) -> bool {
         matches!(
             self,
             Self::FixedTx | Self::FixedTxRx128 | Self::FixedTxTransportOnly
@@ -116,13 +116,23 @@ impl UrmaBenchmarkProfile {
 #[derive(Clone, Debug)]
 pub enum UrmaBenchmarkSource {
     Memory(MemorySource),
+    /// Logical memory source for fixed-TX diagnostics. The data plane supplies
+    /// one immutable registered chunk, so the full transfer is not materialized.
+    FixedMemory {
+        length: u64,
+    },
     File(FileSource),
 }
 
 impl UrmaBenchmarkSource {
+    pub fn fixed_memory(length: u64) -> Self {
+        Self::FixedMemory { length }
+    }
+
     fn validate(&self, case: &BenchmarkCase) -> Result<()> {
         let (scenario, length) = match self {
             Self::Memory(source) => (BenchmarkScenario::Memory, source.length()),
+            Self::FixedMemory { length } => (BenchmarkScenario::Memory, *length),
             Self::File(source) => (BenchmarkScenario::File, source.length()),
         };
         if scenario != case.scenario || length != case.transfer_bytes {
@@ -131,10 +141,13 @@ impl UrmaBenchmarkSource {
         Ok(())
     }
 
-    fn expected_crc32(&self) -> u32 {
+    fn expected_crc32(&self) -> Result<u32> {
         match self {
-            Self::Memory(source) => source.expected_crc32(),
-            Self::File(source) => source.expected_crc32(),
+            Self::Memory(source) => Ok(source.expected_crc32()),
+            Self::FixedMemory { .. } => Err(invalid(
+                "fixed memory source CRC must come from the fixed registered payload",
+            )),
+            Self::File(source) => Ok(source.expected_crc32()),
         }
     }
 }
@@ -673,13 +686,18 @@ pub fn run_urma_parent_profile(
     profile: UrmaBenchmarkProfile,
 ) -> Result<BenchmarkResult> {
     source.validate(case)?;
-    if profile.fixed_tx()
+    if profile.uses_fixed_tx()
         && (case.scenario != BenchmarkScenario::Memory
             || case.transfer_bytes == 0
             || case.transfer_bytes % case.chunk_size != 0)
     {
         return Err(invalid(
             "fixed-tx profile requires a non-empty, chunk-aligned memory case",
+        ));
+    }
+    if matches!(source, UrmaBenchmarkSource::FixedMemory { .. }) && !profile.uses_fixed_tx() {
+        return Err(invalid(
+            "fixed memory source requires a fixed-tx benchmark profile",
         ));
     }
     let runtime_config = benchmark_runtime_config(case, device, eid_index, profile, false)?;
@@ -716,12 +734,12 @@ pub fn run_urma_parent_profile(
         _ => return Err(Error::Protocol("invalid URMA benchmark Request".into())),
     }
     let fixed_payload = profile
-        .fixed_tx()
+        .uses_fixed_tx()
         .then(|| vec![0x5a; case.chunk_size_usize().expect("case validated")]);
     let expected_crc32 = if let Some(payload) = fixed_payload.as_deref() {
         repeated_payload_crc32(payload, case.chunk_count()?)
     } else {
-        source.expected_crc32()
+        source.expected_crc32()?
     };
     let metadata = IntegrationMessageV3::metadata(
         REQUEST_ID,
@@ -810,9 +828,10 @@ pub fn run_urma_parent_profile(
     result.child_cpu = Some(done.child_cpu);
     stats.insert_all(&mut result.transport_stats);
     insert_remote_credit_stats(&mut result, &remote_credit);
-    result
-        .transport_stats
-        .insert("fixed_tx_profile".into(), u64::from(profile.fixed_tx()));
+    result.transport_stats.insert(
+        "fixed_tx_profile".into(),
+        u64::from(profile.uses_fixed_tx()),
+    );
     result
         .transport_stats
         .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);
@@ -1181,6 +1200,11 @@ fn send_source(
     let mut sequence = 0u32;
     let chunk_count = match source {
         UrmaBenchmarkSource::Memory(source) => source.length().div_ceil(chunk_size as u64),
+        UrmaBenchmarkSource::FixedMemory { .. } => {
+            return Err(invalid(
+                "fixed memory source cannot use the materialized source send path",
+            ));
+        }
         UrmaBenchmarkSource::File(source) => source.length().div_ceil(chunk_size as u64),
     };
     match source {
@@ -1202,6 +1226,7 @@ fn send_source(
                     .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
             }
         }
+        UrmaBenchmarkSource::FixedMemory { .. } => unreachable!("rejected above"),
         UrmaBenchmarkSource::File(source) => {
             let mut file = source.open()?;
             let mut buffer = vec![0u8; chunk_size];
@@ -1231,11 +1256,21 @@ fn send_source(
 }
 
 fn repeated_payload_crc32(payload: &[u8], repetitions: u64) -> u32 {
-    let mut hasher = Crc32Hasher::new();
-    for _ in 0..repetitions {
-        hasher.update(payload);
+    let mut combined = Crc32Hasher::new();
+    let mut repeated_block = Crc32Hasher::new();
+    repeated_block.update(payload);
+    let mut remaining = repetitions;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            combined.combine(&repeated_block);
+        }
+        remaining >>= 1;
+        if remaining != 0 {
+            let block = repeated_block.clone();
+            repeated_block.combine(&block);
+        }
     }
-    hasher.finalize()
+    combined.finalize()
 }
 
 fn send_fixed_payload(
@@ -1629,7 +1664,7 @@ fn benchmark_runtime_config(
 ) -> Result<RuntimeConfig> {
     let mut config = RuntimeConfig::new(device, eid_index);
     config.buffer_pool.slot_size = derive_urma_slot_size(case, config.buffer_pool.alignment)?;
-    config.buffer_pool.alias_tx_slots = profile.fixed_tx();
+    config.buffer_pool.alias_tx_slots = profile.uses_fixed_tx();
     config.buffer_pool.rx_slot_count = profile.rx_slots(case, child)?;
     config.buffer_pool.total_len()?;
     Ok(config)
@@ -2026,7 +2061,7 @@ mod tests {
                 .unwrap(),
             32_769
         );
-        assert!(UrmaBenchmarkProfile::FixedTxTransportOnly.fixed_tx());
+        assert!(UrmaBenchmarkProfile::FixedTxTransportOnly.uses_fixed_tx());
         assert!(UrmaBenchmarkProfile::FixedTxTransportOnly.transport_only());
     }
 
@@ -2038,6 +2073,30 @@ mod tests {
         assert!(select_crc_worker_count(256, Some(25), 25).is_err());
         assert!(select_crc_worker_count(256, Some(33), 64).is_err());
         assert!(select_crc_worker_count(256, Some(0), 64).is_err());
+    }
+
+    #[test]
+    fn fixed_memory_source_is_virtual_and_matches_case_length() {
+        let case = memory_case(8 * 1024 * 1024 * 1024, 64);
+        let source = UrmaBenchmarkSource::fixed_memory(case.transfer_bytes);
+        assert!(source.validate(&case).is_ok());
+        assert!(source.expected_crc32().is_err());
+    }
+
+    #[test]
+    fn repeated_payload_crc_combine_matches_linear_hashing() {
+        let payload = b"fixed-payload";
+        for repetitions in [0, 1, 2, 3, 7, 32, 255, 1024] {
+            let mut linear = Crc32Hasher::new();
+            for _ in 0..repetitions {
+                linear.update(payload);
+            }
+            assert_eq!(
+                repeated_payload_crc32(payload, repetitions),
+                linear.finalize(),
+                "repetitions={repetitions}"
+            );
+        }
     }
 
     #[test]
