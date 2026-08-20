@@ -37,6 +37,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut device = String::from("urma0");
     let mut eid_index = 0u32;
     let mut urma_profile = String::from("normal");
+    let mut crc_workers: Option<usize> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -78,6 +79,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--device" => device = required_value(&mut args, "--device")?,
             "--eid-index" => eid_index = parse_value(&mut args, "--eid-index")?,
             "--urma-profile" => urma_profile = required_value(&mut args, "--urma-profile")?,
+            "--crc-workers" => crc_workers = Some(parse_value(&mut args, "--crc-workers")?),
             "--help" | "-h" => {
                 print_usage();
                 return Ok(());
@@ -107,8 +109,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "urma")]
     if case.transport == BenchmarkTransport::Urma {
         use urma_transport_lab::{
-            run_urma_child_profile, run_urma_parent_profile, UrmaBenchmarkDestination,
-            UrmaBenchmarkProfile, UrmaBenchmarkSource,
+            run_urma_child_profile_with_crc_workers, run_urma_parent_profile,
+            UrmaBenchmarkDestination, UrmaBenchmarkProfile, UrmaBenchmarkSource,
         };
         let profile = match urma_profile.as_str() {
             "normal" => UrmaBenchmarkProfile::Normal,
@@ -116,6 +118,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "rx128" => UrmaBenchmarkProfile::Rx128,
             "fixed-tx-rx128" => UrmaBenchmarkProfile::FixedTxRx128,
             "transport-only" => UrmaBenchmarkProfile::TransportOnly,
+            "fixed-tx-transport-only" => UrmaBenchmarkProfile::FixedTxTransportOnly,
             value => return Err(format!("invalid --urma-profile {value:?}").into()),
         };
         let result = match role {
@@ -139,7 +142,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 };
                 eprintln!("benchmark URMA child: connecting to {parent}");
-                run_urma_child_profile(&case, device, eid_index, &parent, destination, profile)?
+                run_urma_child_profile_with_crc_workers(
+                    &case,
+                    device,
+                    eid_index,
+                    &parent,
+                    destination,
+                    profile,
+                    crc_workers,
+                )?
             }
         };
         println!("{}", result.to_json_line());
@@ -150,7 +161,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("URMA benchmark requires --features urma".into());
     }
     #[cfg(not(feature = "urma"))]
-    let _ = (&device, eid_index);
+    let _ = (&device, eid_index, &urma_profile, crc_workers);
 
     let result = match role {
         Role::Parent => {
@@ -231,7 +242,9 @@ fn print_usage() {
            --output PATH                 required for file Child\n\
            --device NAME                 URMA device, default: urma0\n\
            --eid-index N                 URMA EID index, default: 0\n\
-           --urma-profile normal|fixed-tx|rx128|fixed-tx-rx128|transport-only\n\
-                                         URMA diagnostic profile, default: normal"
+           --urma-profile normal|fixed-tx|rx128|fixed-tx-rx128|transport-only|fixed-tx-transport-only\n\
+                                         URMA diagnostic profile, default: normal\n\
+           --crc-workers N               Child CRC workers, default: affinity CPUs minus one,\n\
+                                         maximum: 32"
     );
 }

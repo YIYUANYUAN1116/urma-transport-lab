@@ -58,8 +58,9 @@ pub use urma_benchmark::{
 };
 #[cfg(feature = "urma")]
 pub use urma_benchmark::{
-    run_urma_child, run_urma_child_profile, run_urma_parent, run_urma_parent_profile,
-    UrmaBenchmarkDestination, UrmaBenchmarkProfile, UrmaBenchmarkSource, UrmaTransportStats,
+    run_urma_child, run_urma_child_profile, run_urma_child_profile_with_crc_workers,
+    run_urma_parent, run_urma_parent_profile, UrmaBenchmarkDestination, UrmaBenchmarkProfile,
+    UrmaBenchmarkSource, UrmaTransportStats,
 };
 
 /// Phase 0 roadmap markers. M2 control-plane variants are now implemented;

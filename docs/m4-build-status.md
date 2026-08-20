@@ -184,8 +184,8 @@ RECV CQE
 
 benchmark fast path 继续加入以下实验性优化：
 
-- verified 模式把 Child RX backing 扩为 16 个 application window，同时保持 provider JFR credit depth 为 512；
-- completed window 分派到多个 CRC worker，worker 数按 CPU affinity 自动选择，预留一个 polling CPU，最大为 8；
+- verified 模式把 Child RX backing 扩为 32 个 application window，同时保持 provider JFR credit depth 为 512；
+- completed window 分派到多个 CRC worker，worker 数按 CPU affinity 自动选择，预留一个 polling CPU，最大为 32，也可通过 `--crc-workers N` 显式设置；
 - 每个 window 独立计算 CRC32，完成结果可以乱序返回，但使用 `crc32fast::Hasher::combine` 按 wire order 合并；
 - file 模式的 positional write 与该 window 的 CRC 仍并发执行，不提前复用 lease；
 - RX free list 改为 FIFO，使新的 backing 先于已回收 backing 使用；正确性不再依赖回收后形成连续物理地址；
@@ -204,4 +204,6 @@ total_registered_bytes
 
 本地测试验证并行 CRC combine、乱序 worker 结果的有序合并与 lease retirement、scatter span CRC、direct pwrite、profile RX sizing 和生命周期。
 
-后续真实 provider 已验证 normal verified profile：2 GiB、64 KiB chunk、window 128、8 个 CRC worker 达到 6938.63 MiB/s，length/CRC32 均通过，`rx_bounce_copy=0`。详细复盘见 `docs/b3.2-urma-performance-optimization-summary-2026-08-19.md`。transport-only profile 仍未获得真实 provider 性能数据；跨节点 64-byte SEND 同时在 demo 和官方 `urma_perftest` 报 `CR status 2`，因此跨节点 UB 环境仍未验证通过。
+后续真实 provider 已验证 normal verified profile：2 GiB、64 KiB chunk、window 128、8 个 CRC worker 达到 6938.63 MiB/s；transport-only 达到 7042.09 MiB/s；fixed-TX 达到 15224.02 MiB/s。三者 length/CRC32 均通过。详细复盘见 `docs/b3.2-urma-performance-optimization-summary-2026-08-19.md`。
+
+2026-08-20 新增 `fixed-tx-transport-only` 组合 profile，用于同时把 Parent TX payload 构造和 Child CRC 移出 transport sample；READY 交换 profile ID 并拒绝两端配置不一致。该组合 profile 已通过本地 feature-on 单元测试和 release build，尚未经过真实 provider 验证。跨节点 64-byte SEND 同时在 demo 和官方 `urma_perftest` 报 `CR status 2`，因此跨节点 UB 环境仍未验证通过。

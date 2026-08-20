@@ -34,8 +34,8 @@ const START: u16 = 2;
 const DONE: u16 = 3;
 const CREDIT: u16 = 4;
 const SEND_COMPLETION_INTERVAL: usize = 100;
-const VERIFIED_RX_POOL_WINDOWS: usize = 16;
-const MAX_CRC_WORKERS: usize = 8;
+const VERIFIED_RX_POOL_WINDOWS: usize = 32;
+const MAX_CRC_WORKERS: usize = 32;
 
 fn registered_rx_window_chunks(application_window: usize, rx_slots: usize) -> Result<usize> {
     let upper = application_window.min(rx_slots);
@@ -61,15 +61,32 @@ pub enum UrmaBenchmarkProfile {
     /// Time the data plane independently, but retain every registered receive
     /// window until its full CRC has been computed after the transport sample.
     TransportOnly,
+    /// Combine immutable registered TX reuse with deferred verification and
+    /// full-payload registered RX backing.
+    FixedTxTransportOnly,
 }
 
 impl UrmaBenchmarkProfile {
+    fn wire_id(self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::FixedTx => 1,
+            Self::Rx128 => 2,
+            Self::FixedTxRx128 => 3,
+            Self::TransportOnly => 4,
+            Self::FixedTxTransportOnly => 5,
+        }
+    }
+
     fn fixed_tx(self) -> bool {
-        matches!(self, Self::FixedTx | Self::FixedTxRx128)
+        matches!(
+            self,
+            Self::FixedTx | Self::FixedTxRx128 | Self::FixedTxTransportOnly
+        )
     }
 
     fn transport_only(self) -> bool {
-        self == Self::TransportOnly
+        matches!(self, Self::TransportOnly | Self::FixedTxTransportOnly)
     }
 
     fn rx_slots(self, case: &BenchmarkCase, child: bool) -> Result<usize> {
@@ -507,13 +524,35 @@ fn validate_registered_window_layout(window: &RegisteredRxWindowLease) -> Result
     Ok(())
 }
 
-fn crc_worker_count(window_count: usize) -> usize {
-    thread::available_parallelism()
-        .map_or(1, usize::from)
-        .saturating_sub(1)
-        .max(1)
+fn crc_worker_count(window_count: usize, requested: Option<usize>) -> Result<usize> {
+    let available = thread::available_parallelism().map_or(1, usize::from);
+    select_crc_worker_count(window_count, requested, available)
+}
+
+fn select_crc_worker_count(
+    window_count: usize,
+    requested: Option<usize>,
+    available_cpus: usize,
+) -> Result<usize> {
+    let affinity_budget = available_cpus.saturating_sub(1).max(1);
+    let maximum = affinity_budget
         .min(MAX_CRC_WORKERS)
-        .min(window_count.max(1))
+        .min(window_count.max(1));
+    match requested {
+        Some(0) => Err(invalid("CRC worker count must be non-zero")),
+        Some(count) if count > MAX_CRC_WORKERS => Err(invalid(format!(
+            "CRC worker count {count} exceeds maximum {MAX_CRC_WORKERS}"
+        ))),
+        Some(count) if count > affinity_budget => Err(invalid(format!(
+            "CRC worker count {count} exceeds affinity budget {affinity_budget}; reserve one CPU for RX polling"
+        ))),
+        Some(count) if count > window_count.max(1) => Err(invalid(format!(
+            "CRC worker count {count} exceeds registered window count {}",
+            window_count.max(1)
+        ))),
+        Some(count) => Ok(count),
+        None => Ok(maximum),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -698,7 +737,8 @@ pub fn run_urma_parent_profile(
     let remote_rx_capacity = profile.rx_slots(case, true)?.min(recv_depth);
     let expected_remote_credit =
         receive_credit_target(case.window as usize, remote_rx_capacity, remaining_messages)?;
-    let initial_remote_credit = expect_ready(&mut session, &case.case_id, expected_remote_credit)?;
+    let initial_remote_credit =
+        expect_ready(&mut session, &case.case_id, expected_remote_credit, profile)?;
     let mut remote_credit = RemoteReceiveCredit::new(initial_remote_credit)?;
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
@@ -808,6 +848,26 @@ pub fn run_urma_child_profile(
     destination: UrmaBenchmarkDestination,
     profile: UrmaBenchmarkProfile,
 ) -> Result<BenchmarkResult> {
+    run_urma_child_profile_with_crc_workers(
+        case,
+        device,
+        eid_index,
+        parent,
+        destination,
+        profile,
+        None,
+    )
+}
+
+pub fn run_urma_child_profile_with_crc_workers(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    parent: impl ToSocketAddrs,
+    destination: UrmaBenchmarkDestination,
+    profile: UrmaBenchmarkProfile,
+    crc_workers: Option<usize>,
+) -> Result<BenchmarkResult> {
     destination.validate(case)?;
     let runtime_config = benchmark_runtime_config(case, device, eid_index, profile, true)?;
     let jetty_config = JettyConfig::default();
@@ -816,6 +876,16 @@ pub fn run_urma_child_profile(
         case,
         UrmaPipelineLimits::from_configs(&runtime_config, &jetty_config),
     )?;
+    let rx_window_chunks = if profile.transport_only() {
+        case.window as usize
+    } else {
+        registered_rx_window_chunks(
+            case.window as usize,
+            runtime_config.buffer_pool.rx_slot_count,
+        )?
+    };
+    let registered_window_count = runtime_config.buffer_pool.rx_slot_count / rx_window_chunks;
+    let sink_worker_count = crc_worker_count(registered_window_count, crc_workers)?;
     let setup_measurement = setup_measurement(case.timing_mode)?;
     let mut runtime = UrmaRuntime::start(runtime_config.clone())?;
     validate_urma_case(
@@ -846,16 +916,6 @@ pub fn run_urma_child_profile(
     receiver.accept_metadata(&metadata)?;
     let sink =
         destination.create_sink(case.transfer_bytes, expected_crc32, case.completion_policy)?;
-    let rx_window_chunks = if profile.transport_only() {
-        case.window as usize
-    } else {
-        registered_rx_window_chunks(
-            case.window as usize,
-            runtime_config.buffer_pool.rx_slot_count,
-        )?
-    };
-    let registered_window_count = runtime_config.buffer_pool.rx_slot_count / rx_window_chunks;
-    let sink_worker_count = crc_worker_count(registered_window_count);
     let mut sink_pipeline = SinkPipeline::start(sink, sink_worker_count, profile.transport_only())?;
     let remaining_messages = usize::try_from(case.chunk_count()? + 1)
         .map_err(|_| invalid("receive message count exceeds usize"))?;
@@ -873,7 +933,7 @@ pub fn run_urma_child_profile(
     write_control(
         session.stream_mut(),
         READY,
-        &encode_ready(&case.case_id, initial_credit)?,
+        &encode_ready(&case.case_id, initial_credit, profile)?,
     )?;
     expect_case_control(&mut session, START, &case.case_id)?;
     let measurement = match setup_measurement {
@@ -1592,26 +1652,31 @@ fn configure_control_stream(stream: &TcpStream) -> Result<()> {
         .map_err(|error| io_error("configure URMA benchmark control timeout", error))
 }
 
-fn encode_ready(case_id: &str, initial_credit: usize) -> Result<Vec<u8>> {
+fn encode_ready(
+    case_id: &str,
+    initial_credit: usize,
+    profile: UrmaBenchmarkProfile,
+) -> Result<Vec<u8>> {
     let case = case_id.as_bytes();
     let case_len = u16::try_from(case.len()).map_err(|_| invalid("case_id too long"))?;
     let credit = u32::try_from(initial_credit)
         .map_err(|_| invalid("initial remote receive credit exceeds u32"))?;
-    let mut payload = Vec::with_capacity(2 + case.len() + 4);
+    let mut payload = Vec::with_capacity(2 + case.len() + 4 + 1);
     payload.extend_from_slice(&case_len.to_be_bytes());
     payload.extend_from_slice(case);
     payload.extend_from_slice(&credit.to_be_bytes());
+    payload.push(profile.wire_id());
     Ok(payload)
 }
 
-fn decode_ready(payload: &[u8]) -> Result<(String, usize)> {
-    if payload.len() < 6 {
+fn decode_ready(payload: &[u8]) -> Result<(String, usize, u8)> {
+    if payload.len() < 7 {
         return Err(Error::Protocol("truncated URMA READY payload".into()));
     }
     let case_len = u16::from_be_bytes(payload[..2].try_into().expect("fixed slice")) as usize;
     let expected_len = 2usize
         .checked_add(case_len)
-        .and_then(|length| length.checked_add(4))
+        .and_then(|length| length.checked_add(5))
         .ok_or_else(|| Error::Protocol("URMA READY length overflow".into()))?;
     if payload.len() != expected_len {
         return Err(Error::Protocol("invalid URMA READY payload length".into()));
@@ -1620,7 +1685,7 @@ fn decode_ready(payload: &[u8]) -> Result<(String, usize)> {
         .map_err(|_| Error::Protocol("URMA READY case_id is not UTF-8".into()))?
         .to_owned();
     let credit = u32::from_be_bytes(
-        payload[2 + case_len..expected_len]
+        payload[2 + case_len..expected_len - 1]
             .try_into()
             .expect("fixed slice"),
     ) as usize;
@@ -1629,14 +1694,24 @@ fn decode_ready(payload: &[u8]) -> Result<(String, usize)> {
             "URMA READY advertised zero receive credit".into(),
         ));
     }
-    Ok((case_id, credit))
+    Ok((case_id, credit, payload[expected_len - 1]))
 }
 
-fn expect_ready(session: &mut OobSession, case_id: &str, expected_credit: usize) -> Result<usize> {
-    let (received_case_id, credit) = decode_ready(&read_control(session.stream_mut(), READY)?)?;
-    if received_case_id != case_id || credit != expected_credit {
+fn expect_ready(
+    session: &mut OobSession,
+    case_id: &str,
+    expected_credit: usize,
+    profile: UrmaBenchmarkProfile,
+) -> Result<usize> {
+    let (received_case_id, credit, received_profile) =
+        decode_ready(&read_control(session.stream_mut(), READY)?)?;
+    if received_case_id != case_id
+        || credit != expected_credit
+        || received_profile != profile.wire_id()
+    {
         return Err(Error::Protocol(format!(
-            "URMA READY mismatch: case_id={received_case_id:?}, credit={credit}, expected case_id={case_id:?}, credit={expected_credit}"
+            "URMA READY mismatch: case_id={received_case_id:?}, credit={credit}, profile={received_profile}, expected case_id={case_id:?}, credit={expected_credit}, profile={}",
+            profile.wire_id()
         )));
     }
     Ok(credit)
@@ -1937,7 +2012,7 @@ mod tests {
         );
         assert_eq!(
             UrmaBenchmarkProfile::Normal.rx_slots(&case, true).unwrap(),
-            2048
+            4096
         );
         assert_eq!(
             UrmaBenchmarkProfile::TransportOnly
@@ -1945,6 +2020,24 @@ mod tests {
                 .unwrap(),
             32_769
         );
+        assert_eq!(
+            UrmaBenchmarkProfile::FixedTxTransportOnly
+                .rx_slots(&case, true)
+                .unwrap(),
+            32_769
+        );
+        assert!(UrmaBenchmarkProfile::FixedTxTransportOnly.fixed_tx());
+        assert!(UrmaBenchmarkProfile::FixedTxTransportOnly.transport_only());
+    }
+
+    #[test]
+    fn crc_worker_selection_respects_affinity_and_explicit_limit() {
+        assert_eq!(select_crc_worker_count(256, None, 25).unwrap(), 24);
+        assert_eq!(select_crc_worker_count(256, Some(24), 25).unwrap(), 24);
+        assert_eq!(select_crc_worker_count(16, None, 64).unwrap(), 16);
+        assert!(select_crc_worker_count(256, Some(25), 25).is_err());
+        assert!(select_crc_worker_count(256, Some(33), 64).is_err());
+        assert!(select_crc_worker_count(256, Some(0), 64).is_err());
     }
 
     #[test]
@@ -2106,17 +2199,18 @@ mod tests {
 
     #[test]
     fn ready_control_round_trip_binds_case_and_posted_credit() {
-        let payload = encode_ready("credit-case", 512).unwrap();
+        let profile = UrmaBenchmarkProfile::FixedTxTransportOnly;
+        let payload = encode_ready("credit-case", 512, profile).unwrap();
         assert_eq!(
             decode_ready(&payload).unwrap(),
-            ("credit-case".to_string(), 512)
+            ("credit-case".to_string(), 512, profile.wire_id())
         );
 
         let mut truncated = payload.clone();
         truncated.pop();
         assert!(decode_ready(&truncated).is_err());
 
-        let zero = encode_ready("credit-case", 0).unwrap();
+        let zero = encode_ready("credit-case", 0, profile).unwrap();
         assert!(decode_ready(&zero).is_err());
     }
 
