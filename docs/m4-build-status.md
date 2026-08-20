@@ -209,3 +209,5 @@ total_registered_bytes
 2026-08-20 新增 `fixed-tx-transport-only` 组合 profile，用于同时把 Parent TX payload 构造和 Child CRC 移出 transport sample；READY 交换 profile ID 并拒绝两端配置不一致。该组合 profile 已通过本地 feature-on 单元测试和 release build，尚未经过真实 provider 验证。跨节点 64-byte SEND 同时在 demo 和官方 `urma_perftest` 报 `CR status 2`，因此跨节点 UB 环境仍未验证通过。
 
 同日进一步移除fixed-TX的O(transfer bytes)初始化：Parent使用只保存逻辑长度的虚拟memory source，不再生成完整测试`Vec`；固定payload expected CRC使用二进制CRC combine，由O(transfer bytes)降为O(chunk size + log chunk count)。steady-state数据路径与完整性语义不变。本地14项fast-path单元测试和release build通过，真实provider复测待完成。
+
+随后加入payload阶段独立CQ统计、send/recv JFC空poll计数，以及sender真实remote-credit阻塞的累计/最大纳秒数。payload边界为START之后到End完成，不含初始化、Metadata、CRC收尾和shutdown。DONE控制消息已扩展，控制协议版本升至3，要求两端同步二进制。本地27项URMA benchmark单元测试与release build通过，真实provider诊断结果待验证。

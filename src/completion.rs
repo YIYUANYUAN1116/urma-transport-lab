@@ -14,7 +14,9 @@ pub struct CompletionStats {
     pub poll_calls: u64,
     pub empty_polls: u64,
     pub send_jfc_poll_calls: u64,
+    pub send_jfc_empty_polls: u64,
     pub recv_jfc_poll_calls: u64,
+    pub recv_jfc_empty_polls: u64,
     pub yield_count: u64,
     pub sleep_count: u64,
     pub backoff_sleep_ns: u64,
@@ -296,6 +298,7 @@ mod native {
                 .poll_into(&mut records[..self.batch])
                 .map_err(|error| map_ffi_error("poll_recv_jfc", error))?;
             if count == 0 {
+                self.stats.recv_jfc_empty_polls += 1;
                 self.stats.empty_polls += 1;
                 self.empty_streak = self.empty_streak.saturating_add(1);
                 self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
@@ -323,6 +326,7 @@ mod native {
                 .poll_into(&mut records[..self.batch])
                 .map_err(|error| map_ffi_error("poll_recv_jfc", error))?;
             if count == 0 {
+                self.stats.recv_jfc_empty_polls += 1;
                 self.stats.empty_polls += 1;
                 self.empty_streak = self.empty_streak.saturating_add(1);
                 self.stats.max_empty_streak = self.stats.max_empty_streak.max(self.empty_streak);
@@ -467,6 +471,9 @@ mod native {
                 let count = send_jfc
                     .poll_into(&mut records[..self.batch])
                     .map_err(|error| map_ffi_error("poll_send_jfc", error))?;
+                if count == 0 {
+                    self.stats.send_jfc_empty_polls += 1;
+                }
                 for record in records.into_iter().take(count) {
                     events.extend(self.route(record, false, pool)?);
                 }
@@ -477,6 +484,9 @@ mod native {
                 let count = recv_jfc
                     .poll_into(&mut records[..self.batch])
                     .map_err(|error| map_ffi_error("poll_recv_jfc", error))?;
+                if count == 0 {
+                    self.stats.recv_jfc_empty_polls += 1;
+                }
                 for record in records.into_iter().take(count) {
                     events.extend(self.route(record, true, pool)?);
                 }

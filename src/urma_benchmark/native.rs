@@ -26,7 +26,7 @@ use std::{
 const REQUEST_ID: u64 = 1;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_MAGIC: u32 = 0x4252_4d41;
-const CONTROL_VERSION: u16 = 2;
+const CONTROL_VERSION: u16 = 3;
 const CONTROL_HEADER_LEN: usize = 12;
 const MAX_CONTROL_PAYLOAD: usize = 4096;
 const READY: u16 = 1;
@@ -579,7 +579,9 @@ pub struct UrmaTransportStats {
     pub poll_calls: u64,
     pub empty_polls: u64,
     pub send_jfc_poll_calls: u64,
+    pub send_jfc_empty_polls: u64,
     pub recv_jfc_poll_calls: u64,
+    pub recv_jfc_empty_polls: u64,
     pub yield_count: u64,
     pub sleep_count: u64,
     pub backoff_sleep_ns: u64,
@@ -622,7 +624,9 @@ impl UrmaTransportStats {
             ("poll_calls", self.poll_calls),
             ("empty_polls", self.empty_polls),
             ("send_jfc_poll_calls", self.send_jfc_poll_calls),
+            ("send_jfc_empty_polls", self.send_jfc_empty_polls),
             ("recv_jfc_poll_calls", self.recv_jfc_poll_calls),
+            ("recv_jfc_empty_polls", self.recv_jfc_empty_polls),
             ("yield_count", self.yield_count),
             ("sleep_count", self.sleep_count),
             ("backoff_sleep_ns", self.backoff_sleep_ns),
@@ -758,6 +762,7 @@ pub fn run_urma_parent_profile(
     let initial_remote_credit =
         expect_ready(&mut session, &case.case_id, expected_remote_credit, profile)?;
     let mut remote_credit = RemoteReceiveCredit::new(initial_remote_credit)?;
+    let payload_poll_start = PayloadPollStats::from_completion(connection.stats());
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
         None => Measurement::start(case.timing_mode)?,
@@ -797,6 +802,8 @@ pub fn run_urma_parent_profile(
     connection.send_frame(&end.encode()?)?;
     remote_credit.consume()?;
     connection.drain_completions(TIMEOUT)?;
+    let parent_payload_poll =
+        PayloadPollStats::from_completion(connection.stats()).elapsed_since(payload_poll_start);
     if pipeline.current() != 0 || connection.outstanding_send() != 0 {
         return Err(Error::Protocol("URMA pipeline did not fully drain".into()));
     }
@@ -828,6 +835,8 @@ pub fn run_urma_parent_profile(
     result.child_cpu = Some(done.child_cpu);
     stats.insert_all(&mut result.transport_stats);
     insert_remote_credit_stats(&mut result, &remote_credit);
+    parent_payload_poll.insert(&mut result, "parent");
+    done.payload_poll.insert(&mut result, "child");
     result.transport_stats.insert(
         "fixed_tx_profile".into(),
         u64::from(profile.uses_fixed_tx()),
@@ -955,6 +964,7 @@ pub fn run_urma_child_profile_with_crc_workers(
         &encode_ready(&case.case_id, initial_credit, profile)?,
     )?;
     expect_case_control(&mut session, START, &case.case_id)?;
+    let payload_poll_start = PayloadPollStats::from_completion(connection.stats());
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
         None => Measurement::start(case.timing_mode)?,
@@ -1056,6 +1066,8 @@ pub fn run_urma_child_profile_with_crc_workers(
             break 'receive message;
         }
     };
+    let child_payload_poll =
+        PayloadPollStats::from_completion(connection.stats()).elapsed_since(payload_poll_start);
     receiver.accept_end(&end_message)?;
     let transport_measurement = if profile.transport_only() {
         Some(
@@ -1134,6 +1146,12 @@ pub fn run_urma_child_profile_with_crc_workers(
         .insert("remote_credit_wait_count".into(), 0);
     result
         .transport_stats
+        .insert("remote_credit_wait_ns".into(), 0);
+    result
+        .transport_stats
+        .insert("remote_credit_max_wait_ns".into(), 0);
+    result
+        .transport_stats
         .insert("remote_credit_consumed".into(), 0);
     result.transport_stats.insert(
         "registered_rx_window_count".into(),
@@ -1171,12 +1189,14 @@ pub fn run_urma_child_profile_with_crc_workers(
         "direct_file_pwrite".into(),
         u64::from(case.scenario == BenchmarkScenario::File),
     );
+    child_payload_poll.insert(&mut result, "child");
     let done = Done {
         case_id: case.case_id.clone(),
         integrity,
         elapsed_ns: result.elapsed_ns,
         child_cpu,
         completion,
+        payload_poll: child_payload_poll,
         bytes_received,
     };
     write_control(session.stream_mut(), DONE, &encode_done(&done)?)?;
@@ -1604,9 +1624,15 @@ fn combined_stats(
         send_jfc_poll_calls: parent
             .send_jfc_poll_calls
             .saturating_add(child.send_jfc_poll_calls),
+        send_jfc_empty_polls: parent
+            .send_jfc_empty_polls
+            .saturating_add(child.send_jfc_empty_polls),
         recv_jfc_poll_calls: parent
             .recv_jfc_poll_calls
             .saturating_add(child.recv_jfc_poll_calls),
+        recv_jfc_empty_polls: parent
+            .recv_jfc_empty_polls
+            .saturating_add(child.recv_jfc_empty_polls),
         yield_count: parent.yield_count.saturating_add(child.yield_count),
         sleep_count: parent.sleep_count.saturating_add(child.sleep_count),
         backoff_sleep_ns: parent
@@ -1779,6 +1805,7 @@ fn wait_for_remote_credit(
         return Ok(());
     }
     remote_credit.waited()?;
+    let wait_started = Instant::now();
     while !remote_credit.can_send() {
         let (kind, payload) = read_control_frame(stream)?;
         if kind != CREDIT {
@@ -1788,6 +1815,7 @@ fn wait_for_remote_credit(
         }
         remote_credit.grant(decode_credit(&payload)?)?;
     }
+    remote_credit.record_wait_duration(wait_started.elapsed());
     Ok(())
 }
 
@@ -1819,6 +1847,12 @@ fn insert_remote_credit_stats(result: &mut BenchmarkResult, credit: &RemoteRecei
             .transport_stats
             .insert(name.into(), u64::try_from(value).unwrap_or(u64::MAX));
     }
+    result
+        .transport_stats
+        .insert("remote_credit_wait_ns".into(), credit.wait_ns());
+    result
+        .transport_stats
+        .insert("remote_credit_max_wait_ns".into(), credit.max_wait_ns());
 }
 
 fn write_control(stream: &mut TcpStream, kind: u16, payload: &[u8]) -> Result<()> {
@@ -1874,7 +1908,85 @@ struct Done {
     elapsed_ns: u64,
     child_cpu: CpuUsage,
     completion: CompletionStats,
+    payload_poll: PayloadPollStats,
     bytes_received: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PayloadPollStats {
+    poll_calls: u64,
+    empty_polls: u64,
+    send_jfc_poll_calls: u64,
+    send_jfc_empty_polls: u64,
+    recv_jfc_poll_calls: u64,
+    recv_jfc_empty_polls: u64,
+}
+
+impl PayloadPollStats {
+    fn from_completion(stats: CompletionStats) -> Self {
+        Self {
+            poll_calls: stats.poll_calls,
+            empty_polls: stats.empty_polls,
+            send_jfc_poll_calls: stats.send_jfc_poll_calls,
+            send_jfc_empty_polls: stats.send_jfc_empty_polls,
+            recv_jfc_poll_calls: stats.recv_jfc_poll_calls,
+            recv_jfc_empty_polls: stats.recv_jfc_empty_polls,
+        }
+    }
+
+    fn elapsed_since(self, start: Self) -> Self {
+        Self {
+            poll_calls: self.poll_calls.saturating_sub(start.poll_calls),
+            empty_polls: self.empty_polls.saturating_sub(start.empty_polls),
+            send_jfc_poll_calls: self
+                .send_jfc_poll_calls
+                .saturating_sub(start.send_jfc_poll_calls),
+            send_jfc_empty_polls: self
+                .send_jfc_empty_polls
+                .saturating_sub(start.send_jfc_empty_polls),
+            recv_jfc_poll_calls: self
+                .recv_jfc_poll_calls
+                .saturating_sub(start.recv_jfc_poll_calls),
+            recv_jfc_empty_polls: self
+                .recv_jfc_empty_polls
+                .saturating_sub(start.recv_jfc_empty_polls),
+        }
+    }
+
+    fn insert(self, result: &mut BenchmarkResult, role: &str) {
+        for (suffix, value) in [
+            ("poll_calls", self.poll_calls),
+            ("empty_polls", self.empty_polls),
+            ("send_jfc_poll_calls", self.send_jfc_poll_calls),
+            ("send_jfc_empty_polls", self.send_jfc_empty_polls),
+            ("recv_jfc_poll_calls", self.recv_jfc_poll_calls),
+            ("recv_jfc_empty_polls", self.recv_jfc_empty_polls),
+        ] {
+            result
+                .transport_stats
+                .insert(format!("payload_{role}_{suffix}"), value);
+        }
+        result.transport_stats.insert(
+            format!("payload_{role}_empty_poll_ratio_ppm"),
+            scaled_ratio(self.empty_polls, self.poll_calls, 1_000_000),
+        );
+        result.transport_stats.insert(
+            format!("payload_{role}_send_jfc_empty_ratio_ppm"),
+            scaled_ratio(
+                self.send_jfc_empty_polls,
+                self.send_jfc_poll_calls,
+                1_000_000,
+            ),
+        );
+        result.transport_stats.insert(
+            format!("payload_{role}_recv_jfc_empty_ratio_ppm"),
+            scaled_ratio(
+                self.recv_jfc_empty_polls,
+                self.recv_jfc_poll_calls,
+                1_000_000,
+            ),
+        );
+    }
 }
 
 fn encode_done(done: &Done) -> Result<Vec<u8>> {
@@ -1898,7 +2010,9 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
         done.completion.poll_calls,
         done.completion.empty_polls,
         done.completion.send_jfc_poll_calls,
+        done.completion.send_jfc_empty_polls,
         done.completion.recv_jfc_poll_calls,
+        done.completion.recv_jfc_empty_polls,
         done.completion.yield_count,
         done.completion.sleep_count,
         done.completion.backoff_sleep_ns,
@@ -1914,6 +2028,12 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
         done.completion.completion_batch_total,
         done.completion.max_completion_poll_gap_ns,
         done.completion.max_outstanding_send,
+        done.payload_poll.poll_calls,
+        done.payload_poll.empty_polls,
+        done.payload_poll.send_jfc_poll_calls,
+        done.payload_poll.send_jfc_empty_polls,
+        done.payload_poll.recv_jfc_poll_calls,
+        done.payload_poll.recv_jfc_empty_polls,
         done.bytes_received,
     ] {
         output.extend_from_slice(&value.to_be_bytes());
@@ -1928,7 +2048,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         return Err(Error::Protocol("truncated URMA Done".into()));
     }
     let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
-    let expected_len = 2 + case_len + 31 * 8 + 2 * 4;
+    let expected_len = 2 + case_len + 39 * 8 + 2 * 4;
     if input.len() != expected_len {
         return Err(Error::Protocol("invalid URMA Done length".into()));
     }
@@ -1955,7 +2075,9 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let poll_calls = next_u64();
     let empty_polls = next_u64();
     let send_jfc_poll_calls = next_u64();
+    let send_jfc_empty_polls = next_u64();
     let recv_jfc_poll_calls = next_u64();
+    let recv_jfc_empty_polls = next_u64();
     let yield_count = next_u64();
     let sleep_count = next_u64();
     let backoff_sleep_ns = next_u64();
@@ -1971,6 +2093,14 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let completion_batch_total = next_u64();
     let max_completion_poll_gap_ns = next_u64();
     let max_outstanding_send = next_u64();
+    let payload_poll = PayloadPollStats {
+        poll_calls: next_u64(),
+        empty_polls: next_u64(),
+        send_jfc_poll_calls: next_u64(),
+        send_jfc_empty_polls: next_u64(),
+        recv_jfc_poll_calls: next_u64(),
+        recv_jfc_empty_polls: next_u64(),
+    };
     let bytes_received = next_u64();
     let expected_crc32 = u32::from_be_bytes(input[offset..offset + 4].try_into().expect("fixed"));
     offset += 4;
@@ -1990,7 +2120,9 @@ fn decode_done(input: &[u8]) -> Result<Done> {
             poll_calls,
             empty_polls,
             send_jfc_poll_calls,
+            send_jfc_empty_polls,
             recv_jfc_poll_calls,
+            recv_jfc_empty_polls,
             yield_count,
             sleep_count,
             backoff_sleep_ns,
@@ -2007,6 +2139,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
             max_completion_poll_gap_ns,
             max_outstanding_send,
         },
+        payload_poll,
         bytes_received,
     })
 }
@@ -2300,22 +2433,32 @@ mod tests {
                 poll_calls: 7,
                 empty_polls: 8,
                 send_jfc_poll_calls: 9,
-                recv_jfc_poll_calls: 10,
-                yield_count: 11,
-                sleep_count: 12,
-                backoff_sleep_ns: 13,
-                jfc_rearm_count: 14,
-                event_wait_count: 15,
-                event_wakeup_count: 16,
-                event_timeout_count: 17,
-                spurious_wakeup_count: 18,
-                event_wait_ns: 19,
-                max_event_wait_ns: 20,
-                max_empty_streak: 21,
-                nonempty_polls: 22,
-                completion_batch_total: 23,
-                max_completion_poll_gap_ns: 24,
-                max_outstanding_send: 25,
+                send_jfc_empty_polls: 10,
+                recv_jfc_poll_calls: 11,
+                recv_jfc_empty_polls: 12,
+                yield_count: 13,
+                sleep_count: 14,
+                backoff_sleep_ns: 15,
+                jfc_rearm_count: 16,
+                event_wait_count: 17,
+                event_wakeup_count: 18,
+                event_timeout_count: 19,
+                spurious_wakeup_count: 20,
+                event_wait_ns: 21,
+                max_event_wait_ns: 22,
+                max_empty_streak: 23,
+                nonempty_polls: 24,
+                completion_batch_total: 25,
+                max_completion_poll_gap_ns: 26,
+                max_outstanding_send: 27,
+            },
+            payload_poll: PayloadPollStats {
+                poll_calls: 28,
+                empty_polls: 29,
+                send_jfc_poll_calls: 30,
+                send_jfc_empty_polls: 31,
+                recv_jfc_poll_calls: 32,
+                recv_jfc_empty_polls: 33,
             },
             bytes_received: 64,
         };

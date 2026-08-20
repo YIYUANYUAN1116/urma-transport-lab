@@ -185,6 +185,8 @@ pub struct RemoteReceiveCredit {
     consumed: usize,
     updates: usize,
     waits: usize,
+    wait_ns: u64,
+    max_wait_ns: u64,
 }
 
 impl RemoteReceiveCredit {
@@ -199,6 +201,8 @@ impl RemoteReceiveCredit {
             consumed: 0,
             updates: 0,
             waits: 0,
+            wait_ns: 0,
+            max_wait_ns: 0,
         })
     }
 
@@ -252,6 +256,12 @@ impl RemoteReceiveCredit {
         Ok(())
     }
 
+    pub fn record_wait_duration(&mut self, elapsed: Duration) {
+        let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.wait_ns = self.wait_ns.saturating_add(elapsed_ns);
+        self.max_wait_ns = self.max_wait_ns.max(elapsed_ns);
+    }
+
     pub const fn initial(&self) -> usize {
         self.initial
     }
@@ -274,6 +284,14 @@ impl RemoteReceiveCredit {
 
     pub const fn waits(&self) -> usize {
         self.waits
+    }
+
+    pub const fn wait_ns(&self) -> u64 {
+        self.wait_ns
+    }
+
+    pub const fn max_wait_ns(&self) -> u64 {
+        self.max_wait_ns
     }
 }
 
@@ -736,6 +754,7 @@ mod tests {
         assert!(!credit.can_send());
         assert!(credit.consume().is_err());
         credit.waited().unwrap();
+        credit.record_wait_duration(Duration::from_nanos(37));
         credit.grant(2).unwrap();
         assert_eq!(credit.initial(), 4);
         assert_eq!(credit.available(), 2);
@@ -743,6 +762,8 @@ mod tests {
         assert_eq!(credit.consumed(), 4);
         assert_eq!(credit.updates(), 1);
         assert_eq!(credit.waits(), 1);
+        assert_eq!(credit.wait_ns(), 37);
+        assert_eq!(credit.max_wait_ns(), 37);
         assert!(credit.grant(0).is_err());
     }
 
