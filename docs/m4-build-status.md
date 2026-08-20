@@ -211,3 +211,15 @@ total_registered_bytes
 同日进一步移除fixed-TX的O(transfer bytes)初始化：Parent使用只保存逻辑长度的虚拟memory source，不再生成完整测试`Vec`；固定payload expected CRC使用二进制CRC combine，由O(transfer bytes)降为O(chunk size + log chunk count)。steady-state数据路径与完整性语义不变。本地14项fast-path单元测试和release build通过，真实provider复测待完成。
 
 随后加入payload阶段独立CQ统计、send/recv JFC空poll计数，以及sender真实remote-credit阻塞的累计/最大纳秒数。payload边界为START之后到End完成，不含初始化、Metadata、CRC收尾和shutdown。DONE控制消息已扩展，控制协议版本升至3，要求两端同步二进制。本地27项URMA benchmark单元测试与release build通过，真实provider诊断结果待验证。
+
+## 2026-08-20：file source registered TX direct-fill
+
+benchmark 的 URMA file scenario 已移除 Parent 普通 heap chunk 到 registered TX slot 的
+额外 memcpy。Parent 现在分配一个独占 TX slot，并通过 positional `read_at` 直接填充
+其注册内存，再提交 SEND。TX slot 只有在 `Allocated`、尚未 post 时可写；提交后仍由
+原有 moderated completion frontier 回收，fill/post 错误路径会在没有硬件引用时回滚并
+释放。FFI shim ABI 因新增受边界检查的 segment mutable window 升至 7。
+
+结果 JSON 新增 `direct_file_tx`、`file_pread_calls`、`file_pread_bytes` 和
+`file_pread_ns`。本地 feature-on URMA benchmark 28 项单元测试和 ABI 基线测试通过；
+真实 provider file scenario 尚未运行，不能据此宣称磁盘或 page-cache 性能收益。

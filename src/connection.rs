@@ -202,6 +202,32 @@ mod native {
             self.send_frame_with_sequence(&[], Some(sequence), is_tail, Some(length))
         }
 
+        pub(crate) fn send_filled_tracked(
+            &mut self,
+            length: usize,
+            sequence: u64,
+            is_tail: bool,
+            fill: impl FnOnce(&mut [u8]) -> Result<()>,
+        ) -> Result<()> {
+            self.require(ConnectionState::Ready)?;
+            self.receive_credit.require_before_send()?;
+            let complete_enable =
+                is_tail || self.sends_since_completion + 1 >= self.send_completion_interval;
+            let slot = self
+                .buffer_pool
+                .allocate(SlotKind::Tx)
+                .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
+            let layout = self.buffer_pool.fill_tx(slot, length, fill);
+            let (offset, length) = match layout {
+                Ok(layout) => layout,
+                Err(error) => {
+                    self.buffer_pool.release(slot)?;
+                    return Err(error);
+                }
+            };
+            self.post_allocated_send(slot, offset, length, Some(sequence), complete_enable)
+        }
+
         pub fn configure_send_completion_interval(&mut self, interval: usize) -> Result<()> {
             if interval == 0 || self.poller.outstanding_send() != 0 {
                 return Err(Error::InvalidConfiguration(
@@ -242,21 +268,45 @@ mod native {
                     return Err(error);
                 }
             };
+            self.post_allocated_send(slot, offset, length, sequence, complete_enable)
+        }
+
+        fn post_allocated_send(
+            &mut self,
+            slot: crate::SlotId,
+            offset: u64,
+            length: u32,
+            sequence: Option<u64>,
+            complete_enable: bool,
+        ) -> Result<()> {
             let token = WrToken {
                 connection_id: self.poller.connection_id(),
                 generation: self.poller.generation(),
                 operation: OperationType::Send,
                 slot,
             };
-            let user_ctx = token.encode()?;
-            self.buffer_pool.mark_posted(slot, SlotKind::Tx)?;
-            let result = self.jetty.post_send(
-                self.buffer_pool.segment_handle()?,
-                offset,
-                length,
-                user_ctx,
-                complete_enable,
-            );
+            let user_ctx = match token.encode() {
+                Ok(user_ctx) => user_ctx,
+                Err(error) => {
+                    self.buffer_pool.release(slot)?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.buffer_pool.mark_posted(slot, SlotKind::Tx) {
+                self.buffer_pool.release(slot)?;
+                return Err(error);
+            }
+            let result = match self.buffer_pool.segment_handle() {
+                Ok(segment) => {
+                    self.jetty
+                        .post_send(segment, offset, length, user_ctx, complete_enable)
+                }
+                Err(error) => {
+                    self.buffer_pool.rollback_post(slot, SlotKind::Tx)?;
+                    self.buffer_pool.release(slot)?;
+                    return Err(error);
+                }
+            };
             let wr = match result {
                 Ok(wr) => wr,
                 Err(error) => {

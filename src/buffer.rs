@@ -427,6 +427,44 @@ mod native {
             Ok((offset, length))
         }
 
+        /// Gives a producer temporary mutable access to an allocated,
+        /// registered TX slot before any WR references it. The slice cannot
+        /// escape the closure, and the caller still owns the slot lifecycle.
+        pub(crate) fn fill_tx(
+            &mut self,
+            id: SlotId,
+            length: usize,
+            fill: impl FnOnce(&mut [u8]) -> Result<()>,
+        ) -> Result<(u64, u32)> {
+            if self.config.alias_tx_slots {
+                return Err(Error::InvalidConfiguration(
+                    "direct TX fill is not valid for aliased TX slots".into(),
+                ));
+            }
+            let (offset, capacity, kind, state) = self.slot_fields(id)?;
+            if kind != SlotKind::Tx || state != SlotState::Allocated {
+                return Err(Error::InvalidConfiguration(
+                    "direct TX fill requires an allocated TX slot".into(),
+                ));
+            }
+            if length == 0 || length > capacity {
+                return Err(Error::InvalidConfiguration(format!(
+                    "direct TX fill length {length} is outside 1..={capacity}"
+                )));
+            }
+            let offset = u64::try_from(offset)
+                .map_err(|_| Error::InvalidConfiguration("slot offset exceeds u64".into()))?;
+            let length = u32::try_from(length)
+                .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
+            self.segment
+                .as_mut()
+                .ok_or_else(|| Error::InvalidConfiguration("registered Segment is closed".into()))?
+                .handle
+                .with_write(offset, length, fill)
+                .map_err(|error| map_ffi_error("fill_tx_slot", error))??;
+            Ok((offset, length))
+        }
+
         pub(crate) fn prepare_aliased_tx(&mut self, data: &[u8]) -> Result<()> {
             if !self.config.alias_tx_slots || data.is_empty() || data.len() > self.config.slot_size
             {

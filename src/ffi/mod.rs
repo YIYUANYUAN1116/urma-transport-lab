@@ -505,6 +505,30 @@ impl SegmentHandle {
         Ok(read(bytes))
     }
 
+    pub(crate) fn with_write<R>(
+        &mut self,
+        offset: u64,
+        length: u32,
+        write: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, FfiError> {
+        let raw = self.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        if length == 0 {
+            return Err(FfiError::Contract("zero-length Segment write window"));
+        }
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the shim validates the registered range and returns unique
+        // writable access for this call. SegmentHandle requires &mut self, and
+        // the caller must not post the slot until the closure returns.
+        status_result(unsafe {
+            sys::urma_lab_segment_get_mut(raw.as_ptr(), offset, length, &mut data)
+        })?;
+        let data = NonNull::new(data).ok_or(FfiError::NullHandle)?;
+        // SAFETY: the shim returned a writable range of exactly `length`
+        // bytes, exclusively borrowed through this SegmentHandle call.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_ptr(), length as usize) };
+        Ok(write(bytes))
+    }
+
     /// Returns the stable base address of the registered allocation. The
     /// caller must keep this Segment alive and prevent provider writes to any
     /// range exposed through the pointer.

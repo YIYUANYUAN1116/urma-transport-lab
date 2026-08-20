@@ -775,6 +775,7 @@ pub fn run_urma_parent_profile(
         connection.prepare_aliased_tx(payload)?;
     }
     let mut bytes_sent = 0u64;
+    let mut direct_file_tx = DirectFileTxStats::default();
     let data_messages = if let Some(payload) = fixed_payload.as_deref() {
         send_fixed_payload(
             payload.len(),
@@ -794,6 +795,7 @@ pub fn run_urma_parent_profile(
             session.stream_mut(),
             &mut remote_credit,
             &mut bytes_sent,
+            &mut direct_file_tx,
         )?
     };
     drain_pipeline(&mut connection, &mut pipeline)?;
@@ -841,6 +843,19 @@ pub fn run_urma_parent_profile(
         "fixed_tx_profile".into(),
         u64::from(profile.uses_fixed_tx()),
     );
+    result.transport_stats.insert(
+        "direct_file_tx".into(),
+        u64::from(case.scenario == BenchmarkScenario::File),
+    );
+    result
+        .transport_stats
+        .insert("file_pread_calls".into(), direct_file_tx.pread_calls);
+    result
+        .transport_stats
+        .insert("file_pread_bytes".into(), direct_file_tx.pread_bytes);
+    result
+        .transport_stats
+        .insert("file_pread_ns".into(), direct_file_tx.pread_ns);
     result
         .transport_stats
         .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);
@@ -1215,6 +1230,7 @@ fn send_source(
     control: &mut TcpStream,
     remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
+    direct_file_tx: &mut DirectFileTxStats,
 ) -> Result<u32> {
     let mut last_progress = Instant::now();
     let mut sequence = 0u32;
@@ -1248,24 +1264,26 @@ fn send_source(
         }
         UrmaBenchmarkSource::FixedMemory { .. } => unreachable!("rejected above"),
         UrmaBenchmarkSource::File(source) => {
-            let mut file = source.open()?;
-            let mut buffer = vec![0u8; chunk_size];
-            loop {
-                let read = read_chunk(&mut file, &mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                post_data(
+            let file = source.open()?;
+            let mut offset = 0u64;
+            while offset < source.length() {
+                let length = usize::try_from((source.length() - offset).min(chunk_size as u64))
+                    .expect("file chunk is bounded by usize chunk_size");
+                post_file_data(
                     connection,
                     pipeline,
                     sequence,
-                    &buffer[..read],
+                    &file,
+                    offset,
+                    length,
                     u64::from(sequence) + 1 == chunk_count,
                     control,
                     remote_credit,
                     &mut last_progress,
+                    direct_file_tx,
                 )?;
-                *bytes_sent += read as u64;
+                offset += length as u64;
+                *bytes_sent += length as u64;
                 sequence = sequence
                     .checked_add(1)
                     .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
@@ -1273,6 +1291,13 @@ fn send_source(
         }
     }
     Ok(sequence)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DirectFileTxStats {
+    pread_calls: u64,
+    pread_bytes: u64,
+    pread_ns: u64,
 }
 
 fn repeated_payload_crc32(payload: &[u8], repetitions: u64) -> u32 {
@@ -1361,6 +1386,74 @@ fn post_data(
     remote_credit.consume()?;
     pipeline.posted()?;
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
+    Ok(())
+}
+
+fn post_file_data(
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+    sequence: u32,
+    file: &File,
+    offset: u64,
+    length: usize,
+    is_last: bool,
+    control: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
+    last_progress: &mut Instant,
+    stats: &mut DirectFileTxStats,
+) -> Result<()> {
+    while !pipeline.can_post() {
+        let completed = poll_send_completions(connection, pipeline)?;
+        if completed != 0 {
+            *last_progress = Instant::now();
+        } else if idle_timeout_elapsed(*last_progress, Instant::now(), TIMEOUT) {
+            log_parent_pipeline_capacity_timeout(connection, pipeline);
+            return Err(Error::Timeout {
+                operation: "URMA direct file TX pipeline capacity",
+            });
+        }
+    }
+    wait_for_remote_credit(control, remote_credit)?;
+
+    let mut pread_calls = 0u64;
+    let mut pread_ns = 0u64;
+    let send_result =
+        connection.send_filled_tracked(length, u64::from(sequence), is_last, |registered| {
+            let pread_started = Instant::now();
+            let result = read_exact_at(file, offset, registered, &mut pread_calls);
+            pread_ns = u64::try_from(pread_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            result
+        });
+    stats.pread_ns = stats.pread_ns.saturating_add(pread_ns);
+    stats.pread_calls = stats.pread_calls.saturating_add(pread_calls);
+    send_result?;
+    stats.pread_bytes = stats.pread_bytes.saturating_add(length as u64);
+
+    remote_credit.consume()?;
+    pipeline.posted()?;
+    debug_assert_eq!(pipeline.current(), connection.outstanding_send());
+    Ok(())
+}
+
+fn read_exact_at(file: &File, offset: u64, output: &mut [u8], calls: &mut u64) -> Result<()> {
+    let mut filled = 0usize;
+    while filled < output.len() {
+        *calls = calls.saturating_add(1);
+        let read = match file.read_at(&mut output[filled..], offset + filled as u64) {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(io_error("pread benchmark source into registered TX", error));
+            }
+        };
+        if read == 0 {
+            return Err(io_error(
+                "pread benchmark source into registered TX",
+                io::Error::new(io::ErrorKind::UnexpectedEof, "source file ended early"),
+            ));
+        }
+        filled += read;
+    }
     Ok(())
 }
 
@@ -1509,19 +1602,6 @@ fn pending_wr_json(pending: &[crate::PendingWrSnapshot]) -> String {
         })
         .collect::<Vec<_>>();
     format!("[{}]", entries.join(","))
-}
-
-fn read_chunk(file: &mut File, buffer: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match file.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(io_error("read URMA benchmark source", error)),
-        }
-    }
-    Ok(filled)
 }
 
 fn setup_measurement(mode: TimingMode) -> Result<Option<Measurement>> {
@@ -2386,6 +2466,29 @@ mod tests {
             .unwrap();
         assert!(pipeline.finish().unwrap().0.is_ok());
         assert_eq!(std::fs::read(&path).unwrap(), payload);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn positional_source_read_fills_exact_registered_range() {
+        let path = std::env::temp_dir().join(format!(
+            "urma-direct-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let file = File::open(&path).unwrap();
+        let mut output = [0u8; 5];
+        let mut calls = 0;
+        read_exact_at(&file, 3, &mut output, &mut calls).unwrap();
+        assert_eq!(&output, b"34567");
+        assert_eq!(calls, 1);
+
+        let mut too_long = [0u8; 4];
+        assert!(read_exact_at(&file, 8, &mut too_long, &mut calls).is_err());
         std::fs::remove_file(path).unwrap();
     }
 

@@ -15,7 +15,7 @@ typedef struct urma_lab_jetty urma_lab_jetty_t;
 typedef struct urma_lab_descriptor urma_lab_descriptor_t;
 typedef struct urma_lab_wr urma_lab_wr_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 6U
+#define URMA_LAB_SHIM_ABI_VERSION 7U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
@@ -143,6 +143,9 @@ int urma_lab_segment_read(const urma_lab_segment_t *segment, uint64_t offset,
 int urma_lab_segment_get_const(const urma_lab_segment_t *segment,
                                uint64_t offset, uint32_t length,
                                const uint8_t **out);
+int urma_lab_segment_get_mut(urma_lab_segment_t *segment,
+                             uint64_t offset, uint32_t length,
+                             uint8_t **out);
 
 /* Creates one RC duplex Jetty backed by an owned shared JFR. */
 int urma_lab_jetty_create(urma_lab_runtime_t *runtime,

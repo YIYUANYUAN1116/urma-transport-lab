@@ -553,6 +553,17 @@ int urma_lab_segment_get_const(const urma_lab_segment_t *segment,
     return 0;
 }
 
+int urma_lab_segment_get_mut(urma_lab_segment_t *segment,
+                             uint64_t offset, uint32_t length,
+                             uint8_t **out)
+{
+    if (out == NULL || urma_lab_segment_range(segment, offset, length) != 0) {
+        return -EINVAL;
+    }
+    *out = (uint8_t *)segment->memory + offset;
+    return 0;
+}
+
 int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
                           urma_lab_jfc_t *send_jfc,
                           urma_lab_jfc_t *recv_jfc,
