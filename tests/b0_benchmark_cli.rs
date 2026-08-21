@@ -51,3 +51,17 @@ fn dry_run_rejects_transport_scenario_mismatch() {
         .unwrap()
         .contains("tcp-sendfile is only valid for the file scenario"));
 }
+
+#[test]
+fn help_documents_reproducible_output_creation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_benchmark"))
+        .arg("--help")
+        .output()
+        .expect("run benchmark help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--output-mode fresh|truncate"));
+    assert!(stdout.contains("default: fresh"));
+    assert!(stdout.contains("--cleanup-output"));
+    assert!(stdout.contains("default: file=4"));
+}

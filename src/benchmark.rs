@@ -708,6 +708,22 @@ impl FileSink {
         )
     }
 
+    pub fn create_fresh(
+        path: impl AsRef<Path>,
+        expected_bytes: u64,
+        expected_crc32: u32,
+        completion_policy: FileCompletionPolicy,
+    ) -> Result<Self> {
+        Self::create_with_capacity_and_mode(
+            path,
+            expected_bytes,
+            expected_crc32,
+            completion_policy,
+            DEFAULT_FILE_BUFFER_SIZE,
+            true,
+        )
+    }
+
     pub fn create_with_capacity(
         path: impl AsRef<Path>,
         expected_bytes: u64,
@@ -715,13 +731,35 @@ impl FileSink {
         completion_policy: FileCompletionPolicy,
         capacity: usize,
     ) -> Result<Self> {
+        Self::create_with_capacity_and_mode(
+            path,
+            expected_bytes,
+            expected_crc32,
+            completion_policy,
+            capacity,
+            false,
+        )
+    }
+
+    fn create_with_capacity_and_mode(
+        path: impl AsRef<Path>,
+        expected_bytes: u64,
+        expected_crc32: u32,
+        completion_policy: FileCompletionPolicy,
+        capacity: usize,
+        fresh: bool,
+    ) -> Result<Self> {
         if capacity == 0 {
             return Err(invalid("file sink buffer capacity must be non-zero"));
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if fresh {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        let file = options
             .open(path)
             .map_err(|error| io_error("create benchmark sink", error))?;
         Ok(Self {
@@ -1100,6 +1138,16 @@ mod tests {
             assert!(sink.finish().unwrap().is_ok());
             assert_eq!(std::fs::metadata(&output_path.0).unwrap().len(), 0);
         }
+    }
+
+    #[test]
+    fn fresh_file_sink_refuses_to_reuse_an_existing_inode() {
+        let output_path = TempPath::new("fresh-output");
+        std::fs::write(&output_path.0, b"existing").unwrap();
+        let error = FileSink::create_fresh(&output_path.0, 0, 0, FileCompletionPolicy::Buffered)
+            .unwrap_err();
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(std::fs::read(&output_path.0).unwrap(), b"existing");
     }
 
     #[test]

@@ -60,14 +60,17 @@ impl TcpBenchmarkSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TcpBenchmarkDestination {
     Memory,
+    /// Compatibility mode: create the output or truncate and reuse its inode.
     File(PathBuf),
+    /// Reproducible benchmark mode: atomically fail if the output exists.
+    FreshFile(PathBuf),
 }
 
 impl TcpBenchmarkDestination {
     fn validate(&self, case: &BenchmarkCase) -> Result<()> {
         let scenario = match self {
             Self::Memory => BenchmarkScenario::Memory,
-            Self::File(_) => BenchmarkScenario::File,
+            Self::File(_) | Self::FreshFile(_) => BenchmarkScenario::File,
         };
         if scenario != case.scenario {
             return Err(invalid(
@@ -89,6 +92,12 @@ impl TcpBenchmarkDestination {
                 expected_crc32,
             ))),
             Self::File(path) => Ok(ActiveSink::File(FileSink::create(
+                path,
+                expected_bytes,
+                expected_crc32,
+                completion_policy,
+            )?)),
+            Self::FreshFile(path) => Ok(ActiveSink::File(FileSink::create_fresh(
                 path,
                 expected_bytes,
                 expected_crc32,

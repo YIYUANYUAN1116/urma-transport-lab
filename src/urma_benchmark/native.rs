@@ -27,7 +27,7 @@ use std::{
 const REQUEST_ID: u64 = 1;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_MAGIC: u32 = 0x4252_4d41;
-const CONTROL_VERSION: u16 = 4;
+const CONTROL_VERSION: u16 = 5;
 const CONTROL_HEADER_LEN: usize = 12;
 const MAX_CONTROL_PAYLOAD: usize = 4096;
 const READY: u16 = 1;
@@ -38,6 +38,7 @@ const SEND_COMPLETION_INTERVAL: usize = 100;
 pub const DEFAULT_SEND_POST_LIST: usize = 16;
 const VERIFIED_RX_POOL_WINDOWS: usize = 32;
 const MAX_CRC_WORKERS: usize = 32;
+const DEFAULT_FILE_CRC_WORKERS: usize = 4;
 
 struct MappedFileSource {
     data: NonNull<u8>,
@@ -233,14 +234,17 @@ impl UrmaBenchmarkSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UrmaBenchmarkDestination {
     Memory,
+    /// Compatibility mode: create the output or truncate and reuse its inode.
     File(PathBuf),
+    /// Reproducible benchmark mode: atomically fail if the output exists.
+    FreshFile(PathBuf),
 }
 
 impl UrmaBenchmarkDestination {
     fn validate(&self, case: &BenchmarkCase) -> Result<()> {
         let scenario = match self {
             Self::Memory => BenchmarkScenario::Memory,
-            Self::File(_) => BenchmarkScenario::File,
+            Self::File(_) | Self::FreshFile(_) => BenchmarkScenario::File,
         };
         if scenario != case.scenario {
             return Err(invalid("URMA destination does not match benchmark case"));
@@ -257,7 +261,14 @@ impl UrmaBenchmarkDestination {
         match self {
             Self::Memory => Ok(WindowSink::memory(expected_bytes, expected_crc32)),
             Self::File(path) => WindowSink::file(path, expected_bytes, expected_crc32, policy),
+            Self::FreshFile(path) => {
+                WindowSink::file_fresh(path, expected_bytes, expected_crc32, policy)
+            }
         }
+    }
+
+    fn uses_fresh_file(&self) -> bool {
+        matches!(self, Self::FreshFile(_))
     }
 }
 
@@ -284,10 +295,45 @@ impl WindowSink {
         expected_crc32: u32,
         completion_policy: FileCompletionPolicy,
     ) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
+        Self::file_with_mode(
+            path,
+            expected_bytes,
+            expected_crc32,
+            completion_policy,
+            false,
+        )
+    }
+
+    fn file_fresh(
+        path: &PathBuf,
+        expected_bytes: u64,
+        expected_crc32: u32,
+        completion_policy: FileCompletionPolicy,
+    ) -> Result<Self> {
+        Self::file_with_mode(
+            path,
+            expected_bytes,
+            expected_crc32,
+            completion_policy,
+            true,
+        )
+    }
+
+    fn file_with_mode(
+        path: &PathBuf,
+        expected_bytes: u64,
+        expected_crc32: u32,
+        completion_policy: FileCompletionPolicy,
+        fresh: bool,
+    ) -> Result<Self> {
+        let mut options = OpenOptions::new();
+        options.write(true);
+        if fresh {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        let file = options
             .open(path)
             .map_err(|error| io_error("create direct URMA benchmark sink", error))?;
         Ok(Self {
@@ -345,6 +391,7 @@ struct SinkJobStats {
 struct SinkStats {
     transport_receive_ns: u64,
     drain_ns: u64,
+    output_fresh: u64,
     outstanding_at_end: u64,
     pending_at_end: u64,
     max_outstanding: u64,
@@ -365,7 +412,7 @@ struct SinkStats {
 }
 
 impl SinkStats {
-    const WIRE_FIELDS: usize = 19;
+    const WIRE_FIELDS: usize = 20;
 
     fn observe(&mut self, job: SinkJobStats) {
         self.jobs = self.jobs.saturating_add(1);
@@ -387,6 +434,7 @@ impl SinkStats {
         [
             self.transport_receive_ns,
             self.drain_ns,
+            self.output_fresh,
             self.outstanding_at_end,
             self.pending_at_end,
             self.max_outstanding,
@@ -411,6 +459,7 @@ impl SinkStats {
         for (name, value) in [
             ("sink_transport_receive_ns", self.transport_receive_ns),
             ("sink_drain_ns", self.drain_ns),
+            ("sink_output_fresh", self.output_fresh),
             ("sink_outstanding_at_end", self.outstanding_at_end),
             ("sink_pending_at_end", self.pending_at_end),
             ("sink_max_outstanding", self.max_outstanding),
@@ -811,15 +860,20 @@ fn validate_registered_window_layout(window: &RegisteredRxWindowLease) -> Result
     Ok(())
 }
 
-fn crc_worker_count(window_count: usize, requested: Option<usize>) -> Result<usize> {
+fn crc_worker_count(
+    window_count: usize,
+    requested: Option<usize>,
+    scenario: BenchmarkScenario,
+) -> Result<usize> {
     let available = thread::available_parallelism().map_or(1, usize::from);
-    select_crc_worker_count(window_count, requested, available)
+    select_crc_worker_count(window_count, requested, available, scenario)
 }
 
 fn select_crc_worker_count(
     window_count: usize,
     requested: Option<usize>,
     available_cpus: usize,
+    scenario: BenchmarkScenario,
 ) -> Result<usize> {
     let affinity_budget = available_cpus.saturating_sub(1).max(1);
     let maximum = affinity_budget
@@ -838,6 +892,7 @@ fn select_crc_worker_count(
             window_count.max(1)
         ))),
         Some(count) => Ok(count),
+        None if scenario == BenchmarkScenario::File => Ok(maximum.min(DEFAULT_FILE_CRC_WORKERS)),
         None => Ok(maximum),
     }
 }
@@ -1281,7 +1336,7 @@ pub fn run_urma_child_profile_with_crc_workers(
         )?
     };
     let registered_window_count = runtime_config.buffer_pool.rx_slot_count / rx_window_chunks;
-    let sink_worker_count = crc_worker_count(registered_window_count, crc_workers)?;
+    let sink_worker_count = crc_worker_count(registered_window_count, crc_workers, case.scenario)?;
     let setup_measurement = setup_measurement(case.timing_mode)?;
     let mut runtime = UrmaRuntime::start(runtime_config.clone())?;
     validate_urma_case(
@@ -1455,6 +1510,7 @@ pub fn run_urma_child_profile_with_crc_workers(
     let (integrity, recycled, mut sink_stats) = sink_pipeline.finish()?;
     sink_stats.transport_receive_ns = transport_receive_ns;
     sink_stats.drain_ns = duration_ns(sink_drain_started.elapsed());
+    sink_stats.output_fresh = u64::from(destination.uses_fresh_file());
     sink_stats.outstanding_at_end = sink_outstanding_at_end;
     sink_stats.pending_at_end = sink_pending_at_end;
     let post_transport_verification_ns = if profile.transport_only() {
@@ -2694,6 +2750,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let sink = SinkStats {
         transport_receive_ns: next_u64(),
         drain_ns: next_u64(),
+        output_fresh: next_u64(),
         outstanding_at_end: next_u64(),
         pending_at_end: next_u64(),
         max_outstanding: next_u64(),
@@ -2815,12 +2872,25 @@ mod tests {
 
     #[test]
     fn crc_worker_selection_respects_affinity_and_explicit_limit() {
-        assert_eq!(select_crc_worker_count(256, None, 25).unwrap(), 24);
-        assert_eq!(select_crc_worker_count(256, Some(24), 25).unwrap(), 24);
-        assert_eq!(select_crc_worker_count(16, None, 64).unwrap(), 16);
-        assert!(select_crc_worker_count(256, Some(25), 25).is_err());
-        assert!(select_crc_worker_count(256, Some(33), 64).is_err());
-        assert!(select_crc_worker_count(256, Some(0), 64).is_err());
+        assert_eq!(
+            select_crc_worker_count(256, None, 25, BenchmarkScenario::File).unwrap(),
+            4
+        );
+        assert_eq!(
+            select_crc_worker_count(256, None, 25, BenchmarkScenario::Memory).unwrap(),
+            24
+        );
+        assert_eq!(
+            select_crc_worker_count(256, Some(24), 25, BenchmarkScenario::File).unwrap(),
+            24
+        );
+        assert_eq!(
+            select_crc_worker_count(16, None, 64, BenchmarkScenario::Memory).unwrap(),
+            16
+        );
+        assert!(select_crc_worker_count(256, Some(25), 25, BenchmarkScenario::File).is_err());
+        assert!(select_crc_worker_count(256, Some(33), 64, BenchmarkScenario::File).is_err());
+        assert!(select_crc_worker_count(256, Some(0), 64, BenchmarkScenario::File).is_err());
     }
 
     #[test]
@@ -3050,6 +3120,26 @@ mod tests {
     }
 
     #[test]
+    fn fresh_direct_file_sink_refuses_existing_output() {
+        let path = std::env::temp_dir().join(format!(
+            "urma-fresh-sink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"existing").unwrap();
+        let error = match WindowSink::file_fresh(&path, 0, 0, FileCompletionPolicy::Buffered) {
+            Ok(_) => panic!("fresh sink unexpectedly reused an existing output"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Io { .. }));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn positional_source_read_fills_exact_registered_range() {
         let path = std::env::temp_dir().join(format!(
             "urma-direct-source-{}-{}",
@@ -3187,6 +3277,7 @@ mod tests {
             sink: SinkStats {
                 transport_receive_ns: 34,
                 drain_ns: 35,
+                output_fresh: 1,
                 outstanding_at_end: 36,
                 pending_at_end: 37,
                 max_outstanding: 38,
