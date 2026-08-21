@@ -858,6 +858,13 @@ pub fn run_urma_parent_profile(
         .insert("file_pread_ns".into(), direct_file_tx.pread_ns);
     result
         .transport_stats
+        .insert("file_tx_batch_count".into(), direct_file_tx.batch_count);
+    result.transport_stats.insert(
+        "file_tx_batch_max_bytes".into(),
+        direct_file_tx.batch_max_bytes,
+    );
+    result
+        .transport_stats
         .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);
 
     session.close()?;
@@ -1267,25 +1274,29 @@ fn send_source(
             let file = source.open()?;
             let mut offset = 0u64;
             while offset < source.length() {
-                let length = usize::try_from((source.length() - offset).min(chunk_size as u64))
-                    .expect("file chunk is bounded by usize chunk_size");
-                post_file_data(
+                let lengths = file_tx_batch_lengths(
+                    source.length() - offset,
+                    chunk_size,
+                    pipeline.configured_window(),
+                )?;
+                let batch_bytes = post_file_batch(
                     connection,
                     pipeline,
                     sequence,
                     &file,
                     offset,
-                    length,
-                    u64::from(sequence) + 1 == chunk_count,
+                    &lengths,
                     control,
                     remote_credit,
                     &mut last_progress,
                     direct_file_tx,
                 )?;
-                offset += length as u64;
-                *bytes_sent += length as u64;
+                offset += batch_bytes;
+                *bytes_sent += batch_bytes;
                 sequence = sequence
-                    .checked_add(1)
+                    .checked_add(u32::try_from(lengths.len()).map_err(|_| {
+                        Error::Protocol("URMA file TX batch count exceeds u32".into())
+                    })?)
                     .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
             }
         }
@@ -1298,6 +1309,8 @@ struct DirectFileTxStats {
     pread_calls: u64,
     pread_bytes: u64,
     pread_ns: u64,
+    batch_count: u64,
+    batch_max_bytes: u64,
 }
 
 fn repeated_payload_crc32(payload: &[u8], repetitions: u64) -> u32 {
@@ -1389,20 +1402,42 @@ fn post_data(
     Ok(())
 }
 
-fn post_file_data(
+fn file_tx_batch_lengths(
+    remaining: u64,
+    chunk_size: usize,
+    max_chunks: usize,
+) -> Result<Vec<usize>> {
+    if remaining == 0 || chunk_size == 0 || max_chunks == 0 {
+        return Err(invalid(
+            "file TX batch requires remaining bytes, chunk size, and capacity",
+        ));
+    }
+    let chunk_size_u64 =
+        u64::try_from(chunk_size).map_err(|_| invalid("file TX chunk size exceeds u64"))?;
+    let count = usize::try_from(remaining.div_ceil(chunk_size_u64).min(max_chunks as u64))
+        .map_err(|_| invalid("file TX batch count exceeds usize"))?;
+    let mut lengths = vec![chunk_size; count];
+    let prefix = chunk_size_u64
+        .checked_mul((count - 1) as u64)
+        .ok_or_else(|| invalid("file TX batch prefix overflow"))?;
+    lengths[count - 1] = usize::try_from((remaining - prefix).min(chunk_size_u64))
+        .map_err(|_| invalid("file TX tail length exceeds usize"))?;
+    Ok(lengths)
+}
+
+fn post_file_batch(
     connection: &mut UrmaConnection<'_>,
     pipeline: &mut PipelineTracker,
-    sequence: u32,
+    first_sequence: u32,
     file: &File,
     offset: u64,
-    length: usize,
-    is_last: bool,
+    lengths: &[usize],
     control: &mut TcpStream,
     remote_credit: &mut RemoteReceiveCredit,
     last_progress: &mut Instant,
     stats: &mut DirectFileTxStats,
-) -> Result<()> {
-    while !pipeline.can_post() {
+) -> Result<u64> {
+    while pipeline.current() != 0 {
         let completed = poll_send_completions(connection, pipeline)?;
         if completed != 0 {
             *last_progress = Instant::now();
@@ -1413,12 +1448,19 @@ fn post_file_data(
             });
         }
     }
-    wait_for_remote_credit(control, remote_credit)?;
+    wait_for_remote_credit_count(control, remote_credit, lengths.len())?;
+
+    let batch_bytes = lengths.iter().try_fold(0usize, |total, &length| {
+        total
+            .checked_add(length)
+            .ok_or_else(|| invalid("file TX batch byte count overflow"))
+    })?;
 
     let mut pread_calls = 0u64;
     let mut pread_ns = 0u64;
     let send_result =
-        connection.send_filled_tracked(length, u64::from(sequence), is_last, |registered| {
+        connection.send_filled_batch_tracked(lengths, u64::from(first_sequence), |registered| {
+            debug_assert_eq!(registered.len(), batch_bytes);
             let pread_started = Instant::now();
             let result = read_exact_at(file, offset, registered, &mut pread_calls);
             pread_ns = u64::try_from(pread_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1427,12 +1469,16 @@ fn post_file_data(
     stats.pread_ns = stats.pread_ns.saturating_add(pread_ns);
     stats.pread_calls = stats.pread_calls.saturating_add(pread_calls);
     send_result?;
-    stats.pread_bytes = stats.pread_bytes.saturating_add(length as u64);
+    stats.pread_bytes = stats.pread_bytes.saturating_add(batch_bytes as u64);
+    stats.batch_count = stats.batch_count.saturating_add(1);
+    stats.batch_max_bytes = stats.batch_max_bytes.max(batch_bytes as u64);
 
-    remote_credit.consume()?;
-    pipeline.posted()?;
+    for _ in lengths {
+        remote_credit.consume()?;
+        pipeline.posted()?;
+    }
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
-    Ok(())
+    Ok(batch_bytes as u64)
 }
 
 fn read_exact_at(file: &File, offset: u64, output: &mut [u8], calls: &mut u64) -> Result<()> {
@@ -1881,12 +1927,25 @@ fn wait_for_remote_credit(
     stream: &mut TcpStream,
     remote_credit: &mut RemoteReceiveCredit,
 ) -> Result<()> {
-    if remote_credit.can_send() {
+    wait_for_remote_credit_count(stream, remote_credit, 1)
+}
+
+fn wait_for_remote_credit_count(
+    stream: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
+    required: usize,
+) -> Result<()> {
+    if required == 0 || required > remote_credit.initial() {
+        return Err(invalid(
+            "remote credit batch must be within the initial RQ capacity",
+        ));
+    }
+    if remote_credit.available() >= required {
         return Ok(());
     }
     remote_credit.waited()?;
     let wait_started = Instant::now();
-    while !remote_credit.can_send() {
+    while remote_credit.available() < required {
         let (kind, payload) = read_control_frame(stream)?;
         if kind != CREDIT {
             return Err(Error::Protocol(format!(
@@ -2490,6 +2549,21 @@ mod tests {
         let mut too_long = [0u8; 4];
         assert!(read_exact_at(&file, 8, &mut too_long, &mut calls).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn file_tx_batches_keep_wr_chunks_within_provider_payload() {
+        let chunk = 64 * 1024;
+        let full = file_tx_batch_lengths((chunk * 128) as u64, chunk, 64).unwrap();
+        assert_eq!(full.len(), 64);
+        assert!(full.iter().all(|&length| length == chunk));
+        assert_eq!(full.iter().sum::<usize>(), 4 * 1024 * 1024);
+
+        let tail = file_tx_batch_lengths((chunk * 2 + 17) as u64, chunk, 64).unwrap();
+        assert_eq!(tail, vec![chunk, chunk, 17]);
+        assert!(file_tx_batch_lengths(0, chunk, 64).is_err());
+        assert!(file_tx_batch_lengths(1, 0, 64).is_err());
+        assert!(file_tx_batch_lengths(1, chunk, 0).is_err());
     }
 
     #[test]

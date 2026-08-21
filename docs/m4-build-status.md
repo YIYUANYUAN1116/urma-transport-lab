@@ -223,3 +223,14 @@ benchmark 的 URMA file scenario 已移除 Parent 普通 heap chunk 到 register
 结果 JSON 新增 `direct_file_tx`、`file_pread_calls`、`file_pread_bytes` 和
 `file_pread_ns`。本地 feature-on URMA benchmark 28 项单元测试和 ABI 基线测试通过；
 真实 provider file scenario 尚未运行，不能据此宣称磁盘或 page-cache 性能收益。
+
+## 2026-08-20：file TX registered batch read
+
+真实 8 GiB 文件和 2 GiB tmpfs 数据确认 Parent 的 64 KiB positional read 占 steady-state
+约 98%。file TX 已进一步改为分配一个物理连续 registered TX slot batch，一次读取整个
+batch，再按 provider `max_msg_size=65536` 拆成独立 SEND。window=64 时 batch 为 4 MiB。
+
+每个 batch tail 强制 completion，并在复用前完整 drain；fill/partial-post 错误路径区分
+尚未提交和已被硬件引用的 slots。新增 `file_tx_batch_count`、
+`file_tx_batch_max_bytes`。本地 URMA benchmark 29 项单元测试通过，真实 provider
+吞吐和错误/关闭行为待验证。

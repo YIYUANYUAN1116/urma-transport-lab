@@ -202,30 +202,38 @@ mod native {
             self.send_frame_with_sequence(&[], Some(sequence), is_tail, Some(length))
         }
 
-        pub(crate) fn send_filled_tracked(
+        pub(crate) fn send_filled_batch_tracked(
             &mut self,
-            length: usize,
-            sequence: u64,
-            is_tail: bool,
+            lengths: &[usize],
+            first_sequence: u64,
             fill: impl FnOnce(&mut [u8]) -> Result<()>,
-        ) -> Result<()> {
+        ) -> Result<usize> {
             self.require(ConnectionState::Ready)?;
             self.receive_credit.require_before_send()?;
-            let complete_enable =
-                is_tail || self.sends_since_completion + 1 >= self.send_completion_interval;
-            let slot = self
-                .buffer_pool
-                .allocate(SlotKind::Tx)
-                .ok_or_else(|| Error::InvalidConfiguration("no free TX slot".into()))?;
-            let layout = self.buffer_pool.fill_tx(slot, length, fill);
-            let (offset, length) = match layout {
-                Ok(layout) => layout,
-                Err(error) => {
-                    self.buffer_pool.release(slot)?;
+            let last_offset = u64::try_from(lengths.len().saturating_sub(1))
+                .map_err(|_| Error::Protocol("SEND batch length exceeds u64".into()))?;
+            first_sequence
+                .checked_add(last_offset)
+                .ok_or_else(|| Error::Protocol("SEND sequence overflow".into()))?;
+            let layouts = self.buffer_pool.fill_tx_batch(lengths, fill)?;
+            for (index, &(slot, offset, length)) in layouts.iter().enumerate() {
+                // A batch is drained before its registered range may be
+                // filled again, so its final WR must always establish a
+                // completion frontier even when moderation does not divide
+                // the batch length.
+                let complete_enable = index + 1 == layouts.len()
+                    || self.sends_since_completion + 1 >= self.send_completion_interval;
+                let sequence = first_sequence + index as u64;
+                if let Err(error) =
+                    self.post_allocated_send(slot, offset, length, Some(sequence), complete_enable)
+                {
+                    for &(remaining, _, _) in layouts.iter().skip(index + 1) {
+                        self.buffer_pool.release(remaining)?;
+                    }
                     return Err(error);
                 }
-            };
-            self.post_allocated_send(slot, offset, length, Some(sequence), complete_enable)
+            }
+            Ok(layouts.len())
         }
 
         pub fn configure_send_completion_interval(&mut self, interval: usize) -> Result<()> {

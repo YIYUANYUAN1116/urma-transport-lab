@@ -427,42 +427,98 @@ mod native {
             Ok((offset, length))
         }
 
-        /// Gives a producer temporary mutable access to an allocated,
-        /// registered TX slot before any WR references it. The slice cannot
-        /// escape the closure, and the caller still owns the slot lifecycle.
-        pub(crate) fn fill_tx(
+        /// Allocates one physically contiguous run of TX slots and fills the
+        /// whole registered range in one producer call. Every slot except the
+        /// final one must be full so that packed file bytes remain aligned with
+        /// the independently posted SEND SGEs.
+        pub(crate) fn fill_tx_batch(
             &mut self,
-            id: SlotId,
-            length: usize,
+            lengths: &[usize],
             fill: impl FnOnce(&mut [u8]) -> Result<()>,
-        ) -> Result<(u64, u32)> {
-            if self.config.alias_tx_slots {
+        ) -> Result<Vec<(SlotId, u64, u32)>> {
+            if self.config.alias_tx_slots || lengths.is_empty() {
                 return Err(Error::InvalidConfiguration(
-                    "direct TX fill is not valid for aliased TX slots".into(),
+                    "direct TX batch requires non-empty, non-aliased TX slots".into(),
                 ));
             }
-            let (offset, capacity, kind, state) = self.slot_fields(id)?;
-            if kind != SlotKind::Tx || state != SlotState::Allocated {
+            if lengths.len() > self.config.tx_slot_count {
                 return Err(Error::InvalidConfiguration(
-                    "direct TX fill requires an allocated TX slot".into(),
+                    "direct TX batch exceeds TX slot count".into(),
                 ));
             }
-            if length == 0 || length > capacity {
-                return Err(Error::InvalidConfiguration(format!(
-                    "direct TX fill length {length} is outside 1..={capacity}"
-                )));
+            for (index, &length) in lengths.iter().enumerate() {
+                if length == 0 || length > self.config.slot_size {
+                    return Err(Error::InvalidConfiguration(format!(
+                        "direct TX batch length {length} is outside 1..={} at index {index}",
+                        self.config.slot_size
+                    )));
+                }
+                if index + 1 != lengths.len() && length != self.config.slot_size {
+                    return Err(Error::InvalidConfiguration(
+                        "only the final direct TX batch slot may be short".into(),
+                    ));
+                }
             }
-            let offset = u64::try_from(offset)
+            if self.segment.is_none() {
+                return Err(Error::InvalidConfiguration(
+                    "registered Segment is closed".into(),
+                ));
+            }
+            let fill_length = self
+                .config
+                .slot_size
+                .checked_mul(lengths.len() - 1)
+                .and_then(|prefix| prefix.checked_add(*lengths.last().expect("non-empty")))
+                .ok_or_else(|| Error::InvalidConfiguration("TX batch length overflow".into()))?;
+            let fill_length_u32 = u32::try_from(fill_length)
+                .map_err(|_| Error::InvalidConfiguration("TX batch length exceeds u32".into()))?;
+
+            let start = self
+                .slots
+                .iter()
+                .take(self.config.tx_slot_count)
+                .map(|slot| slot.state)
+                .collect::<Vec<_>>()
+                .windows(lengths.len())
+                .position(|states| states.iter().all(|state| *state == SlotState::Free))
+                .ok_or_else(|| Error::InvalidConfiguration("no contiguous free TX batch".into()))?;
+            let end = start + lengths.len();
+            let first_offset_u64 = u64::try_from(self.slots[start].offset)
                 .map_err(|_| Error::InvalidConfiguration("slot offset exceeds u64".into()))?;
-            let length = u32::try_from(length)
-                .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
-            self.segment
+            let layouts = lengths
+                .iter()
+                .enumerate()
+                .map(|(relative, &length)| {
+                    let id = SlotId(start + relative);
+                    let offset = u64::try_from(self.slots[id.0].offset).map_err(|_| {
+                        Error::InvalidConfiguration("slot offset exceeds u64".into())
+                    })?;
+                    let length = u32::try_from(length)
+                        .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
+                    Ok((id, offset, length))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let allocated = (start..end).collect::<Vec<_>>();
+            self.free_tx.retain(|index| !allocated.contains(index));
+            for &index in &allocated {
+                self.slots[index].state = SlotState::Allocated;
+            }
+
+            let fill_result = self
+                .segment
                 .as_mut()
-                .ok_or_else(|| Error::InvalidConfiguration("registered Segment is closed".into()))?
+                .expect("Segment presence checked before allocating TX slots")
                 .handle
-                .with_write(offset, length, fill)
-                .map_err(|error| map_ffi_error("fill_tx_slot", error))??;
-            Ok((offset, length))
+                .with_write(first_offset_u64, fill_length_u32, fill)
+                .map_err(|error| map_ffi_error("fill_tx_batch", error))
+                .and_then(|result| result);
+            if let Err(error) = fill_result {
+                for index in allocated {
+                    self.release(SlotId(index))?;
+                }
+                return Err(error);
+            }
+            Ok(layouts)
         }
 
         pub(crate) fn prepare_aliased_tx(&mut self, data: &[u8]) -> Result<()> {
