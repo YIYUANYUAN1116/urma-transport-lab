@@ -1441,31 +1441,33 @@ fn send_fixed_payload(
     remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
 ) -> Result<u32> {
-    let mut last_progress = Instant::now();
     let count = u32::try_from(chunk_count)
         .map_err(|_| Error::Protocol("URMA sequence count exceeds u32".into()))?;
-    for sequence in 0..count {
-        while !pipeline.can_post() {
-            let completed = poll_send_completions(connection, pipeline)?;
-            if completed != 0 {
-                last_progress = Instant::now();
-            } else if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
-                return Err(Error::Timeout {
-                    operation: "URMA fixed TX pipeline capacity",
-                });
-            }
+    let mut sequence = 0u32;
+    while sequence < count {
+        let batch_count = usize::try_from(count - sequence)
+            .unwrap_or(usize::MAX)
+            .min(pipeline.configured_window());
+        wait_for_remote_credit_count(control, remote_credit, batch_count)?;
+        drain_pipeline(connection, pipeline)?;
+        let prepared = connection.prepare_aliased_tx_batch(payload_len, batch_count)?;
+        let posted = connection.post_prepared_batch_tracked(prepared, u64::from(sequence))?;
+        for _ in 0..posted {
+            remote_credit.consume()?;
+            pipeline.posted()?;
         }
-        wait_for_remote_credit(control, remote_credit)?;
-        connection.send_prepared_tracked(
-            payload_len,
-            u64::from(sequence),
-            sequence + 1 == count,
-        )?;
-        remote_credit.consume()?;
-        pipeline.posted()?;
+        let posted_bytes = (payload_len as u64)
+            .checked_mul(posted as u64)
+            .ok_or_else(|| Error::Protocol("fixed TX byte count overflow".into()))?;
         *bytes_sent = bytes_sent
-            .checked_add(payload_len as u64)
+            .checked_add(posted_bytes)
             .ok_or_else(|| Error::Protocol("sent byte count overflow".into()))?;
+        sequence = sequence
+            .checked_add(
+                u32::try_from(posted)
+                    .map_err(|_| Error::Protocol("fixed TX batch exceeds u32".into()))?,
+            )
+            .ok_or_else(|| Error::Protocol("fixed TX sequence overflow".into()))?;
     }
     Ok(count)
 }

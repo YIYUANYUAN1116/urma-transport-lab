@@ -563,6 +563,49 @@ mod native {
                 .map_err(|error| map_ffi_error("prepare_aliased_tx", error))
         }
 
+        pub(crate) fn prepare_aliased_tx_batch(
+            &mut self,
+            length: usize,
+            count: usize,
+        ) -> Result<PreparedTxBatch> {
+            if !self.config.alias_tx_slots
+                || length == 0
+                || length > self.config.slot_size
+                || count == 0
+                || count > self.config.tx_slot_count
+            {
+                return Err(Error::InvalidConfiguration(
+                    "aliased TX batch is outside the configured slot layout".into(),
+                ));
+            }
+            let length_u32 = u32::try_from(length)
+                .map_err(|_| Error::InvalidConfiguration("TX length exceeds u32".into()))?;
+            let mut layouts = Vec::with_capacity(count);
+            for _ in 0..count {
+                let Some(slot) = self.allocate(SlotKind::Tx) else {
+                    for (slot, _, _) in layouts {
+                        self.release(slot)?;
+                    }
+                    return Err(Error::InvalidConfiguration(
+                        "no free aliased TX slot for batch".into(),
+                    ));
+                };
+                let (offset, posted_length) = match self.aliased_tx_layout(slot, length) {
+                    Ok(layout) => layout,
+                    Err(error) => {
+                        self.release(slot)?;
+                        for (slot, _, _) in layouts {
+                            self.release(slot)?;
+                        }
+                        return Err(error);
+                    }
+                };
+                debug_assert_eq!(posted_length, length_u32);
+                layouts.push((slot, offset, posted_length));
+            }
+            Ok(PreparedTxBatch { layouts })
+        }
+
         pub(crate) fn aliased_tx_layout(&self, id: SlotId, length: usize) -> Result<(u64, u32)> {
             let (offset, capacity, kind, state) = self.slot_fields(id)?;
             if !self.config.alias_tx_slots || kind != SlotKind::Tx || state != SlotState::Allocated

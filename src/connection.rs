@@ -329,6 +329,16 @@ mod native {
             self.send_frame_with_sequence(&[], Some(sequence), is_tail, Some(length))
         }
 
+        pub(crate) fn prepare_aliased_tx_batch(
+            &mut self,
+            length: usize,
+            count: usize,
+        ) -> Result<crate::buffer::PreparedTxBatch> {
+            self.require(ConnectionState::Ready)?;
+            self.receive_credit.require_before_send()?;
+            self.buffer_pool.prepare_aliased_tx_batch(length, count)
+        }
+
         pub(crate) fn prepare_filled_batch(
             &mut self,
             lengths: &[usize],
