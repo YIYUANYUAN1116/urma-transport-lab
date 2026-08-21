@@ -150,6 +150,20 @@ mod native {
         pub(crate) fn len(&self) -> usize {
             self.layouts.len()
         }
+
+        pub(crate) fn split(self, maximum: usize) -> Vec<Self> {
+            debug_assert!(maximum != 0);
+            let mut layouts = self.layouts.into_iter();
+            let mut batches = Vec::new();
+            loop {
+                let part = layouts.by_ref().take(maximum).collect::<Vec<_>>();
+                if part.is_empty() {
+                    break;
+                }
+                batches.push(Self { layouts: part });
+            }
+            batches
+        }
     }
 
     #[derive(Clone, Copy)]

@@ -35,6 +35,7 @@ const START: u16 = 2;
 const DONE: u16 = 3;
 const CREDIT: u16 = 4;
 const SEND_COMPLETION_INTERVAL: usize = 100;
+pub const DEFAULT_SEND_POST_LIST: usize = 16;
 const VERIFIED_RX_POOL_WINDOWS: usize = 32;
 const MAX_CRC_WORKERS: usize = 32;
 
@@ -774,7 +775,33 @@ pub fn run_urma_parent_profile(
     source: UrmaBenchmarkSource,
     profile: UrmaBenchmarkProfile,
 ) -> Result<BenchmarkResult> {
+    run_urma_parent_profile_with_post_list(
+        case,
+        device,
+        eid_index,
+        listen,
+        source,
+        profile,
+        DEFAULT_SEND_POST_LIST,
+    )
+}
+
+pub fn run_urma_parent_profile_with_post_list(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    listen: impl ToSocketAddrs,
+    source: UrmaBenchmarkSource,
+    profile: UrmaBenchmarkProfile,
+    send_post_list: usize,
+) -> Result<BenchmarkResult> {
     source.validate(case)?;
+    if send_post_list == 0 || send_post_list > case.window as usize {
+        return Err(invalid(format!(
+            "SEND post-list {send_post_list} must be in 1..={}",
+            case.window
+        )));
+    }
     if profile.uses_fixed_tx()
         && (case.scenario != BenchmarkScenario::Memory
             || case.transfer_bytes == 0
@@ -884,6 +911,7 @@ pub fn run_urma_parent_profile(
             session.stream_mut(),
             &mut remote_credit,
             &mut bytes_sent,
+            send_post_list,
         )?
     } else {
         send_source(
@@ -896,6 +924,7 @@ pub fn run_urma_parent_profile(
             &mut bytes_sent,
             &mut tx_fill,
             mapped_file.as_ref(),
+            send_post_list,
         )?
     };
     drain_pipeline(&mut connection, &mut pipeline)?;
@@ -942,6 +971,11 @@ pub fn run_urma_parent_profile(
     result.transport_stats.insert(
         "fixed_tx_profile".into(),
         u64::from(profile.uses_fixed_tx()),
+    );
+    result.transport_stats.insert(
+        "configured_send_post_list".into(),
+        u64::try_from(send_post_list)
+            .map_err(|_| invalid("SEND post-list does not fit result u64"))?,
     );
     result.transport_stats.insert(
         "direct_file_tx".into(),
@@ -1354,6 +1388,7 @@ fn send_source(
     bytes_sent: &mut u64,
     stats: &mut TxFillStats,
     mapped_file: Option<&MappedFileSource>,
+    send_post_list: usize,
 ) -> Result<u32> {
     let (mut window_source, source_length, is_file) = match source {
         UrmaBenchmarkSource::Memory(source) => (
@@ -1387,6 +1422,7 @@ fn send_source(
         remote_credit,
         bytes_sent,
         stats,
+        send_post_list,
     )
 }
 
@@ -1440,18 +1476,39 @@ fn send_fixed_payload(
     control: &mut TcpStream,
     remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
+    send_post_list: usize,
 ) -> Result<u32> {
     let count = u32::try_from(chunk_count)
         .map_err(|_| Error::Protocol("URMA sequence count exceeds u32".into()))?;
     let mut sequence = 0u32;
+    let mut last_progress = Instant::now();
     while sequence < count {
+        while !pipeline.can_post() {
+            let completed = poll_send_completions(connection, pipeline)?;
+            if completed != 0 {
+                last_progress = Instant::now();
+            } else if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
+                return Err(Error::Timeout {
+                    operation: "URMA fixed TX pipeline capacity",
+                });
+            }
+        }
+        let available_window = pipeline.configured_window() - pipeline.current();
         let batch_count = usize::try_from(count - sequence)
             .unwrap_or(usize::MAX)
-            .min(pipeline.configured_window());
+            .min(send_post_list)
+            .min(available_window);
         wait_for_remote_credit_count(control, remote_credit, batch_count)?;
-        drain_pipeline(connection, pipeline)?;
         let prepared = connection.prepare_aliased_tx_batch(payload_len, batch_count)?;
-        let posted = connection.post_prepared_batch_tracked(prepared, u64::from(sequence))?;
+        let force_tail_completion = sequence
+            .checked_add(batch_count as u32)
+            .is_some_and(|next| next == count);
+        let posted = connection.post_prepared_batch_tracked_list_with_tail(
+            prepared,
+            u64::from(sequence),
+            send_post_list,
+            force_tail_completion,
+        )?;
         for _ in 0..posted {
             remote_credit.consume()?;
             pipeline.posted()?;
@@ -1574,6 +1631,7 @@ fn send_windowed_source(
     remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
     stats: &mut TxFillStats,
+    send_post_list: usize,
 ) -> Result<u32> {
     if source_length == 0 {
         return Ok(0);
@@ -1605,8 +1663,11 @@ fn send_windowed_source(
             return Err(error);
         }
 
-        let posted =
-            connection.post_prepared_batch_tracked(prepared.registered, u64::from(sequence))?;
+        let posted = connection.post_prepared_batch_tracked_list(
+            prepared.registered,
+            u64::from(sequence),
+            send_post_list,
+        )?;
         debug_assert_eq!(posted, prepared.lengths.len());
         for _ in 0..posted {
             remote_credit.consume()?;

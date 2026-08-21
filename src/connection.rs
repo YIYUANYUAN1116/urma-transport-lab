@@ -356,10 +356,63 @@ mod native {
             self.buffer_pool.discard_tx_batch(batch)
         }
 
-        pub(crate) fn post_prepared_batch_tracked(
+        pub(crate) fn post_prepared_batch_tracked_list(
             &mut self,
             batch: crate::buffer::PreparedTxBatch,
             first_sequence: u64,
+            post_list: usize,
+        ) -> Result<usize> {
+            self.post_prepared_batch_tracked_list_with_tail(batch, first_sequence, post_list, true)
+        }
+
+        pub(crate) fn post_prepared_batch_tracked_list_with_tail(
+            &mut self,
+            batch: crate::buffer::PreparedTxBatch,
+            first_sequence: u64,
+            post_list: usize,
+            force_tail_completion: bool,
+        ) -> Result<usize> {
+            if post_list == 0 {
+                self.buffer_pool.discard_tx_batch(batch)?;
+                return Err(Error::InvalidConfiguration(
+                    "SEND post-list must be non-zero".into(),
+                ));
+            }
+            let total_len = batch.len();
+            let last_offset = match u64::try_from(total_len.saturating_sub(1)) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    self.buffer_pool.discard_tx_batch(batch)?;
+                    return Err(Error::Protocol("SEND batch length exceeds u64".into()));
+                }
+            };
+            if first_sequence.checked_add(last_offset).is_none() {
+                self.buffer_pool.discard_tx_batch(batch)?;
+                return Err(Error::Protocol("SEND sequence overflow".into()));
+            }
+            let mut parts = batch.split(post_list).into_iter().peekable();
+            let mut posted_total = 0usize;
+            while let Some(part) = parts.next() {
+                let part_sequence = first_sequence + posted_total as u64;
+                let force_part_tail = force_tail_completion && parts.peek().is_none();
+                match self.post_prepared_batch_part(part, part_sequence, force_part_tail) {
+                    Ok(posted) => posted_total += posted,
+                    Err(error) => {
+                        for remaining in parts {
+                            self.buffer_pool.discard_tx_batch(remaining)?;
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(posted_total)
+        }
+
+        fn post_prepared_batch_part(
+            &mut self,
+            batch: crate::buffer::PreparedTxBatch,
+            first_sequence: u64,
+            force_tail_completion: bool,
         ) -> Result<usize> {
             if let Err(error) = self.require(ConnectionState::Ready) {
                 self.buffer_pool.discard_tx_batch(batch)?;
@@ -381,11 +434,10 @@ mod native {
             let mut descriptors = Vec::with_capacity(layouts.len());
             let mut sends_since_completion = self.sends_since_completion;
             for (index, &(slot, offset, length)) in layouts.iter().enumerate() {
-                // A batch is drained before its registered range may be
-                // filled again, so its final WR must always establish a
-                // completion frontier even when moderation does not divide
-                // the batch length.
-                let complete_enable = index + 1 == layouts.len()
+                // Completion moderation spans provider post calls. The
+                // caller forces a tail frontier only where the underlying
+                // registered range is about to be reused or at transfer end.
+                let complete_enable = (force_tail_completion && index + 1 == layouts.len())
                     || sends_since_completion + 1 >= self.send_completion_interval;
                 if complete_enable {
                     sends_since_completion = 0;

@@ -37,6 +37,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut device = String::from("urma0");
     let mut eid_index = 0u32;
     let mut urma_profile = String::from("normal");
+    let mut urma_post_list = 16usize;
     let mut crc_workers: Option<usize> = None;
 
     let mut args = std::env::args().skip(1);
@@ -79,6 +80,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--device" => device = required_value(&mut args, "--device")?,
             "--eid-index" => eid_index = parse_value(&mut args, "--eid-index")?,
             "--urma-profile" => urma_profile = required_value(&mut args, "--urma-profile")?,
+            "--urma-post-list" => urma_post_list = parse_value(&mut args, "--urma-post-list")?,
             "--crc-workers" => crc_workers = Some(parse_value(&mut args, "--crc-workers")?),
             "--help" | "-h" => {
                 print_usage();
@@ -109,7 +111,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "urma")]
     if case.transport == BenchmarkTransport::Urma {
         use urma_transport_lab::{
-            run_urma_child_profile_with_crc_workers, run_urma_parent_profile,
+            run_urma_child_profile_with_crc_workers, run_urma_parent_profile_with_post_list,
             UrmaBenchmarkDestination, UrmaBenchmarkProfile, UrmaBenchmarkSource,
         };
         let profile = match urma_profile.as_str() {
@@ -135,7 +137,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )?),
                 };
                 eprintln!("benchmark URMA parent: listening on {listen}");
-                run_urma_parent_profile(&case, device, eid_index, &listen, source, profile)?
+                run_urma_parent_profile_with_post_list(
+                    &case,
+                    device,
+                    eid_index,
+                    &listen,
+                    source,
+                    profile,
+                    urma_post_list,
+                )?
             }
             Role::Child => {
                 let destination = match case.scenario {
@@ -164,7 +174,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("URMA benchmark requires --features urma".into());
     }
     #[cfg(not(feature = "urma"))]
-    let _ = (&device, eid_index, &urma_profile, crc_workers);
+    let _ = (
+        &device,
+        eid_index,
+        &urma_profile,
+        urma_post_list,
+        crc_workers,
+    );
 
     let result = match role {
         Role::Parent => {
@@ -247,6 +263,7 @@ fn print_usage() {
            --eid-index N                 URMA EID index, default: 0\n\
            --urma-profile normal|fixed-tx|rx128|fixed-tx-rx128|transport-only|fixed-tx-transport-only\n\
                                          URMA diagnostic profile, default: normal\n\
+           --urma-post-list N             linked SEND WRs per provider post, default: 16\n\
            --crc-workers N               Child CRC workers, default: affinity CPUs minus one,\n\
                                          maximum: 32"
     );
