@@ -15,7 +15,7 @@ typedef struct urma_lab_jetty urma_lab_jetty_t;
 typedef struct urma_lab_descriptor urma_lab_descriptor_t;
 typedef struct urma_lab_wr urma_lab_wr_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 7U
+#define URMA_LAB_SHIM_ABI_VERSION 8U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
@@ -91,6 +91,15 @@ typedef struct urma_lab_completion {
     uint8_t user_ctx_valid;
     uint8_t reserved;
 } urma_lab_completion_t;
+
+/* Pointer-free input used to build a linked WR list inside the C shim. */
+typedef struct urma_lab_wr_desc {
+    uint64_t offset;
+    uint64_t user_ctx;
+    uint32_t length;
+    uint8_t complete_enable;
+    uint8_t reserved[3];
+} urma_lab_wr_desc_t;
 
 /*
  * Opens the smallest process-global chain: urma_init -> device -> context.
@@ -187,6 +196,22 @@ int urma_lab_post_recv(urma_lab_jetty_t *jetty,
                        urma_lab_segment_t *segment, uint64_t offset,
                        uint32_t length, uint64_t user_ctx,
                        urma_lab_wr_t **out);
+/*
+ * Posts one linked list. `out_posted` is the successfully submitted prefix;
+ * only those entries in `out_wrs` are provider-owned and require completion.
+ * On providers that return an error without bad_wr, the complete list is
+ * conservatively treated as possibly posted and must not be reused early.
+ */
+int urma_lab_post_send_batch(urma_lab_jetty_t *jetty,
+                             urma_lab_segment_t *segment,
+                             const urma_lab_wr_desc_t *descs,
+                             uint32_t count, urma_lab_wr_t **out_wrs,
+                             uint32_t *out_posted);
+int urma_lab_post_recv_batch(urma_lab_jetty_t *jetty,
+                             urma_lab_segment_t *segment,
+                             const urma_lab_wr_desc_t *descs,
+                             uint32_t count, urma_lab_wr_t **out_wrs,
+                             uint32_t *out_posted);
 void urma_lab_wr_complete(urma_lab_wr_t *wr);
 
 /* Non-blocking poll. Returns a count in [0, capacity], or a negative error. */

@@ -137,6 +137,132 @@ mod native {
             self.recv_ready_with_sequence(Some(sequence))
         }
 
+        pub(crate) fn recv_ready_tracked_batch(
+            &mut self,
+            first_sequence: u64,
+            count: usize,
+        ) -> Result<usize> {
+            if count == 0 {
+                return Ok(0);
+            }
+            if !matches!(self.state, ConnectionState::Bound | ConnectionState::Ready) {
+                return Err(self.state_error("post receive batch"));
+            }
+            let last = u64::try_from(count - 1)
+                .map_err(|_| Error::Protocol("RECV batch length exceeds u64".into()))?;
+            if first_sequence.checked_add(last).is_none() {
+                return Err(Error::Protocol("RECV sequence overflow".into()));
+            }
+
+            let mut entries = Vec::with_capacity(count);
+            for _ in 0..count {
+                let Some(slot) = self.buffer_pool.allocate(SlotKind::Rx) else {
+                    for (slot, _, _) in entries {
+                        self.buffer_pool.release(slot)?;
+                    }
+                    return Err(Error::InvalidConfiguration("no free RX slot".into()));
+                };
+                let (offset, length) = match self.buffer_pool.recv_post_layout(slot) {
+                    Ok(layout) => layout,
+                    Err(error) => {
+                        self.buffer_pool.release(slot)?;
+                        for (slot, _, _) in entries {
+                            self.buffer_pool.release(slot)?;
+                        }
+                        return Err(error);
+                    }
+                };
+                entries.push((slot, offset, length));
+            }
+
+            let mut descriptors = Vec::with_capacity(count);
+            for (index, &(slot, offset, length)) in entries.iter().enumerate() {
+                let token = WrToken {
+                    connection_id: self.poller.connection_id(),
+                    generation: self.poller.generation(),
+                    operation: OperationType::Recv,
+                    slot,
+                };
+                let user_ctx = match token.encode() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        for &(rollback, _, _) in entries.iter().take(index) {
+                            self.buffer_pool.rollback_post(rollback, SlotKind::Rx)?;
+                        }
+                        for &(slot, _, _) in &entries {
+                            self.buffer_pool.release(slot)?;
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.buffer_pool.mark_posted(slot, SlotKind::Rx) {
+                    for &(rollback, _, _) in entries.iter().take(index) {
+                        self.buffer_pool.rollback_post(rollback, SlotKind::Rx)?;
+                    }
+                    for &(release, _, _) in &entries {
+                        self.buffer_pool.release(release)?;
+                    }
+                    return Err(error);
+                }
+                descriptors.push(crate::ffi::WrDescriptor {
+                    offset,
+                    length,
+                    user_ctx,
+                    complete_enable: true,
+                });
+            }
+
+            let posted_result = match self.buffer_pool.segment_handle() {
+                Ok(segment) => self.jetty.post_recv_batch(segment, &descriptors),
+                Err(error) => {
+                    for &(slot, _, _) in &entries {
+                        self.buffer_pool.rollback_post(slot, SlotKind::Rx)?;
+                        self.buffer_pool.release(slot)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let posted = match posted_result {
+                Ok(posted) => posted,
+                Err(error) => {
+                    for &(slot, _, _) in &entries {
+                        self.buffer_pool.rollback_post(slot, SlotKind::Rx)?;
+                        self.buffer_pool.release(slot)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let posted_count = posted.handles.len();
+            self.poller
+                .record_post_call(OperationType::Recv, descriptors.len());
+            for (index, handle) in posted.handles.into_iter().enumerate() {
+                self.poller.track(
+                    descriptors[index].user_ctx,
+                    OperationType::Recv,
+                    handle,
+                    Some(first_sequence + index as u64),
+                    true,
+                )?;
+                self.receive_credit.posted();
+            }
+            for &(slot, _, _) in entries.iter().skip(posted_count) {
+                self.buffer_pool.rollback_post(slot, SlotKind::Rx)?;
+                self.buffer_pool.release(slot)?;
+            }
+            if posted.status != 0 {
+                return Err(Error::Native {
+                    operation: "post_jetty_recv_wr_batch",
+                    status: posted.status,
+                });
+            }
+            if posted_count != count {
+                return Err(Error::Protocol(
+                    "successful RECV batch did not post every WR".into(),
+                ));
+            }
+            Ok(posted_count)
+        }
+
         fn recv_ready_with_sequence(&mut self, sequence: Option<u64>) -> Result<()> {
             if !matches!(self.state, ConnectionState::Bound | ConnectionState::Ready) {
                 return Err(self.state_error("post receive"));
@@ -165,6 +291,7 @@ mod native {
                     return Err(error);
                 }
             };
+            self.poller.record_post_call(OperationType::Recv, 1);
             self.poller
                 .track(user_ctx, OperationType::Recv, wr, sequence, true)?;
             self.receive_credit.posted();
@@ -241,24 +368,107 @@ mod native {
                 return Err(Error::Protocol("SEND sequence overflow".into()));
             }
             let layouts = batch.layouts;
+            let mut descriptors = Vec::with_capacity(layouts.len());
+            let mut sends_since_completion = self.sends_since_completion;
             for (index, &(slot, offset, length)) in layouts.iter().enumerate() {
                 // A batch is drained before its registered range may be
                 // filled again, so its final WR must always establish a
                 // completion frontier even when moderation does not divide
                 // the batch length.
                 let complete_enable = index + 1 == layouts.len()
-                    || self.sends_since_completion + 1 >= self.send_completion_interval;
-                let sequence = first_sequence + index as u64;
-                if let Err(error) =
-                    self.post_allocated_send(slot, offset, length, Some(sequence), complete_enable)
-                {
-                    for &(remaining, _, _) in layouts.iter().skip(index + 1) {
-                        self.buffer_pool.release(remaining)?;
+                    || sends_since_completion + 1 >= self.send_completion_interval;
+                if complete_enable {
+                    sends_since_completion = 0;
+                } else {
+                    sends_since_completion += 1;
+                }
+                let token = WrToken {
+                    connection_id: self.poller.connection_id(),
+                    generation: self.poller.generation(),
+                    operation: OperationType::Send,
+                    slot,
+                };
+                let user_ctx = match token.encode() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        for &(rollback, _, _) in layouts.iter().take(index) {
+                            self.buffer_pool.rollback_post(rollback, SlotKind::Tx)?;
+                        }
+                        for &(release, _, _) in &layouts {
+                            self.buffer_pool.release(release)?;
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.buffer_pool.mark_posted(slot, SlotKind::Tx) {
+                    for &(rollback, _, _) in layouts.iter().take(index) {
+                        self.buffer_pool.rollback_post(rollback, SlotKind::Tx)?;
+                    }
+                    for &(release, _, _) in &layouts {
+                        self.buffer_pool.release(release)?;
                     }
                     return Err(error);
                 }
+                descriptors.push(crate::ffi::WrDescriptor {
+                    offset,
+                    length,
+                    user_ctx,
+                    complete_enable,
+                });
             }
-            Ok(layouts.len())
+            let posted_result = match self.buffer_pool.segment_handle() {
+                Ok(segment) => self.jetty.post_send_batch(segment, &descriptors),
+                Err(error) => {
+                    for &(slot, _, _) in &layouts {
+                        self.buffer_pool.rollback_post(slot, SlotKind::Tx)?;
+                        self.buffer_pool.release(slot)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let posted = match posted_result {
+                Ok(posted) => posted,
+                Err(error) => {
+                    for &(slot, _, _) in &layouts {
+                        self.buffer_pool.rollback_post(slot, SlotKind::Tx)?;
+                        self.buffer_pool.release(slot)?;
+                    }
+                    return Err(error);
+                }
+            };
+            let posted_count = posted.handles.len();
+            self.poller
+                .record_post_call(OperationType::Send, descriptors.len());
+            for (index, handle) in posted.handles.into_iter().enumerate() {
+                self.poller.track(
+                    descriptors[index].user_ctx,
+                    OperationType::Send,
+                    handle,
+                    Some(first_sequence + index as u64),
+                    descriptors[index].complete_enable,
+                )?;
+                if descriptors[index].complete_enable {
+                    self.sends_since_completion = 0;
+                } else {
+                    self.sends_since_completion += 1;
+                }
+            }
+            for &(slot, _, _) in layouts.iter().skip(posted_count) {
+                self.buffer_pool.rollback_post(slot, SlotKind::Tx)?;
+                self.buffer_pool.release(slot)?;
+            }
+            if posted.status != 0 {
+                return Err(Error::Native {
+                    operation: "post_jetty_send_wr_batch",
+                    status: posted.status,
+                });
+            }
+            if posted_count != layouts.len() {
+                return Err(Error::Protocol(
+                    "successful SEND batch did not post every WR".into(),
+                ));
+            }
+            Ok(posted_count)
         }
 
         pub fn configure_send_completion_interval(&mut self, interval: usize) -> Result<()> {
@@ -348,6 +558,7 @@ mod native {
                     return Err(error);
                 }
             };
+            self.poller.record_post_call(OperationType::Send, 1);
             self.poller
                 .track(user_ctx, OperationType::Send, wr, sequence, complete_enable)?;
             if complete_enable {

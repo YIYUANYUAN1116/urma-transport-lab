@@ -5,6 +5,11 @@ use std::time::{Duration, Instant};
 pub struct CompletionStats {
     pub send_post: u64,
     pub recv_post: u64,
+    /// Provider post API calls; one call may submit a linked WR list.
+    pub send_post_calls: u64,
+    pub recv_post_calls: u64,
+    pub send_post_list_max: u64,
+    pub recv_post_list_max: u64,
     /// Hardware SEND completion records consumed from the JFC.
     pub send_cqe: u64,
     /// Logical SEND WRs retired by those ordered completion frontiers.
@@ -666,6 +671,20 @@ mod native {
 
         pub(crate) fn reserve_send(&mut self, additional: usize) {
             self.send_order.reserve(additional);
+        }
+
+        pub(crate) fn record_post_call(&mut self, operation: OperationType, count: usize) {
+            let count = u64::try_from(count).unwrap_or(u64::MAX);
+            match operation {
+                OperationType::Send => {
+                    self.stats.send_post_calls += 1;
+                    self.stats.send_post_list_max = self.stats.send_post_list_max.max(count);
+                }
+                OperationType::Recv => {
+                    self.stats.recv_post_calls += 1;
+                    self.stats.recv_post_list_max = self.stats.recv_post_list_max.max(count);
+                }
+            }
         }
 
         pub(crate) fn outstanding(&self) -> usize {

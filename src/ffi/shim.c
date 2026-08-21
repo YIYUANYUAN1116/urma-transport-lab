@@ -989,6 +989,143 @@ int urma_lab_post_recv(urma_lab_jetty_t *jetty,
     return 0;
 }
 
+static void urma_lab_return_wr_suffix(urma_lab_wr_t **wrs, uint32_t first,
+                                      uint32_t count)
+{
+    for (uint32_t i = first; i < count; ++i) {
+        urma_lab_wr_return(wrs[i]);
+        wrs[i] = NULL;
+    }
+}
+
+static uint32_t urma_lab_send_bad_index(urma_lab_wr_t **wrs, uint32_t count,
+                                        urma_jfs_wr_t *bad_wr)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        if (&wrs[i]->send_wr == bad_wr) {
+            return i;
+        }
+    }
+    return count;
+}
+
+static uint32_t urma_lab_recv_bad_index(urma_lab_wr_t **wrs, uint32_t count,
+                                        urma_jfr_wr_t *bad_wr)
+{
+    for (uint32_t i = 0; i < count; ++i) {
+        if (&wrs[i]->recv_wr == bad_wr) {
+            return i;
+        }
+    }
+    return count;
+}
+
+int urma_lab_post_send_batch(urma_lab_jetty_t *jetty,
+                             urma_lab_segment_t *segment,
+                             const urma_lab_wr_desc_t *descs,
+                             uint32_t count, urma_lab_wr_t **out_wrs,
+                             uint32_t *out_posted)
+{
+    urma_jfs_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    uint32_t acquired = 0;
+
+    if (jetty == NULL || jetty->target == NULL || jetty->bound == 0 ||
+        segment == NULL || descs == NULL || out_wrs == NULL ||
+        out_posted == NULL || count == 0 || count > jetty->wr_capacity) {
+        return -EINVAL;
+    }
+    *out_posted = 0;
+    (void)memset(out_wrs, 0, sizeof(*out_wrs) * count);
+    for (; acquired < count; ++acquired) {
+        int ret = urma_lab_wr_acquire(jetty, segment, descs[acquired].offset,
+                                      descs[acquired].length,
+                                      &out_wrs[acquired]);
+        if (ret != 0) {
+            urma_lab_return_wr_suffix(out_wrs, 0, acquired);
+            return ret;
+        }
+        urma_lab_wr_t *wr = out_wrs[acquired];
+        wr->send_wr.opcode = URMA_OPC_SEND;
+        wr->send_wr.flag.value = 0;
+        wr->send_wr.flag.bs.complete_enable =
+            descs[acquired].complete_enable != 0;
+        wr->send_wr.tjetty = jetty->target;
+        wr->send_wr.user_ctx = descs[acquired].user_ctx;
+        wr->send_wr.send.src.sge = &wr->sge;
+        wr->send_wr.send.src.num_sge = 1;
+        wr->send_wr.send.imm_data = 0;
+        wr->send_wr.next = NULL;
+        if (acquired != 0) {
+            out_wrs[acquired - 1]->send_wr.next = &wr->send_wr;
+        }
+    }
+
+    status = urma_post_jetty_send_wr(jetty->jetty,
+                                     &out_wrs[0]->send_wr, &bad_wr);
+    uint32_t posted = status == URMA_SUCCESS
+        ? count : urma_lab_send_bad_index(out_wrs, count, bad_wr);
+    if (posted != 0) {
+        out_wrs[posted - 1]->send_wr.next = NULL;
+    }
+    urma_lab_return_wr_suffix(out_wrs, posted, count);
+    for (uint32_t i = 0; i < posted; ++i) {
+        urma_lab_wr_posted(out_wrs[i]);
+    }
+    *out_posted = posted;
+    return (int)status;
+}
+
+int urma_lab_post_recv_batch(urma_lab_jetty_t *jetty,
+                             urma_lab_segment_t *segment,
+                             const urma_lab_wr_desc_t *descs,
+                             uint32_t count, urma_lab_wr_t **out_wrs,
+                             uint32_t *out_posted)
+{
+    urma_jfr_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    uint32_t acquired = 0;
+
+    if (jetty == NULL || segment == NULL || descs == NULL ||
+        out_wrs == NULL || out_posted == NULL || count == 0 ||
+        count > jetty->wr_capacity) {
+        return -EINVAL;
+    }
+    *out_posted = 0;
+    (void)memset(out_wrs, 0, sizeof(*out_wrs) * count);
+    for (; acquired < count; ++acquired) {
+        int ret = urma_lab_wr_acquire(jetty, segment, descs[acquired].offset,
+                                      descs[acquired].length,
+                                      &out_wrs[acquired]);
+        if (ret != 0) {
+            urma_lab_return_wr_suffix(out_wrs, 0, acquired);
+            return ret;
+        }
+        urma_lab_wr_t *wr = out_wrs[acquired];
+        wr->recv_wr.src.sge = &wr->sge;
+        wr->recv_wr.src.num_sge = 1;
+        wr->recv_wr.user_ctx = descs[acquired].user_ctx;
+        wr->recv_wr.next = NULL;
+        if (acquired != 0) {
+            out_wrs[acquired - 1]->recv_wr.next = &wr->recv_wr;
+        }
+    }
+
+    status = urma_post_jetty_recv_wr(jetty->jetty,
+                                     &out_wrs[0]->recv_wr, &bad_wr);
+    uint32_t posted = status == URMA_SUCCESS
+        ? count : urma_lab_recv_bad_index(out_wrs, count, bad_wr);
+    if (posted != 0) {
+        out_wrs[posted - 1]->recv_wr.next = NULL;
+    }
+    urma_lab_return_wr_suffix(out_wrs, posted, count);
+    for (uint32_t i = 0; i < posted; ++i) {
+        urma_lab_wr_posted(out_wrs[i]);
+    }
+    *out_posted = posted;
+    return (int)status;
+}
+
 void urma_lab_wr_complete(urma_lab_wr_t *wr)
 {
     if (wr == NULL) {

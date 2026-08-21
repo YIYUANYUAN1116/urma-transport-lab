@@ -649,6 +649,10 @@ fn select_crc_worker_count(
 pub struct UrmaTransportStats {
     pub send_post: u64,
     pub recv_post: u64,
+    pub send_post_calls: u64,
+    pub recv_post_calls: u64,
+    pub send_post_list_max: u64,
+    pub recv_post_list_max: u64,
     pub send_cqe: u64,
     pub send_retired: u64,
     pub recv_cqe: u64,
@@ -694,6 +698,10 @@ impl UrmaTransportStats {
         for (name, value) in [
             ("send_post", self.send_post),
             ("recv_post", self.recv_post),
+            ("send_post_calls", self.send_post_calls),
+            ("recv_post_calls", self.recv_post_calls),
+            ("send_post_list_max", self.send_post_list_max),
+            ("recv_post_list_max", self.recv_post_list_max),
             ("send_cqe", self.send_cqe),
             ("send_retired", self.send_retired),
             ("recv_cqe", self.recv_cqe),
@@ -1718,11 +1726,10 @@ fn replenish_credit(
     // availability and only refill slots that are actually Free.
     let free_rx_slots = connection.rx_slot_state_snapshot().free;
     let repost_count = bounded_repost_count(credit.posts_needed(), free_rx_slots);
-    let mut posted = 0usize;
-    while posted < repost_count {
-        connection.recv_ready_tracked(credit.next_post_sequence())?;
+    let first_sequence = credit.next_post_sequence();
+    let posted = connection.recv_ready_tracked_batch(first_sequence, repost_count)?;
+    for _ in 0..posted {
         credit.posted()?;
-        posted += 1;
     }
     Ok(posted)
 }
@@ -1898,6 +1905,10 @@ fn combined_stats(
     Ok(UrmaTransportStats {
         send_post: parent.send_post,
         recv_post: child.recv_post,
+        send_post_calls: parent.send_post_calls,
+        recv_post_calls: child.recv_post_calls,
+        send_post_list_max: parent.send_post_list_max,
+        recv_post_list_max: child.recv_post_list_max,
         send_cqe: parent.send_cqe,
         send_retired: parent.send_retired,
         recv_cqe: child.recv_cqe,
@@ -2299,6 +2310,10 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
         done.child_cpu.system_us,
         done.completion.send_post,
         done.completion.recv_post,
+        done.completion.send_post_calls,
+        done.completion.recv_post_calls,
+        done.completion.send_post_list_max,
+        done.completion.recv_post_list_max,
         done.completion.send_cqe,
         done.completion.send_retired,
         done.completion.recv_cqe,
@@ -2344,7 +2359,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         return Err(Error::Protocol("truncated URMA Done".into()));
     }
     let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
-    let expected_len = 2 + case_len + 39 * 8 + 2 * 4;
+    let expected_len = 2 + case_len + 43 * 8 + 2 * 4;
     if input.len() != expected_len {
         return Err(Error::Protocol("invalid URMA Done length".into()));
     }
@@ -2364,6 +2379,10 @@ fn decode_done(input: &[u8]) -> Result<Done> {
     let system_us = next_u64();
     let send_post = next_u64();
     let recv_post = next_u64();
+    let send_post_calls = next_u64();
+    let recv_post_calls = next_u64();
+    let send_post_list_max = next_u64();
+    let recv_post_list_max = next_u64();
     let send_cqe = next_u64();
     let send_retired = next_u64();
     let recv_cqe = next_u64();
@@ -2409,6 +2428,10 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         completion: CompletionStats {
             send_post,
             recv_post,
+            send_post_calls,
+            recv_post_calls,
+            send_post_list_max,
+            recv_post_list_max,
             send_cqe,
             send_retired,
             recv_cqe,
@@ -2781,6 +2804,10 @@ mod tests {
             completion: CompletionStats {
                 send_post: 1,
                 recv_post: 2,
+                send_post_calls: 1,
+                recv_post_calls: 1,
+                send_post_list_max: 1,
+                recv_post_list_max: 2,
                 send_cqe: 3,
                 send_retired: 4,
                 recv_cqe: 5,

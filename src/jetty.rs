@@ -233,6 +233,26 @@ mod native {
                 .map_err(|error| map_ffi_error("post_jetty_recv_wr", error))
         }
 
+        pub(crate) fn post_send_batch(
+            &mut self,
+            segment: &ffi::SegmentHandle,
+            descriptors: &[ffi::WrDescriptor],
+        ) -> Result<ffi::PostBatch> {
+            self.handle
+                .post_send_batch(segment, descriptors)
+                .map_err(|error| map_ffi_error("post_jetty_send_wr_batch", error))
+        }
+
+        pub(crate) fn post_recv_batch(
+            &mut self,
+            segment: &ffi::SegmentHandle,
+            descriptors: &[ffi::WrDescriptor],
+        ) -> Result<ffi::PostBatch> {
+            self.handle
+                .post_recv_batch(segment, descriptors)
+                .map_err(|error| map_ffi_error("post_jetty_recv_wr_batch", error))
+        }
+
         pub(crate) fn close(&mut self) -> Result<()> {
             let mut failures = Vec::new();
             if self.bound {

@@ -608,7 +608,7 @@ mod tests {
     #[test]
     fn abi_baseline_matches_verified_m0_contract() {
         let baseline = abi_baseline().expect("C shim must return its ABI baseline");
-        assert_eq!(baseline.shim_abi_version, 7);
+        assert_eq!(baseline.shim_abi_version, 8);
         assert_eq!(baseline.pointer_size as usize, std::mem::size_of::<usize>());
         assert_eq!(baseline.status_size as usize, std::mem::size_of::<i32>());
         assert_eq!(baseline.success_value, 0);

@@ -684,6 +684,91 @@ impl JettyHandle {
         self.post(segment, offset, length, user_ctx, false, true)
     }
 
+    pub(crate) fn post_send_batch(
+        &mut self,
+        segment: &SegmentHandle,
+        descriptors: &[WrDescriptor],
+    ) -> Result<PostBatch, FfiError> {
+        self.post_batch(segment, descriptors, true)
+    }
+
+    pub(crate) fn post_recv_batch(
+        &mut self,
+        segment: &SegmentHandle,
+        descriptors: &[WrDescriptor],
+    ) -> Result<PostBatch, FfiError> {
+        self.post_batch(segment, descriptors, false)
+    }
+
+    fn post_batch(
+        &mut self,
+        segment: &SegmentHandle,
+        descriptors: &[WrDescriptor],
+        send: bool,
+    ) -> Result<PostBatch, FfiError> {
+        if descriptors.is_empty() {
+            return Err(FfiError::Contract("WR batch cannot be empty"));
+        }
+        let count = u32::try_from(descriptors.len())
+            .map_err(|_| FfiError::Contract("WR batch length exceeds u32"))?;
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let raw_descriptors = descriptors
+            .iter()
+            .map(|descriptor| sys::urma_lab_wr_desc_t {
+                offset: descriptor.offset,
+                user_ctx: descriptor.user_ctx,
+                length: descriptor.length,
+                complete_enable: u8::from(descriptor.complete_enable),
+                reserved: [0; 3],
+            })
+            .collect::<Vec<_>>();
+        let mut raw_wrs = vec![std::ptr::null_mut(); descriptors.len()];
+        let mut posted = 0u32;
+        // SAFETY: All slices remain live for the synchronous shim call. The
+        // shim initializes exactly `posted` non-null owners in raw_wrs.
+        let status = unsafe {
+            if send {
+                sys::urma_lab_post_send_batch(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    raw_descriptors.as_ptr(),
+                    count,
+                    raw_wrs.as_mut_ptr(),
+                    &mut posted,
+                )
+            } else {
+                sys::urma_lab_post_recv_batch(
+                    jetty.as_ptr(),
+                    segment.as_ptr(),
+                    raw_descriptors.as_ptr(),
+                    count,
+                    raw_wrs.as_mut_ptr(),
+                    &mut posted,
+                )
+            }
+        };
+        let posted = posted as usize;
+        // A malformed result after the provider call has an unknown ownership
+        // boundary. Abort this control flow instead of returning an error that
+        // could make the caller roll back and reuse a possibly posted buffer.
+        assert!(
+            posted <= raw_wrs.len(),
+            "shim returned an invalid posted WR count"
+        );
+        let handles = raw_wrs
+            .into_iter()
+            .take(posted)
+            .map(|raw| WrHandle {
+                raw: Some(
+                    NonNull::new(raw).expect("shim returned a null owner for a possibly posted WR"),
+                ),
+                _not_send_sync: PhantomData,
+            })
+            .collect::<Vec<_>>();
+        Ok(PostBatch { status, handles })
+    }
+
     fn post(
         &mut self,
         segment: &SegmentHandle,
@@ -746,6 +831,19 @@ impl JettyHandle {
 pub(crate) struct WrHandle {
     raw: Option<NonNull<sys::urma_lab_wr_t>>,
     _not_send_sync: PhantomData<Rc<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WrDescriptor {
+    pub(crate) offset: u64,
+    pub(crate) length: u32,
+    pub(crate) user_ctx: u64,
+    pub(crate) complete_enable: bool,
+}
+
+pub(crate) struct PostBatch {
+    pub(crate) status: i32,
+    pub(crate) handles: Vec<WrHandle>,
 }
 
 impl WrHandle {
