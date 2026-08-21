@@ -234,3 +234,22 @@ batch，再按 provider `max_msg_size=65536` 拆成独立 SEND。window=64 时 b
 尚未提交和已被硬件引用的 slots。新增 `file_tx_batch_count`、
 `file_tx_batch_max_bytes`。本地 URMA benchmark 29 项单元测试通过，真实 provider
 吞吐和错误/关闭行为待验证。
+
+## 2026-08-21：finished-file mmap 与双 registered TX window
+
+为对齐 Dragonfly2 当前候选 RDMA 上传数据路径，URMA benchmark 的 file source 优先在
+START 前建立 `MAP_PRIVATE` 只读映射，然后按 application window 连续复制到 registered
+TX ring；mmap 不可用时保留批量 `pread` fallback。memory dynamic source 也复用同一个
+window producer。
+
+发送侧新增显式 prepared-batch 生命周期，并在 tx slots 足够时使用 A/B 两个 registered
+windows：当前 batch 已 post、尚未 completion-retire 时，只填充另一组 free slots；复用
+任一组前必须 drain 到其 batch-tail completion frontier。fill、discard、partial post 和
+shutdown 路径都区分尚未被 provider 引用与已提交 WR，避免提前复用。
+
+新增统计为 `file_mmap_tx`、`tx_fill_bytes`、`tx_fill_ns`、
+`tx_fill_overlap_batches`、`tx_ring_windows`。这不是文件页直接注册、one-sided I/O 或
+零拷贝落盘；仍保留 SEND/RECV、64 KiB WR、RX lease、并行 CRC 和完整 length/digest
+校验。当前本地 mmap/fast-path 17 项单元测试、feature-off check 和 feature-on release
+build 通过；完整 lib test 仅有 3 项既有 TCP loopback 测试因 sandbox 禁止 bind 而失败。
+真实 UB provider 的吞吐与 shutdown 尚待复测。

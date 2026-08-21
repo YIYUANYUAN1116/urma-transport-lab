@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    buffer::RegisteredRxWindowLease,
+    buffer::{PreparedTxBatch, RegisteredRxWindowLease},
     completion::CompletedRecv,
     derive_urma_slot_size,
     oob::{child_handshake, parent_handshake, OobSession},
@@ -13,8 +13,9 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    os::unix::fs::FileExt,
+    os::{fd::AsRawFd, unix::fs::FileExt},
     path::PathBuf,
+    ptr::NonNull,
     sync::{
         mpsc::{self, Receiver, Sender, TryRecvError},
         Arc, Condvar, Mutex,
@@ -36,6 +37,82 @@ const CREDIT: u16 = 4;
 const SEND_COMPLETION_INTERVAL: usize = 100;
 const VERIFIED_RX_POOL_WINDOWS: usize = 32;
 const MAX_CRC_WORKERS: usize = 32;
+
+struct MappedFileSource {
+    data: NonNull<u8>,
+    length: usize,
+}
+
+impl MappedFileSource {
+    fn map(source: &FileSource) -> Result<Option<Self>> {
+        let length = usize::try_from(source.length())
+            .map_err(|_| invalid("file mmap length exceeds usize"))?;
+        if length == 0 {
+            return Ok(None);
+        }
+        let file = source.open()?;
+        let actual = file
+            .metadata()
+            .map_err(|error| io_error("stat mmap benchmark source", error))?
+            .len();
+        if actual != source.length() {
+            return Err(invalid(format!(
+                "benchmark source length changed before mmap: expected {}, got {actual}",
+                source.length()
+            )));
+        }
+        // SAFETY: fd is live for mmap, length is non-zero and validated against
+        // the file. MAP_PRIVATE/PROT_READ prevents the benchmark from mutating
+        // source content through this mapping.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if raw == libc::MAP_FAILED {
+            return Err(io_error(
+                "mmap benchmark source",
+                io::Error::last_os_error(),
+            ));
+        }
+        let data = match NonNull::new(raw.cast::<u8>()) {
+            Some(data) => data,
+            None => {
+                // SAFETY: mmap succeeded and raw/length identify that mapping.
+                unsafe {
+                    libc::munmap(raw, length);
+                }
+                return Err(invalid("mmap returned a null source address"));
+            }
+        };
+        // Best-effort hints match Dragonfly's finished-piece mmap path. Page
+        // faults and actual source reads may still occur in the measured copy path.
+        unsafe {
+            libc::madvise(raw, length, libc::MADV_SEQUENTIAL);
+            libc::madvise(raw, length, libc::MADV_WILLNEED);
+        }
+        Ok(Some(Self { data, length }))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: the mapping remains live and read-only for self's lifetime.
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.length) }
+    }
+}
+
+impl Drop for MappedFileSource {
+    fn drop(&mut self) {
+        // SAFETY: data/length describe the one live mapping owned by self.
+        unsafe {
+            libc::munmap(self.data.as_ptr().cast(), self.length);
+        }
+    }
+}
 
 fn registered_rx_window_chunks(application_window: usize, rx_slots: usize) -> Result<usize> {
     let upper = application_window.min(rx_slots);
@@ -762,6 +839,20 @@ pub fn run_urma_parent_profile(
     let initial_remote_credit =
         expect_ready(&mut session, &case.case_id, expected_remote_credit, profile)?;
     let mut remote_credit = RemoteReceiveCredit::new(initial_remote_credit)?;
+    // Match Dragonfly's finished-piece upload path: establish the read-only
+    // mapping before the steady-state sample, then account page faults and
+    // window copies while payload is flowing.
+    let mapped_file = match &source {
+        UrmaBenchmarkSource::File(source) => match MappedFileSource::map(source) {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                eprintln!("benchmark: file mmap unavailable, falling back to pread: {error}");
+                None
+            }
+        },
+        _ => None,
+    };
+    let file_mmap_tx = mapped_file.is_some();
     let payload_poll_start = PayloadPollStats::from_completion(connection.stats());
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
@@ -775,7 +866,7 @@ pub fn run_urma_parent_profile(
         connection.prepare_aliased_tx(payload)?;
     }
     let mut bytes_sent = 0u64;
-    let mut direct_file_tx = DirectFileTxStats::default();
+    let mut tx_fill = TxFillStats::default();
     let data_messages = if let Some(payload) = fixed_payload.as_deref() {
         send_fixed_payload(
             payload.len(),
@@ -795,7 +886,8 @@ pub fn run_urma_parent_profile(
             session.stream_mut(),
             &mut remote_credit,
             &mut bytes_sent,
-            &mut direct_file_tx,
+            &mut tx_fill,
+            mapped_file.as_ref(),
         )?
     };
     drain_pipeline(&mut connection, &mut pipeline)?;
@@ -849,20 +941,35 @@ pub fn run_urma_parent_profile(
     );
     result
         .transport_stats
-        .insert("file_pread_calls".into(), direct_file_tx.pread_calls);
+        .insert("file_mmap_tx".into(), u64::from(file_mmap_tx));
     result
         .transport_stats
-        .insert("file_pread_bytes".into(), direct_file_tx.pread_bytes);
+        .insert("file_pread_calls".into(), tx_fill.pread_calls);
     result
         .transport_stats
-        .insert("file_pread_ns".into(), direct_file_tx.pread_ns);
+        .insert("file_pread_bytes".into(), tx_fill.pread_bytes);
     result
         .transport_stats
-        .insert("file_tx_batch_count".into(), direct_file_tx.batch_count);
+        .insert("file_pread_ns".into(), tx_fill.pread_ns);
+    result
+        .transport_stats
+        .insert("file_tx_batch_count".into(), tx_fill.file_batch_count);
     result.transport_stats.insert(
         "file_tx_batch_max_bytes".into(),
-        direct_file_tx.batch_max_bytes,
+        tx_fill.file_batch_max_bytes,
     );
+    result
+        .transport_stats
+        .insert("tx_fill_bytes".into(), tx_fill.fill_bytes);
+    result
+        .transport_stats
+        .insert("tx_fill_ns".into(), tx_fill.fill_ns);
+    result
+        .transport_stats
+        .insert("tx_fill_overlap_batches".into(), tx_fill.overlap_batches);
+    result
+        .transport_stats
+        .insert("tx_ring_windows".into(), tx_fill.ring_windows);
     result
         .transport_stats
         .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);
@@ -1237,80 +1344,66 @@ fn send_source(
     control: &mut TcpStream,
     remote_credit: &mut RemoteReceiveCredit,
     bytes_sent: &mut u64,
-    direct_file_tx: &mut DirectFileTxStats,
+    stats: &mut TxFillStats,
+    mapped_file: Option<&MappedFileSource>,
 ) -> Result<u32> {
-    let mut last_progress = Instant::now();
-    let mut sequence = 0u32;
-    let chunk_count = match source {
-        UrmaBenchmarkSource::Memory(source) => source.length().div_ceil(chunk_size as u64),
+    let (mut window_source, source_length, is_file) = match source {
+        UrmaBenchmarkSource::Memory(source) => (
+            TxWindowSource::Bytes(source.bytes()),
+            source.length(),
+            false,
+        ),
         UrmaBenchmarkSource::FixedMemory { .. } => {
             return Err(invalid(
                 "fixed memory source cannot use the materialized source send path",
             ));
         }
-        UrmaBenchmarkSource::File(source) => source.length().div_ceil(chunk_size as u64),
-    };
-    match source {
-        UrmaBenchmarkSource::Memory(source) => {
-            for chunk in source.chunks(chunk_size)? {
-                post_data(
-                    connection,
-                    pipeline,
-                    sequence,
-                    chunk,
-                    u64::from(sequence) + 1 == chunk_count,
-                    control,
-                    remote_credit,
-                    &mut last_progress,
-                )?;
-                *bytes_sent += chunk.len() as u64;
-                sequence = sequence
-                    .checked_add(1)
-                    .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
-            }
-        }
-        UrmaBenchmarkSource::FixedMemory { .. } => unreachable!("rejected above"),
         UrmaBenchmarkSource::File(source) => {
-            let file = source.open()?;
-            let mut offset = 0u64;
-            while offset < source.length() {
-                let lengths = file_tx_batch_lengths(
-                    source.length() - offset,
-                    chunk_size,
-                    pipeline.configured_window(),
-                )?;
-                let batch_bytes = post_file_batch(
-                    connection,
-                    pipeline,
-                    sequence,
-                    &file,
-                    offset,
-                    &lengths,
-                    control,
-                    remote_credit,
-                    &mut last_progress,
-                    direct_file_tx,
-                )?;
-                offset += batch_bytes;
-                *bytes_sent += batch_bytes;
-                sequence = sequence
-                    .checked_add(u32::try_from(lengths.len()).map_err(|_| {
-                        Error::Protocol("URMA file TX batch count exceeds u32".into())
-                    })?)
-                    .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
-            }
+            let length = source.length();
+            let window_source = if let Some(mapped) = mapped_file {
+                TxWindowSource::Bytes(mapped.as_slice())
+            } else {
+                TxWindowSource::Pread(source.open()?)
+            };
+            (window_source, length, true)
         }
-    }
-    Ok(sequence)
+    };
+    send_windowed_source(
+        &mut window_source,
+        source_length,
+        is_file,
+        chunk_size,
+        connection,
+        pipeline,
+        control,
+        remote_credit,
+        bytes_sent,
+        stats,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DirectFileTxStats {
+struct TxFillStats {
     pread_calls: u64,
     pread_bytes: u64,
     pread_ns: u64,
-    batch_count: u64,
-    batch_max_bytes: u64,
+    file_batch_count: u64,
+    file_batch_max_bytes: u64,
+    fill_bytes: u64,
+    fill_ns: u64,
+    overlap_batches: u64,
+    ring_windows: u64,
+}
+
+enum TxWindowSource<'a> {
+    Bytes(&'a [u8]),
+    Pread(File),
+}
+
+struct PreparedSourceBatch {
+    registered: PreparedTxBatch,
+    lengths: Vec<usize>,
+    bytes: u64,
 }
 
 fn repeated_payload_crc32(payload: &[u8], repetitions: u64) -> u32 {
@@ -1369,44 +1462,7 @@ fn send_fixed_payload(
     Ok(count)
 }
 
-fn post_data(
-    connection: &mut UrmaConnection<'_>,
-    pipeline: &mut PipelineTracker,
-    sequence: u32,
-    payload: &[u8],
-    is_last: bool,
-    control: &mut TcpStream,
-    remote_credit: &mut RemoteReceiveCredit,
-    last_progress: &mut Instant,
-) -> Result<()> {
-    while !pipeline.can_post() {
-        let completed = poll_send_completions(connection, pipeline)?;
-        if completed != 0 {
-            *last_progress = Instant::now();
-        } else if idle_timeout_elapsed(*last_progress, Instant::now(), TIMEOUT) {
-            log_parent_pipeline_capacity_timeout(connection, pipeline);
-            return Err(Error::Timeout {
-                operation: "URMA pipeline capacity",
-            });
-        }
-    }
-    wait_for_remote_credit(control, remote_credit)?;
-    if is_last {
-        connection.send_frame_tracked_tail(payload, u64::from(sequence))?;
-    } else {
-        connection.send_frame_tracked(payload, u64::from(sequence))?;
-    }
-    remote_credit.consume()?;
-    pipeline.posted()?;
-    debug_assert_eq!(pipeline.current(), connection.outstanding_send());
-    Ok(())
-}
-
-fn file_tx_batch_lengths(
-    remaining: u64,
-    chunk_size: usize,
-    max_chunks: usize,
-) -> Result<Vec<usize>> {
+fn tx_batch_lengths(remaining: u64, chunk_size: usize, max_chunks: usize) -> Result<Vec<usize>> {
     if remaining == 0 || chunk_size == 0 || max_chunks == 0 {
         return Err(invalid(
             "file TX batch requires remaining bytes, chunk size, and capacity",
@@ -1425,60 +1481,168 @@ fn file_tx_batch_lengths(
     Ok(lengths)
 }
 
-fn post_file_batch(
+fn prepare_source_batch(
+    source: &mut TxWindowSource<'_>,
+    source_length: u64,
+    source_offset: u64,
+    is_file: bool,
+    chunk_size: usize,
+    max_chunks: usize,
     connection: &mut UrmaConnection<'_>,
-    pipeline: &mut PipelineTracker,
-    first_sequence: u32,
-    file: &File,
-    offset: u64,
-    lengths: &[usize],
-    control: &mut TcpStream,
-    remote_credit: &mut RemoteReceiveCredit,
-    last_progress: &mut Instant,
-    stats: &mut DirectFileTxStats,
-) -> Result<u64> {
-    while pipeline.current() != 0 {
-        let completed = poll_send_completions(connection, pipeline)?;
-        if completed != 0 {
-            *last_progress = Instant::now();
-        } else if idle_timeout_elapsed(*last_progress, Instant::now(), TIMEOUT) {
-            log_parent_pipeline_capacity_timeout(connection, pipeline);
-            return Err(Error::Timeout {
-                operation: "URMA direct file TX pipeline capacity",
-            });
-        }
-    }
-    wait_for_remote_credit_count(control, remote_credit, lengths.len())?;
-
+    stats: &mut TxFillStats,
+    overlaps_send: bool,
+) -> Result<PreparedSourceBatch> {
+    let lengths = tx_batch_lengths(source_length - source_offset, chunk_size, max_chunks)?;
     let batch_bytes = lengths.iter().try_fold(0usize, |total, &length| {
         total
             .checked_add(length)
-            .ok_or_else(|| invalid("file TX batch byte count overflow"))
+            .ok_or_else(|| invalid("TX batch byte count overflow"))
     })?;
-
     let mut pread_calls = 0u64;
     let mut pread_ns = 0u64;
-    let send_result =
-        connection.send_filled_batch_tracked(lengths, u64::from(first_sequence), |registered| {
-            debug_assert_eq!(registered.len(), batch_bytes);
-            let pread_started = Instant::now();
-            let result = read_exact_at(file, offset, registered, &mut pread_calls);
-            pread_ns = u64::try_from(pread_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            result
-        });
+    let mut fill_ns = 0u64;
+    let used_pread = matches!(source, TxWindowSource::Pread(_));
+    let registered = connection.prepare_filled_batch(&lengths, |registered| {
+        debug_assert_eq!(registered.len(), batch_bytes);
+        let started = Instant::now();
+        let result = match source {
+            TxWindowSource::Bytes(bytes) => {
+                let start = usize::try_from(source_offset)
+                    .map_err(|_| invalid("TX source offset exceeds usize"))?;
+                let end = start
+                    .checked_add(registered.len())
+                    .ok_or_else(|| invalid("TX source range overflow"))?;
+                let source = bytes
+                    .get(start..end)
+                    .ok_or_else(|| invalid("TX source range exceeds payload"))?;
+                registered.copy_from_slice(source);
+                Ok(())
+            }
+            TxWindowSource::Pread(file) => {
+                let pread_started = Instant::now();
+                let result = read_exact_at(file, source_offset, registered, &mut pread_calls);
+                pread_ns = u64::try_from(pread_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                result
+            }
+        };
+        fill_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        result
+    })?;
+
+    let batch_bytes_u64 = batch_bytes as u64;
     stats.pread_ns = stats.pread_ns.saturating_add(pread_ns);
     stats.pread_calls = stats.pread_calls.saturating_add(pread_calls);
-    send_result?;
-    stats.pread_bytes = stats.pread_bytes.saturating_add(batch_bytes as u64);
-    stats.batch_count = stats.batch_count.saturating_add(1);
-    stats.batch_max_bytes = stats.batch_max_bytes.max(batch_bytes as u64);
-
-    for _ in lengths {
-        remote_credit.consume()?;
-        pipeline.posted()?;
+    if used_pread {
+        stats.pread_bytes = stats.pread_bytes.saturating_add(batch_bytes_u64);
     }
-    debug_assert_eq!(pipeline.current(), connection.outstanding_send());
-    Ok(batch_bytes as u64)
+    stats.fill_bytes = stats.fill_bytes.saturating_add(batch_bytes_u64);
+    stats.fill_ns = stats.fill_ns.saturating_add(fill_ns);
+    stats.ring_windows = stats.ring_windows.max(if overlaps_send { 2 } else { 1 });
+    if overlaps_send {
+        stats.overlap_batches = stats.overlap_batches.saturating_add(1);
+    }
+    if is_file {
+        stats.file_batch_count = stats.file_batch_count.saturating_add(1);
+        stats.file_batch_max_bytes = stats.file_batch_max_bytes.max(batch_bytes_u64);
+    }
+    Ok(PreparedSourceBatch {
+        registered,
+        lengths,
+        bytes: batch_bytes_u64,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_windowed_source(
+    source: &mut TxWindowSource<'_>,
+    source_length: u64,
+    is_file: bool,
+    chunk_size: usize,
+    connection: &mut UrmaConnection<'_>,
+    pipeline: &mut PipelineTracker,
+    control: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
+    bytes_sent: &mut u64,
+    stats: &mut TxFillStats,
+) -> Result<u32> {
+    if source_length == 0 {
+        return Ok(0);
+    }
+    let batch_capacity = pipeline.configured_window();
+    let mut source_offset = 0u64;
+    let mut sequence = 0u32;
+    let mut prepared = prepare_source_batch(
+        source,
+        source_length,
+        source_offset,
+        is_file,
+        chunk_size,
+        batch_capacity,
+        connection,
+        stats,
+        false,
+    )?;
+
+    loop {
+        if let Err(error) =
+            wait_for_remote_credit_count(control, remote_credit, prepared.lengths.len())
+        {
+            connection.discard_prepared_batch(prepared.registered)?;
+            return Err(error);
+        }
+        if let Err(error) = drain_pipeline(connection, pipeline) {
+            connection.discard_prepared_batch(prepared.registered)?;
+            return Err(error);
+        }
+
+        let posted =
+            connection.post_prepared_batch_tracked(prepared.registered, u64::from(sequence))?;
+        debug_assert_eq!(posted, prepared.lengths.len());
+        for _ in 0..posted {
+            remote_credit.consume()?;
+            pipeline.posted()?;
+        }
+        source_offset = source_offset
+            .checked_add(prepared.bytes)
+            .ok_or_else(|| Error::Protocol("TX source offset overflow".into()))?;
+        *bytes_sent = bytes_sent
+            .checked_add(prepared.bytes)
+            .ok_or_else(|| Error::Protocol("sent byte count overflow".into()))?;
+        sequence = sequence
+            .checked_add(
+                u32::try_from(posted)
+                    .map_err(|_| Error::Protocol("TX batch message count exceeds u32".into()))?,
+            )
+            .ok_or_else(|| Error::Protocol("URMA sequence overflow".into()))?;
+
+        if source_offset == source_length {
+            break;
+        }
+
+        let next_count = usize::try_from(
+            (source_length - source_offset)
+                .div_ceil(chunk_size as u64)
+                .min(batch_capacity as u64),
+        )
+        .map_err(|_| invalid("next TX batch count exceeds usize"))?;
+        if connection.tx_slot_state_snapshot().free < next_count {
+            drain_pipeline(connection, pipeline)?;
+        }
+        let overlaps_send = pipeline.current() != 0;
+        prepared = prepare_source_batch(
+            source,
+            source_length,
+            source_offset,
+            is_file,
+            chunk_size,
+            batch_capacity,
+            connection,
+            stats,
+            overlaps_send,
+        )?;
+    }
+
+    Ok(sequence)
 }
 
 fn read_exact_at(file: &File, offset: u64, output: &mut [u8], calls: &mut u64) -> Result<()> {
@@ -1561,13 +1725,6 @@ fn replenish_credit(
         posted += 1;
     }
     Ok(posted)
-}
-
-fn log_parent_pipeline_capacity_timeout(
-    connection: &UrmaConnection<'_>,
-    pipeline: &PipelineTracker,
-) {
-    log_parent_pipeline_timeout(connection, pipeline, "pipeline_capacity");
 }
 
 fn log_parent_pipeline_timeout(
@@ -2552,18 +2709,39 @@ mod tests {
     }
 
     #[test]
-    fn file_tx_batches_keep_wr_chunks_within_provider_payload() {
+    fn tx_batches_keep_wr_chunks_within_provider_payload() {
         let chunk = 64 * 1024;
-        let full = file_tx_batch_lengths((chunk * 128) as u64, chunk, 64).unwrap();
+        let full = tx_batch_lengths((chunk * 128) as u64, chunk, 64).unwrap();
         assert_eq!(full.len(), 64);
         assert!(full.iter().all(|&length| length == chunk));
         assert_eq!(full.iter().sum::<usize>(), 4 * 1024 * 1024);
 
-        let tail = file_tx_batch_lengths((chunk * 2 + 17) as u64, chunk, 64).unwrap();
+        let tail = tx_batch_lengths((chunk * 2 + 17) as u64, chunk, 64).unwrap();
         assert_eq!(tail, vec![chunk, chunk, 17]);
-        assert!(file_tx_batch_lengths(0, chunk, 64).is_err());
-        assert!(file_tx_batch_lengths(1, 0, 64).is_err());
-        assert!(file_tx_batch_lengths(1, chunk, 0).is_err());
+        assert!(tx_batch_lengths(0, chunk, 64).is_err());
+        assert!(tx_batch_lengths(1, 0, 64).is_err());
+        assert!(tx_batch_lengths(1, chunk, 0).is_err());
+    }
+
+    #[test]
+    fn mmap_source_exposes_finished_file_without_changing_it() {
+        let path = std::env::temp_dir().join(format!(
+            "urma-mmap-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let expected = b"finished-piece-source";
+        std::fs::write(&path, expected).unwrap();
+        let source = FileSource::from_path(&path).unwrap();
+        {
+            let mapped = MappedFileSource::map(&source).unwrap().unwrap();
+            assert_eq!(mapped.as_slice(), expected);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), expected);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

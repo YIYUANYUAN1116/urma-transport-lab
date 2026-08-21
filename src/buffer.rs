@@ -139,6 +139,19 @@ mod native {
         pub(crate) length: usize,
     }
 
+    /// A filled TX slot run that is not yet referenced by any provider WR.
+    /// The owning connection must either post or explicitly discard it.
+    #[must_use = "a prepared TX batch must be posted or discarded"]
+    pub(crate) struct PreparedTxBatch {
+        pub(crate) layouts: Vec<(SlotId, u64, u32)>,
+    }
+
+    impl PreparedTxBatch {
+        pub(crate) fn len(&self) -> usize {
+            self.layouts.len()
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct RegisteredRxSpan {
         data: NonNull<u8>,
@@ -431,11 +444,11 @@ mod native {
         /// whole registered range in one producer call. Every slot except the
         /// final one must be full so that packed file bytes remain aligned with
         /// the independently posted SEND SGEs.
-        pub(crate) fn fill_tx_batch(
+        pub(crate) fn prepare_tx_batch(
             &mut self,
             lengths: &[usize],
             fill: impl FnOnce(&mut [u8]) -> Result<()>,
-        ) -> Result<Vec<(SlotId, u64, u32)>> {
+        ) -> Result<PreparedTxBatch> {
             if self.config.alias_tx_slots || lengths.is_empty() {
                 return Err(Error::InvalidConfiguration(
                     "direct TX batch requires non-empty, non-aliased TX slots".into(),
@@ -518,7 +531,14 @@ mod native {
                 }
                 return Err(error);
             }
-            Ok(layouts)
+            Ok(PreparedTxBatch { layouts })
+        }
+
+        pub(crate) fn discard_tx_batch(&mut self, batch: PreparedTxBatch) -> Result<()> {
+            for (slot, _, _) in batch.layouts {
+                self.release(slot)?;
+            }
+            Ok(())
         }
 
         pub(crate) fn prepare_aliased_tx(&mut self, data: &[u8]) -> Result<()> {
@@ -878,6 +898,8 @@ mod native {
     }
 }
 
+#[cfg(feature = "urma")]
+pub(crate) use native::PreparedTxBatch;
 #[cfg(feature = "urma")]
 pub(crate) use native::RegisteredRxWindowLease;
 #[cfg(feature = "urma")]

@@ -202,20 +202,45 @@ mod native {
             self.send_frame_with_sequence(&[], Some(sequence), is_tail, Some(length))
         }
 
-        pub(crate) fn send_filled_batch_tracked(
+        pub(crate) fn prepare_filled_batch(
             &mut self,
             lengths: &[usize],
-            first_sequence: u64,
             fill: impl FnOnce(&mut [u8]) -> Result<()>,
-        ) -> Result<usize> {
+        ) -> Result<crate::buffer::PreparedTxBatch> {
             self.require(ConnectionState::Ready)?;
             self.receive_credit.require_before_send()?;
-            let last_offset = u64::try_from(lengths.len().saturating_sub(1))
-                .map_err(|_| Error::Protocol("SEND batch length exceeds u64".into()))?;
-            first_sequence
-                .checked_add(last_offset)
-                .ok_or_else(|| Error::Protocol("SEND sequence overflow".into()))?;
-            let layouts = self.buffer_pool.fill_tx_batch(lengths, fill)?;
+            self.buffer_pool.prepare_tx_batch(lengths, fill)
+        }
+
+        pub(crate) fn discard_prepared_batch(
+            &mut self,
+            batch: crate::buffer::PreparedTxBatch,
+        ) -> Result<()> {
+            self.buffer_pool.discard_tx_batch(batch)
+        }
+
+        pub(crate) fn post_prepared_batch_tracked(
+            &mut self,
+            batch: crate::buffer::PreparedTxBatch,
+            first_sequence: u64,
+        ) -> Result<usize> {
+            if let Err(error) = self.require(ConnectionState::Ready) {
+                self.buffer_pool.discard_tx_batch(batch)?;
+                return Err(error);
+            }
+            let batch_len = batch.len();
+            let last_offset = match u64::try_from(batch_len.saturating_sub(1)) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    self.buffer_pool.discard_tx_batch(batch)?;
+                    return Err(Error::Protocol("SEND batch length exceeds u64".into()));
+                }
+            };
+            if first_sequence.checked_add(last_offset).is_none() {
+                self.buffer_pool.discard_tx_batch(batch)?;
+                return Err(Error::Protocol("SEND sequence overflow".into()));
+            }
+            let layouts = batch.layouts;
             for (index, &(slot, offset, length)) in layouts.iter().enumerate() {
                 // A batch is drained before its registered range may be
                 // filled again, so its final WR must always establish a
