@@ -27,7 +27,7 @@ use std::{
 const REQUEST_ID: u64 = 1;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_MAGIC: u32 = 0x4252_4d41;
-const CONTROL_VERSION: u16 = 3;
+const CONTROL_VERSION: u16 = 4;
 const CONTROL_HEADER_LEN: usize = 12;
 const MAX_CONTROL_PAYLOAD: usize = 4096;
 const READY: u16 = 1;
@@ -317,6 +317,7 @@ impl WindowSink {
 struct WindowJob {
     order: u64,
     position: u64,
+    queued_at: Instant,
     window: RegisteredRxWindowLease,
 }
 
@@ -324,7 +325,114 @@ struct WindowOutcome {
     order: u64,
     length: usize,
     digest: Result<Crc32Hasher>,
+    stats: SinkJobStats,
     window: RegisteredRxWindowLease,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SinkJobStats {
+    queue_wait_ns: u64,
+    processing_ns: u64,
+    pwrite_calls: u64,
+    pwrite_bytes: u64,
+    pwrite_ns: u64,
+    pwrite_max_ns: u64,
+    crc_ns: u64,
+    spans: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SinkStats {
+    transport_receive_ns: u64,
+    drain_ns: u64,
+    outstanding_at_end: u64,
+    pending_at_end: u64,
+    max_outstanding: u64,
+    max_pending: u64,
+    jobs: u64,
+    queue_wait_ns: u64,
+    queue_wait_max_ns: u64,
+    processing_ns: u64,
+    processing_max_ns: u64,
+    pwrite_calls: u64,
+    pwrite_bytes: u64,
+    pwrite_ns: u64,
+    pwrite_max_ns: u64,
+    crc_ns: u64,
+    crc_max_ns: u64,
+    span_total: u64,
+    span_max: u64,
+}
+
+impl SinkStats {
+    const WIRE_FIELDS: usize = 19;
+
+    fn observe(&mut self, job: SinkJobStats) {
+        self.jobs = self.jobs.saturating_add(1);
+        self.queue_wait_ns = self.queue_wait_ns.saturating_add(job.queue_wait_ns);
+        self.queue_wait_max_ns = self.queue_wait_max_ns.max(job.queue_wait_ns);
+        self.processing_ns = self.processing_ns.saturating_add(job.processing_ns);
+        self.processing_max_ns = self.processing_max_ns.max(job.processing_ns);
+        self.pwrite_calls = self.pwrite_calls.saturating_add(job.pwrite_calls);
+        self.pwrite_bytes = self.pwrite_bytes.saturating_add(job.pwrite_bytes);
+        self.pwrite_ns = self.pwrite_ns.saturating_add(job.pwrite_ns);
+        self.pwrite_max_ns = self.pwrite_max_ns.max(job.pwrite_max_ns);
+        self.crc_ns = self.crc_ns.saturating_add(job.crc_ns);
+        self.crc_max_ns = self.crc_max_ns.max(job.crc_ns);
+        self.span_total = self.span_total.saturating_add(job.spans);
+        self.span_max = self.span_max.max(job.spans);
+    }
+
+    fn wire_values(self) -> [u64; Self::WIRE_FIELDS] {
+        [
+            self.transport_receive_ns,
+            self.drain_ns,
+            self.outstanding_at_end,
+            self.pending_at_end,
+            self.max_outstanding,
+            self.max_pending,
+            self.jobs,
+            self.queue_wait_ns,
+            self.queue_wait_max_ns,
+            self.processing_ns,
+            self.processing_max_ns,
+            self.pwrite_calls,
+            self.pwrite_bytes,
+            self.pwrite_ns,
+            self.pwrite_max_ns,
+            self.crc_ns,
+            self.crc_max_ns,
+            self.span_total,
+            self.span_max,
+        ]
+    }
+
+    fn insert(self, result: &mut BenchmarkResult) {
+        for (name, value) in [
+            ("sink_transport_receive_ns", self.transport_receive_ns),
+            ("sink_drain_ns", self.drain_ns),
+            ("sink_outstanding_at_end", self.outstanding_at_end),
+            ("sink_pending_at_end", self.pending_at_end),
+            ("sink_max_outstanding", self.max_outstanding),
+            ("sink_max_pending", self.max_pending),
+            ("sink_jobs", self.jobs),
+            ("sink_queue_wait_ns", self.queue_wait_ns),
+            ("sink_queue_wait_max_ns", self.queue_wait_max_ns),
+            ("sink_processing_ns", self.processing_ns),
+            ("sink_processing_max_ns", self.processing_max_ns),
+            ("sink_pwrite_calls", self.pwrite_calls),
+            ("sink_pwrite_bytes", self.pwrite_bytes),
+            ("sink_pwrite_ns", self.pwrite_ns),
+            ("sink_pwrite_max_ns", self.pwrite_max_ns),
+            ("sink_crc_ns", self.crc_ns),
+            ("sink_crc_max_ns", self.crc_max_ns),
+            ("sink_span_total", self.span_total),
+            ("sink_span_max", self.span_max),
+            ("sink_transient_thread_spawns", 0),
+        ] {
+            result.transport_stats.insert(name.into(), value);
+        }
+    }
 }
 
 /// Hashes independent registered windows on multiple workers. Window digests
@@ -346,6 +454,7 @@ struct SinkPipeline {
     actual_bytes: u64,
     recycled: Vec<RegisteredRxWindowLease>,
     failure: Option<Error>,
+    stats: SinkStats,
 }
 
 impl SinkPipeline {
@@ -385,6 +494,7 @@ impl SinkPipeline {
             actual_bytes: 0,
             recycled: Vec::new(),
             failure: None,
+            stats: SinkStats::default(),
         })
     }
 
@@ -410,10 +520,12 @@ impl SinkPipeline {
             .outstanding
             .checked_add(1)
             .ok_or_else(|| invalid("CRC pipeline outstanding overflow"))?;
+        self.stats.max_outstanding = self.stats.max_outstanding.max(self.outstanding as u64);
         if self.commands[worker]
             .send(WindowJob {
                 order,
                 position,
+                queued_at: Instant::now(),
                 window,
             })
             .is_err()
@@ -424,7 +536,7 @@ impl SinkPipeline {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<(IntegrityResult, Vec<RegisteredRxWindowLease>)> {
+    fn finish(mut self) -> Result<(IntegrityResult, Vec<RegisteredRxWindowLease>, SinkStats)> {
         self.release_workers();
         while self.outstanding != 0 {
             let outcome = self.event.recv().map_err(|_| {
@@ -442,7 +554,7 @@ impl SinkPipeline {
         }
         let actual_crc32 = std::mem::take(&mut self.combined).finalize();
         let integrity = self.sink.finish(self.actual_bytes, actual_crc32)?;
-        Ok((integrity, std::mem::take(&mut self.recycled)))
+        Ok((integrity, std::mem::take(&mut self.recycled), self.stats))
     }
 
     fn take_recycled(&mut self) -> Result<Vec<RegisteredRxWindowLease>> {
@@ -468,9 +580,11 @@ impl SinkPipeline {
 
     fn accept_outcome(&mut self, outcome: WindowOutcome) {
         self.outstanding = self.outstanding.saturating_sub(1);
+        self.stats.observe(outcome.stats);
         if self.pending.insert(outcome.order, outcome).is_some() && self.failure.is_none() {
             self.failure = Some(Error::Protocol("duplicate CRC window result".into()));
         }
+        self.stats.max_pending = self.stats.max_pending.max(self.pending.len() as u64);
         while let Some(outcome) = self.pending.remove(&self.next_combine) {
             match outcome.digest {
                 Ok(digest) => {
@@ -508,6 +622,14 @@ impl SinkPipeline {
             ready.notify_all();
         };
     }
+
+    fn outstanding(&self) -> usize {
+        self.outstanding
+    }
+
+    fn pending(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 impl Drop for SinkPipeline {
@@ -538,13 +660,18 @@ fn run_window_worker(
         }
     }
     while let Ok(job) = command.recv() {
+        let queue_wait_ns = duration_ns(job.queued_at.elapsed());
+        let processing_started = Instant::now();
         let length = job.window.len();
-        let digest = hash_and_write_window(file.as_ref(), &job.window, job.position);
+        let (digest, mut stats) = hash_and_write_window(file.as_ref(), &job.window, job.position);
+        stats.queue_wait_ns = queue_wait_ns;
+        stats.processing_ns = duration_ns(processing_started.elapsed());
         if event
             .send(WindowOutcome {
                 order: job.order,
                 length,
                 digest,
+                stats,
                 window: job.window,
             })
             .is_err()
@@ -558,34 +685,103 @@ fn hash_and_write_window(
     file: Option<&Arc<File>>,
     window: &RegisteredRxWindowLease,
     position: u64,
-) -> Result<Crc32Hasher> {
+) -> (Result<Crc32Hasher>, SinkJobStats) {
+    let parts = window.parts().collect::<Vec<_>>();
+    let mut stats = SinkJobStats {
+        spans: parts.len() as u64,
+        ..SinkJobStats::default()
+    };
     let mut digest = Crc32Hasher::new();
+    let crc_started = Instant::now();
+    for bytes in &parts {
+        digest.update(bytes);
+    }
+    stats.crc_ns = duration_ns(crc_started.elapsed());
     if let Some(file) = file {
-        let write = thread::scope(|scope| {
-            let write = scope.spawn(|| -> io::Result<()> {
-                let mut part_position = position;
-                for bytes in window.parts() {
-                    file.write_all_at(bytes, part_position)?;
-                    part_position = part_position
-                        .checked_add(bytes.len() as u64)
-                        .ok_or_else(|| io::Error::other("RX file position overflow"))?;
-                }
-                Ok(())
-            });
-            for bytes in window.parts() {
-                digest.update(bytes);
-            }
-            write.join()
-        });
-        write
-            .map_err(|_| Error::Protocol("direct file writer panicked".into()))?
-            .map_err(|error| io_error("pwrite registered RX window", error))?;
-    } else {
-        for bytes in window.parts() {
-            digest.update(bytes);
+        if let Err(error) = write_window_vectored(file, &parts, position, &mut stats) {
+            return (Err(io_error("pwritev registered RX window", error)), stats);
         }
     }
-    Ok(digest)
+    (Ok(digest), stats)
+}
+
+fn write_window_vectored(
+    file: &File,
+    parts: &[&[u8]],
+    position: u64,
+    stats: &mut SinkJobStats,
+) -> io::Result<()> {
+    let mut part_index = 0usize;
+    let mut part_offset = 0usize;
+    let mut file_position = position;
+    while part_index < parts.len() {
+        let buffers = parts[part_index..]
+            .iter()
+            .enumerate()
+            .map(|(relative, bytes)| {
+                let bytes = if relative == 0 {
+                    &bytes[part_offset..]
+                } else {
+                    bytes
+                };
+                libc::iovec {
+                    iov_base: bytes.as_ptr().cast_mut().cast(),
+                    iov_len: bytes.len(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let iov_count = i32::try_from(buffers.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many RX spans"))?;
+        let file_offset = libc::off_t::try_from(file_position).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RX file position exceeds off_t",
+            )
+        })?;
+        let started = Instant::now();
+        // SAFETY: every iovec borrows an immutable live RX lease span for the
+        // duration of this call. The fd is live and the iovec count and file
+        // offset were checked against their C representations.
+        let written =
+            unsafe { libc::pwritev(file.as_raw_fd(), buffers.as_ptr(), iov_count, file_offset) };
+        let call_ns = duration_ns(started.elapsed());
+        stats.pwrite_calls = stats.pwrite_calls.saturating_add(1);
+        stats.pwrite_ns = stats.pwrite_ns.saturating_add(call_ns);
+        stats.pwrite_max_ns = stats.pwrite_max_ns.max(call_ns);
+        if written < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if written == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        let written = written as usize;
+        stats.pwrite_bytes = stats.pwrite_bytes.saturating_add(written as u64);
+        file_position = file_position
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::other("RX file position overflow"))?;
+
+        let mut remaining = written;
+        while remaining != 0 {
+            let available = parts[part_index].len() - part_offset;
+            if remaining < available {
+                part_offset += remaining;
+                remaining = 0;
+            } else {
+                remaining -= available;
+                part_index += 1;
+                part_offset = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 fn validate_registered_window_layout(window: &RegisteredRxWindowLease) -> Result<()> {
@@ -968,6 +1164,7 @@ pub fn run_urma_parent_profile_with_post_list(
     insert_remote_credit_stats(&mut result, &remote_credit);
     parent_payload_poll.insert(&mut result, "parent");
     done.payload_poll.insert(&mut result, "child");
+    done.sink.insert(&mut result);
     result.transport_stats.insert(
         "fixed_tx_profile".into(),
         u64::from(profile.uses_fixed_tx()),
@@ -1141,6 +1338,7 @@ pub fn run_urma_child_profile_with_crc_workers(
         None => Measurement::start(case.timing_mode)?,
     };
     let mut measurement = Some(measurement);
+    let payload_started = Instant::now();
 
     let mut last_progress = Instant::now();
     let mut bytes_received = 0u64;
@@ -1239,6 +1437,7 @@ pub fn run_urma_child_profile_with_crc_workers(
     };
     let child_payload_poll =
         PayloadPollStats::from_completion(connection.stats()).elapsed_since(payload_poll_start);
+    let transport_receive_ns = duration_ns(payload_started.elapsed());
     receiver.accept_end(&end_message)?;
     let transport_measurement = if profile.transport_only() {
         Some(
@@ -1250,10 +1449,16 @@ pub fn run_urma_child_profile_with_crc_workers(
     } else {
         None
     };
-    let verification_started = Instant::now();
-    let (integrity, recycled) = sink_pipeline.finish()?;
+    let sink_outstanding_at_end = sink_pipeline.outstanding() as u64;
+    let sink_pending_at_end = sink_pipeline.pending() as u64;
+    let sink_drain_started = Instant::now();
+    let (integrity, recycled, mut sink_stats) = sink_pipeline.finish()?;
+    sink_stats.transport_receive_ns = transport_receive_ns;
+    sink_stats.drain_ns = duration_ns(sink_drain_started.elapsed());
+    sink_stats.outstanding_at_end = sink_outstanding_at_end;
+    sink_stats.pending_at_end = sink_pending_at_end;
     let post_transport_verification_ns = if profile.transport_only() {
-        u64::try_from(verification_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        sink_stats.drain_ns
     } else {
         0
     };
@@ -1360,6 +1565,7 @@ pub fn run_urma_child_profile_with_crc_workers(
         "direct_file_pwrite".into(),
         u64::from(case.scenario == BenchmarkScenario::File),
     );
+    sink_stats.insert(&mut result);
     child_payload_poll.insert(&mut result, "child");
     let done = Done {
         case_id: case.case_id.clone(),
@@ -1369,6 +1575,7 @@ pub fn run_urma_child_profile_with_crc_workers(
         completion,
         payload_poll: child_payload_poll,
         bytes_received,
+        sink: sink_stats,
     };
     write_control(session.stream_mut(), DONE, &encode_done(&done)?)?;
 
@@ -2280,6 +2487,7 @@ struct Done {
     completion: CompletionStats,
     payload_poll: PayloadPollStats,
     bytes_received: u64,
+    sink: SinkStats,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2412,6 +2620,9 @@ fn encode_done(done: &Done) -> Result<Vec<u8>> {
     ] {
         output.extend_from_slice(&value.to_be_bytes());
     }
+    for value in done.sink.wire_values() {
+        output.extend_from_slice(&value.to_be_bytes());
+    }
     output.extend_from_slice(&done.integrity.expected_crc32.to_be_bytes());
     output.extend_from_slice(&done.integrity.actual_crc32.to_be_bytes());
     Ok(output)
@@ -2422,7 +2633,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         return Err(Error::Protocol("truncated URMA Done".into()));
     }
     let case_len = u16::from_be_bytes([input[0], input[1]]) as usize;
-    let expected_len = 2 + case_len + 43 * 8 + 2 * 4;
+    let expected_len = 2 + case_len + (43 + SinkStats::WIRE_FIELDS) * 8 + 2 * 4;
     if input.len() != expected_len {
         return Err(Error::Protocol("invalid URMA Done length".into()));
     }
@@ -2480,6 +2691,27 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         recv_jfc_empty_polls: next_u64(),
     };
     let bytes_received = next_u64();
+    let sink = SinkStats {
+        transport_receive_ns: next_u64(),
+        drain_ns: next_u64(),
+        outstanding_at_end: next_u64(),
+        pending_at_end: next_u64(),
+        max_outstanding: next_u64(),
+        max_pending: next_u64(),
+        jobs: next_u64(),
+        queue_wait_ns: next_u64(),
+        queue_wait_max_ns: next_u64(),
+        processing_ns: next_u64(),
+        processing_max_ns: next_u64(),
+        pwrite_calls: next_u64(),
+        pwrite_bytes: next_u64(),
+        pwrite_ns: next_u64(),
+        pwrite_max_ns: next_u64(),
+        crc_ns: next_u64(),
+        crc_max_ns: next_u64(),
+        span_total: next_u64(),
+        span_max: next_u64(),
+    };
     let expected_crc32 = u32::from_be_bytes(input[offset..offset + 4].try_into().expect("fixed"));
     offset += 4;
     let actual_crc32 = u32::from_be_bytes(input[offset..offset + 4].try_into().expect("fixed"));
@@ -2523,6 +2755,7 @@ fn decode_done(input: &[u8]) -> Result<Done> {
         },
         payload_poll,
         bytes_received,
+        sink,
     })
 }
 
@@ -2654,9 +2887,10 @@ mod tests {
                 ),
             )
             .unwrap();
-        let (integrity, recycled) = pipeline.finish().unwrap();
+        let (integrity, recycled, stats) = pipeline.finish().unwrap();
         assert!(integrity.is_ok());
         assert_eq!(recycled.len(), 2);
+        assert_eq!(stats.jobs, 2);
     }
 
     #[test]
@@ -2671,6 +2905,7 @@ mod tests {
                 order,
                 length: 1,
                 digest: Ok(digest),
+                stats: SinkJobStats::default(),
                 window: RegisteredRxWindowLease::from_test_bytes(
                     vec![byte],
                     vec![(Some(sequence), 1)],
@@ -2705,9 +2940,10 @@ mod tests {
             )
             .unwrap();
         assert!(pipeline.take_recycled().unwrap().is_empty());
-        let (integrity, recycled) = pipeline.finish().unwrap();
+        let (integrity, recycled, stats) = pipeline.finish().unwrap();
         assert!(integrity.is_ok());
         assert_eq!(recycled.len(), 1);
+        assert_eq!(stats.jobs, 1);
     }
 
     #[test]
@@ -2766,7 +3002,49 @@ mod tests {
                 ),
             )
             .unwrap();
-        assert!(pipeline.finish().unwrap().0.is_ok());
+        let (integrity, _, stats) = pipeline.finish().unwrap();
+        assert!(integrity.is_ok());
+        assert_eq!(stats.pwrite_calls, 2);
+        assert_eq!(stats.pwrite_bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fragmented_rx_window_uses_one_vectored_positional_write() {
+        let parts = [b"registered-".as_slice(), b"window".as_slice()];
+        let payload = parts.concat();
+        let path = std::env::temp_dir().join(format!(
+            "urma-vectored-sink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sink = WindowSink::file(
+            &path,
+            payload.len() as u64,
+            crate::crc32_bytes(&payload),
+            FileCompletionPolicy::Buffered,
+        )
+        .unwrap();
+        let mut pipeline = SinkPipeline::start(sink, 1, false).unwrap();
+        pipeline
+            .push(
+                0,
+                RegisteredRxWindowLease::from_test_parts(
+                    parts.iter().map(|part| part.to_vec()).collect(),
+                    vec![(Some(0), parts[0].len()), (Some(1), parts[1].len())],
+                ),
+            )
+            .unwrap();
+        let (integrity, _, stats) = pipeline.finish().unwrap();
+        assert!(integrity.is_ok());
+        assert_eq!(stats.jobs, 1);
+        assert_eq!(stats.span_total, 2);
+        assert_eq!(stats.pwrite_calls, 1);
+        assert_eq!(stats.pwrite_bytes, payload.len() as u64);
         assert_eq!(std::fs::read(&path).unwrap(), payload);
         std::fs::remove_file(path).unwrap();
     }
@@ -2906,6 +3184,27 @@ mod tests {
                 recv_jfc_empty_polls: 33,
             },
             bytes_received: 64,
+            sink: SinkStats {
+                transport_receive_ns: 34,
+                drain_ns: 35,
+                outstanding_at_end: 36,
+                pending_at_end: 37,
+                max_outstanding: 38,
+                max_pending: 39,
+                jobs: 40,
+                queue_wait_ns: 41,
+                queue_wait_max_ns: 42,
+                processing_ns: 43,
+                processing_max_ns: 44,
+                pwrite_calls: 45,
+                pwrite_bytes: 46,
+                pwrite_ns: 47,
+                pwrite_max_ns: 48,
+                crc_ns: 49,
+                crc_max_ns: 50,
+                span_total: 51,
+                span_max: 52,
+            },
         };
 
         assert_eq!(decode_done(&encode_done(&done).unwrap()).unwrap(), done);
