@@ -275,3 +275,13 @@ completion frontier 后回收，warmup RX lease 也只在 completion 后复用�
 本地验证：feature-off `cargo check --all-targets` 通过；feature-on all-target compile
 通过；feature-off 85 项 lib 测试及 feature-on 106 项 lib 测试通过。真实 UB provider
 warmup=0/64 的冷启动对照尚待验证。
+
+## 2026-08-24：file source 外部 CRC 与基线冻结
+
+CLI 新增 `--expected-crc32 N`（十进制或 `0x`）。它只允许 Parent file scenario 使用，
+并通过 open/stat 构造 source，跳过默认的全文件 CRC 预扫描；接收端仍计算完整 payload
+CRC，错误元数据不会绕过最终完整性检查。Parent 结果新增 `source_crc32_external`。
+
+真实实验、规范命令、回归阈值及不同层次结论已冻结在
+`docs/benchmark-regression-baseline-2026-08-24.md`。demo 不再增加 Piece scheduler 或
+多连接并发，后续并发比较转入 Dragonfly 集成环境。

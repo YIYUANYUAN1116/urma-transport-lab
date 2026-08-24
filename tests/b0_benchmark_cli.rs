@@ -63,5 +63,7 @@ fn help_documents_reproducible_output_creation() {
     assert!(stdout.contains("--output-mode fresh|truncate"));
     assert!(stdout.contains("default: fresh"));
     assert!(stdout.contains("--cleanup-output"));
+    assert!(stdout.contains("--expected-crc32 N"));
+    assert!(stdout.contains("skip Parent prescan"));
     assert!(stdout.contains("default: file=4"));
 }

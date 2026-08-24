@@ -231,6 +231,13 @@ impl UrmaBenchmarkSource {
             Self::File(source) => Ok(source.expected_crc32()),
         }
     }
+
+    fn expected_crc32_external(&self) -> bool {
+        match self {
+            Self::Memory(_) | Self::FixedMemory { .. } => false,
+            Self::File(source) => source.expected_crc32_external(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1071,6 +1078,7 @@ pub fn run_urma_parent_profile_with_options(
     warmup_messages: u32,
 ) -> Result<BenchmarkResult> {
     source.validate(case)?;
+    let source_crc32_external = source.expected_crc32_external();
     if send_post_list == 0 || send_post_list > case.window as usize {
         return Err(invalid(format!(
             "SEND post-list {send_post_list} must be in 1..={}",
@@ -1295,6 +1303,10 @@ pub fn run_urma_parent_profile_with_options(
         "configured_send_post_list".into(),
         u64::try_from(send_post_list)
             .map_err(|_| invalid("SEND post-list does not fit result u64"))?,
+    );
+    result.transport_stats.insert(
+        "source_crc32_external".into(),
+        u64::from(source_crc32_external),
     );
     result
         .transport_stats

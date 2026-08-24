@@ -40,6 +40,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut listen = String::from("127.0.0.1:19091");
     let mut parent = String::from("127.0.0.1:19091");
     let mut input = None;
+    let mut expected_crc32 = None;
     let mut output = None;
     let mut output_mode = OutputMode::Fresh;
     let mut cleanup_output = false;
@@ -86,6 +87,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--listen" => listen = required_value(&mut args, "--listen")?,
             "--parent" => parent = required_value(&mut args, "--parent")?,
             "--input" => input = Some(PathBuf::from(required_value(&mut args, "--input")?)),
+            "--expected-crc32" => {
+                expected_crc32 = Some(parse_crc32(&required_value(
+                    &mut args,
+                    "--expected-crc32",
+                )?)?)
+            }
             "--output" => output = Some(PathBuf::from(required_value(&mut args, "--output")?)),
             "--output-mode" => {
                 output_mode = match required_value(&mut args, "--output-mode")?.as_str() {
@@ -130,6 +137,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cleanup_output && (role != Role::Child || case.scenario != BenchmarkScenario::File) {
         return Err("--cleanup-output requires --role child --scenario file".into());
     }
+    if expected_crc32.is_some()
+        && (role != Role::Parent || case.scenario != BenchmarkScenario::File)
+    {
+        return Err("--expected-crc32 requires --role parent --scenario file".into());
+    }
     #[cfg(feature = "urma")]
     if case.transport == BenchmarkTransport::Urma {
         use urma_transport_lab::{
@@ -154,8 +166,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     BenchmarkScenario::Memory => UrmaBenchmarkSource::Memory(
                         MemorySource::generate(case.transfer_bytes, case.data_seed)?,
                     ),
-                    BenchmarkScenario::File => UrmaBenchmarkSource::File(FileSource::from_path(
+                    BenchmarkScenario::File => UrmaBenchmarkSource::File(open_file_source(
                         input.ok_or("file Parent requires --input PATH")?,
+                        expected_crc32,
                     )?),
                 };
                 eprintln!("benchmark URMA parent: listening on {listen}");
@@ -229,7 +242,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?),
                 BenchmarkScenario::File => {
                     let path = input.ok_or("file Parent requires --input PATH")?;
-                    TcpBenchmarkSource::File(FileSource::from_path(path)?)
+                    TcpBenchmarkSource::File(open_file_source(path, expected_crc32)?)
                 }
             };
             eprintln!("benchmark parent: listening on {listen}");
@@ -271,6 +284,28 @@ fn cleanup_file_if_requested(
             .map_err(|error| format!("remove benchmark output {}: {error}", path.display()))?;
     }
     Ok(())
+}
+
+fn open_file_source(
+    path: PathBuf,
+    expected_crc32: Option<u32>,
+) -> urma_transport_lab::Result<FileSource> {
+    match expected_crc32 {
+        Some(expected_crc32) => FileSource::from_path_with_expected_crc32(path, expected_crc32),
+        None => FileSource::from_path(path),
+    }
+}
+
+fn parse_crc32(value: &str) -> Result<u32, Box<dyn std::error::Error>> {
+    let parsed = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(hex, 16)
+    } else {
+        value.parse::<u32>()
+    };
+    parsed.map_err(|_| format!("invalid --expected-crc32 {value:?}").into())
 }
 
 fn required_value(
@@ -319,6 +354,7 @@ fn print_usage() {
            --listen ADDRESS              Parent bind address, default: 127.0.0.1:19091\n\
            --parent ADDRESS              Child target address, default: 127.0.0.1:19091\n\
            --input PATH                  required for file Parent\n\
+           --expected-crc32 N            trust decimal/0x CRC32 metadata; skip Parent prescan\n\
            --output PATH                 required for file Child\n\
            --output-mode fresh|truncate  file Child creation mode, default: fresh\n\
            --cleanup-output              remove output after successful verification\n\

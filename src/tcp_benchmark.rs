@@ -55,6 +55,13 @@ impl TcpBenchmarkSource {
             Self::File(source) => source.expected_crc32(),
         }
     }
+
+    fn expected_crc32_external(&self) -> bool {
+        match self {
+            Self::Memory(_) => false,
+            Self::File(source) => source.expected_crc32_external(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -257,6 +264,7 @@ fn run_tcp_parent_with_listener(
     source: TcpBenchmarkSource,
     setup_measurement: Option<Measurement>,
 ) -> Result<BenchmarkResult> {
+    let source_crc32_external = source.expected_crc32_external();
     let (mut stream, peer) = listener
         .accept()
         .map_err(|error| io_error("accept TCP", error))?;
@@ -321,6 +329,10 @@ fn run_tcp_parent_with_listener(
     result.parent_cpu = Some(parent_cpu);
     result.child_cpu = Some(done.child_cpu);
     stats.insert_all(&mut result.transport_stats);
+    result.transport_stats.insert(
+        "source_crc32_external".into(),
+        u64::from(source_crc32_external),
+    );
     result
         .transport_stats
         .insert("parent_elapsed_ns".into(), parent_sample.elapsed_ns()?);

@@ -611,6 +611,7 @@ pub struct FileSource {
     path: PathBuf,
     length: u64,
     expected_crc32: u32,
+    expected_crc32_external: bool,
 }
 
 impl FileSource {
@@ -623,6 +624,28 @@ impl FileSource {
             path,
             length,
             expected_crc32,
+            expected_crc32_external: false,
+        })
+    }
+
+    /// Opens a finished file without reading its contents and trusts the
+    /// digest supplied by the caller. The receiver still hashes every byte and
+    /// rejects a stale or incorrect value at transfer completion.
+    pub fn from_path_with_expected_crc32(
+        path: impl AsRef<Path>,
+        expected_crc32: u32,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let file = File::open(&path).map_err(|error| io_error("open benchmark source", error))?;
+        let length = file
+            .metadata()
+            .map_err(|error| io_error("stat benchmark source", error))?
+            .len();
+        Ok(Self {
+            path,
+            length,
+            expected_crc32,
+            expected_crc32_external: true,
         })
     }
 
@@ -662,6 +685,7 @@ impl FileSource {
             path,
             length,
             expected_crc32: hasher.finalize(),
+            expected_crc32_external: false,
         })
     }
 
@@ -679,6 +703,10 @@ impl FileSource {
 
     pub fn expected_crc32(&self) -> u32 {
         self.expected_crc32
+    }
+
+    pub fn expected_crc32_external(&self) -> bool {
+        self.expected_crc32_external
     }
 }
 
@@ -1125,6 +1153,23 @@ mod tests {
                 source.length()
             );
         }
+    }
+
+    #[test]
+    fn external_file_crc_uses_metadata_but_receiver_still_verifies_bytes() {
+        let source_path = TempPath::new("external-crc-source");
+        std::fs::write(&source_path.0, b"finished-piece").unwrap();
+        let expected = crate::crc32_bytes(b"finished-piece");
+        let source = FileSource::from_path_with_expected_crc32(&source_path.0, expected).unwrap();
+        assert_eq!(source.length(), 14);
+        assert_eq!(source.expected_crc32(), expected);
+        assert!(source.expected_crc32_external());
+
+        let stale =
+            FileSource::from_path_with_expected_crc32(&source_path.0, expected ^ 1).unwrap();
+        let mut sink = MemorySink::new(stale.length(), stale.expected_crc32());
+        sink.write_chunk(b"finished-piece").unwrap();
+        assert!(!sink.finish().unwrap().digest_ok);
     }
 
     #[test]
