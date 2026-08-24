@@ -632,7 +632,8 @@ mod native;
 #[cfg(feature = "urma")]
 pub use native::{
     run_urma_child, run_urma_child_profile, run_urma_child_profile_with_crc_workers,
-    run_urma_parent, run_urma_parent_profile, run_urma_parent_profile_with_post_list,
+    run_urma_child_profile_with_options, run_urma_parent, run_urma_parent_profile,
+    run_urma_parent_profile_with_options, run_urma_parent_profile_with_post_list,
     UrmaBenchmarkDestination, UrmaBenchmarkProfile, UrmaBenchmarkSource, UrmaTransportStats,
     DEFAULT_SEND_POST_LIST,
 };

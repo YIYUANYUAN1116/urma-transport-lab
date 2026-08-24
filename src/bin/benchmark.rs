@@ -47,6 +47,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut eid_index = 0u32;
     let mut urma_profile = String::from("normal");
     let mut urma_post_list = 16usize;
+    let mut warmup_messages = 0u32;
     let mut crc_workers: Option<usize> = None;
 
     let mut args = std::env::args().skip(1);
@@ -98,6 +99,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--eid-index" => eid_index = parse_value(&mut args, "--eid-index")?,
             "--urma-profile" => urma_profile = required_value(&mut args, "--urma-profile")?,
             "--urma-post-list" => urma_post_list = parse_value(&mut args, "--urma-post-list")?,
+            "--warmup-messages" => warmup_messages = parse_value(&mut args, "--warmup-messages")?,
             "--crc-workers" => crc_workers = Some(parse_value(&mut args, "--crc-workers")?),
             "--help" | "-h" => {
                 print_usage();
@@ -131,7 +133,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "urma")]
     if case.transport == BenchmarkTransport::Urma {
         use urma_transport_lab::{
-            run_urma_child_profile_with_crc_workers, run_urma_parent_profile_with_post_list,
+            run_urma_child_profile_with_options, run_urma_parent_profile_with_options,
             UrmaBenchmarkDestination, UrmaBenchmarkProfile, UrmaBenchmarkSource,
         };
         let profile = match urma_profile.as_str() {
@@ -157,7 +159,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     )?),
                 };
                 eprintln!("benchmark URMA parent: listening on {listen}");
-                run_urma_parent_profile_with_post_list(
+                run_urma_parent_profile_with_options(
                     &case,
                     device,
                     eid_index,
@@ -165,6 +167,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     source,
                     profile,
                     urma_post_list,
+                    warmup_messages,
                 )?
             }
             Role::Child => {
@@ -186,7 +189,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                 };
                 eprintln!("benchmark URMA child: connecting to {parent}");
-                let result = run_urma_child_profile_with_crc_workers(
+                let result = run_urma_child_profile_with_options(
                     &case,
                     device,
                     eid_index,
@@ -194,6 +197,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     destination,
                     profile,
                     crc_workers,
+                    warmup_messages,
                 )?;
                 cleanup_file_if_requested(cleanup_output, output_path.as_deref())?;
                 result
@@ -212,6 +216,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eid_index,
         &urma_profile,
         urma_post_list,
+        warmup_messages,
         crc_workers,
     );
 
@@ -322,6 +327,7 @@ fn print_usage() {
            --urma-profile normal|fixed-tx|rx128|fixed-tx-rx128|transport-only|fixed-tx-transport-only\n\
                                          URMA diagnostic profile, default: normal\n\
            --urma-post-list N             linked SEND WRs per provider post, default: 16\n\
+           --warmup-messages N           URMA payload messages before START, default: 0\n\
            --crc-workers N               Child CRC workers, default: file=4,\n\
                                          memory=affinity CPUs minus one; maximum: 32"
     );

@@ -233,8 +233,10 @@ mod native {
                 }
             };
             let posted_count = posted.handles.len();
-            self.poller
+            let post_call = self
+                .poller
                 .record_post_call(OperationType::Recv, descriptors.len());
+            let post_count = u32::try_from(descriptors.len()).unwrap_or(u32::MAX);
             for (index, handle) in posted.handles.into_iter().enumerate() {
                 self.poller.track(
                     descriptors[index].user_ctx,
@@ -242,6 +244,9 @@ mod native {
                     handle,
                     Some(first_sequence + index as u64),
                     true,
+                    post_call,
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    post_count,
                 )?;
                 self.receive_credit.posted();
             }
@@ -291,9 +296,17 @@ mod native {
                     return Err(error);
                 }
             };
-            self.poller.record_post_call(OperationType::Recv, 1);
-            self.poller
-                .track(user_ctx, OperationType::Recv, wr, sequence, true)?;
+            let post_call = self.poller.record_post_call(OperationType::Recv, 1);
+            self.poller.track(
+                user_ctx,
+                OperationType::Recv,
+                wr,
+                sequence,
+                true,
+                post_call,
+                0,
+                1,
+            )?;
             self.receive_credit.posted();
             Ok(())
         }
@@ -499,8 +512,10 @@ mod native {
                 }
             };
             let posted_count = posted.handles.len();
-            self.poller
+            let post_call = self
+                .poller
                 .record_post_call(OperationType::Send, descriptors.len());
+            let post_count = u32::try_from(descriptors.len()).unwrap_or(u32::MAX);
             for (index, handle) in posted.handles.into_iter().enumerate() {
                 self.poller.track(
                     descriptors[index].user_ctx,
@@ -508,6 +523,9 @@ mod native {
                     handle,
                     Some(first_sequence + index as u64),
                     descriptors[index].complete_enable,
+                    post_call,
+                    u32::try_from(index).unwrap_or(u32::MAX),
+                    post_count,
                 )?;
                 if descriptors[index].complete_enable {
                     self.sends_since_completion = 0;
@@ -620,9 +638,17 @@ mod native {
                     return Err(error);
                 }
             };
-            self.poller.record_post_call(OperationType::Send, 1);
-            self.poller
-                .track(user_ctx, OperationType::Send, wr, sequence, complete_enable)?;
+            let post_call = self.poller.record_post_call(OperationType::Send, 1);
+            self.poller.track(
+                user_ctx,
+                OperationType::Send,
+                wr,
+                sequence,
+                complete_enable,
+                post_call,
+                0,
+                1,
+            )?;
             if complete_enable {
                 self.sends_since_completion = 0;
             } else {

@@ -101,6 +101,10 @@ pub fn validate_completion_status(status: i32, opcode: u32, user_ctx: u64) -> Re
             status,
             opcode,
             user_ctx,
+            sequence: None,
+            post_call: None,
+            post_index: None,
+            post_count: None,
         })
     }
 }
@@ -120,6 +124,9 @@ mod native {
         handle: ffi::WrHandle,
         sequence: Option<u64>,
         signaled: bool,
+        post_call: u64,
+        post_index: u32,
+        post_count: u32,
     }
 
     pub(crate) struct CompletionPoller {
@@ -173,6 +180,9 @@ mod native {
             wr: ffi::WrHandle,
             sequence: Option<u64>,
             signaled: bool,
+            post_call: u64,
+            post_index: u32,
+            post_count: u32,
         ) -> Result<()> {
             let token = WrToken::decode(user_ctx)?;
             let slot = token.slot.index();
@@ -187,6 +197,9 @@ mod native {
                 handle: wr,
                 sequence,
                 signaled,
+                post_call,
+                post_index,
+                post_count,
             });
             self.outstanding_total += 1;
             match operation {
@@ -357,6 +370,10 @@ mod native {
                     status: record.status,
                     opcode: record.opcode,
                     user_ctx: 0,
+                    sequence: None,
+                    post_call: None,
+                    post_index: None,
+                    post_count: None,
                 });
             }
             let token = WrToken::decode(record.user_ctx)?;
@@ -415,6 +432,10 @@ mod native {
                     status: record.status,
                     opcode: record.opcode,
                     user_ctx: 0,
+                    sequence: None,
+                    post_call: None,
+                    post_index: None,
+                    post_count: None,
                 });
             }
             let token = WrToken::decode(record.user_ctx)?;
@@ -552,6 +573,10 @@ mod native {
                     status: record.status,
                     opcode: record.opcode,
                     user_ctx: 0,
+                    sequence: None,
+                    post_call: None,
+                    post_index: None,
+                    post_count: None,
                 });
             }
             let token = WrToken::decode(record.user_ctx)?;
@@ -616,8 +641,20 @@ mod native {
                 .iter()
                 .position(|user_ctx| *user_ctx == record.user_ctx)
                 .ok_or_else(|| Error::Protocol("SEND CQE has no ordered frontier".into()))?;
-            let completion_error =
-                validate_completion_status(record.status, record.opcode, record.user_ctx).err();
+            let completion_error = if record.status == 0 {
+                None
+            } else {
+                let failed = self.outstanding_for(record.user_ctx)?;
+                Some(Error::Completion {
+                    status: record.status,
+                    opcode: record.opcode,
+                    user_ctx: record.user_ctx,
+                    sequence: failed.sequence,
+                    post_call: Some(failed.post_call),
+                    post_index: Some(failed.post_index),
+                    post_count: Some(failed.post_count),
+                })
+            };
             // Providers may report a flushed WR even when that WR did not ask
             // for a normal success CQE. Accept that only on the error path: it
             // proves device access has ended and lets shutdown retire the
@@ -673,16 +710,18 @@ mod native {
             self.send_order.reserve(additional);
         }
 
-        pub(crate) fn record_post_call(&mut self, operation: OperationType, count: usize) {
+        pub(crate) fn record_post_call(&mut self, operation: OperationType, count: usize) -> u64 {
             let count = u64::try_from(count).unwrap_or(u64::MAX);
             match operation {
                 OperationType::Send => {
                     self.stats.send_post_calls += 1;
                     self.stats.send_post_list_max = self.stats.send_post_list_max.max(count);
+                    self.stats.send_post_calls
                 }
                 OperationType::Recv => {
                     self.stats.recv_post_calls += 1;
                     self.stats.recv_post_list_max = self.stats.recv_post_list_max.max(count);
+                    self.stats.recv_post_calls
                 }
             }
         }

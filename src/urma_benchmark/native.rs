@@ -27,13 +27,15 @@ use std::{
 const REQUEST_ID: u64 = 1;
 const TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_MAGIC: u32 = 0x4252_4d41;
-const CONTROL_VERSION: u16 = 5;
+const CONTROL_VERSION: u16 = 6;
 const CONTROL_HEADER_LEN: usize = 12;
 const MAX_CONTROL_PAYLOAD: usize = 4096;
 const READY: u16 = 1;
 const START: u16 = 2;
 const DONE: u16 = 3;
 const CREDIT: u16 = 4;
+const WARMUP_DONE: u16 = 5;
+const WARMUP_SEQUENCE_BASE: u64 = 1 << 63;
 const SEND_COMPLETION_INTERVAL: usize = 100;
 pub const DEFAULT_SEND_POST_LIST: usize = 16;
 const VERIFIED_RX_POOL_WINDOWS: usize = 32;
@@ -1046,6 +1048,28 @@ pub fn run_urma_parent_profile_with_post_list(
     profile: UrmaBenchmarkProfile,
     send_post_list: usize,
 ) -> Result<BenchmarkResult> {
+    run_urma_parent_profile_with_options(
+        case,
+        device,
+        eid_index,
+        listen,
+        source,
+        profile,
+        send_post_list,
+        0,
+    )
+}
+
+pub fn run_urma_parent_profile_with_options(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    listen: impl ToSocketAddrs,
+    source: UrmaBenchmarkSource,
+    profile: UrmaBenchmarkProfile,
+    send_post_list: usize,
+    warmup_messages: u32,
+) -> Result<BenchmarkResult> {
     source.validate(case)?;
     if send_post_list == 0 || send_post_list > case.window as usize {
         return Err(invalid(format!(
@@ -1065,6 +1089,11 @@ pub fn run_urma_parent_profile_with_post_list(
     if matches!(source, UrmaBenchmarkSource::FixedMemory { .. }) && !profile.uses_fixed_tx() {
         return Err(invalid(
             "fixed memory source requires a fixed-tx benchmark profile",
+        ));
+    }
+    if warmup_messages != 0 && case.timing_mode != TimingMode::SteadyState {
+        return Err(invalid(
+            "URMA payload warmup requires timing-mode=steady-state",
         ));
     }
     let runtime_config = benchmark_runtime_config(case, device, eid_index, profile, false)?;
@@ -1117,13 +1146,23 @@ pub fn run_urma_parent_profile_with_post_list(
     connection.send_frame(&metadata.encode()?)?;
     connection.drain_completions(TIMEOUT)?;
 
-    let remaining_messages = usize::try_from(case.chunk_count()? + 1)
-        .map_err(|_| invalid("receive message count exceeds usize"))?;
+    let remaining_messages = usize::try_from(
+        case.chunk_count()?
+            .checked_add(u64::from(warmup_messages))
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| invalid("receive message count overflow"))?,
+    )
+    .map_err(|_| invalid("receive message count exceeds usize"))?;
     let remote_rx_capacity = profile.rx_slots(case, true)?.min(recv_depth);
     let expected_remote_credit =
         receive_credit_target(case.window as usize, remote_rx_capacity, remaining_messages)?;
-    let initial_remote_credit =
-        expect_ready(&mut session, &case.case_id, expected_remote_credit, profile)?;
+    let initial_remote_credit = expect_ready(
+        &mut session,
+        &case.case_id,
+        expected_remote_credit,
+        profile,
+        warmup_messages,
+    )?;
     let mut remote_credit = RemoteReceiveCredit::new(initial_remote_credit)?;
     // Match Dragonfly's finished-piece upload path: establish the read-only
     // mapping before the steady-state sample, then account page faults and
@@ -1139,6 +1178,39 @@ pub fn run_urma_parent_profile_with_post_list(
         _ => None,
     };
     let file_mmap_tx = mapped_file.is_some();
+    connection
+        .configure_send_completion_interval((case.window as usize).min(SEND_COMPLETION_INTERVAL))?;
+    if let Some(payload) = fixed_payload.as_deref() {
+        connection.prepare_aliased_tx(payload)?;
+    }
+    let warmup_started = Instant::now();
+    if warmup_messages != 0 {
+        let warmup_payload = fixed_payload.as_deref().map_or_else(
+            || vec![0xa5; case.chunk_size_usize().expect("case validated")],
+            Vec::from,
+        );
+        send_warmup_payload(
+            &warmup_payload,
+            warmup_messages,
+            profile.uses_fixed_tx(),
+            &mut connection,
+            session.stream_mut(),
+            &mut remote_credit,
+            case.window as usize,
+            send_post_list,
+        )?;
+        wait_for_control_with_credit(
+            session.stream_mut(),
+            &mut remote_credit,
+            WARMUP_DONE,
+            case.case_id.as_bytes(),
+        )?;
+    }
+    let warmup_elapsed_ns = if warmup_messages == 0 {
+        0
+    } else {
+        duration_ns(warmup_started.elapsed())
+    };
     let payload_poll_start = PayloadPollStats::from_completion(connection.stats());
     let measurement = match setup_measurement {
         Some(measurement) => measurement,
@@ -1146,11 +1218,6 @@ pub fn run_urma_parent_profile_with_post_list(
     };
     write_control(session.stream_mut(), START, case.case_id.as_bytes())?;
     let mut pipeline = PipelineTracker::new(case.window as usize)?;
-    connection
-        .configure_send_completion_interval((case.window as usize).min(SEND_COMPLETION_INTERVAL))?;
-    if let Some(payload) = fixed_payload.as_deref() {
-        connection.prepare_aliased_tx(payload)?;
-    }
     let mut bytes_sent = 0u64;
     let mut tx_fill = TxFillStats::default();
     let data_messages = if let Some(payload) = fixed_payload.as_deref() {
@@ -1229,6 +1296,16 @@ pub fn run_urma_parent_profile_with_post_list(
         u64::try_from(send_post_list)
             .map_err(|_| invalid("SEND post-list does not fit result u64"))?,
     );
+    result
+        .transport_stats
+        .insert("warmup_messages".into(), u64::from(warmup_messages));
+    result.transport_stats.insert(
+        "warmup_bytes".into(),
+        u64::from(warmup_messages).saturating_mul(case.chunk_size),
+    );
+    result
+        .transport_stats
+        .insert("warmup_elapsed_ns".into(), warmup_elapsed_ns);
     result.transport_stats.insert(
         "direct_file_tx".into(),
         u64::from(case.scenario == BenchmarkScenario::File),
@@ -1319,7 +1396,34 @@ pub fn run_urma_child_profile_with_crc_workers(
     profile: UrmaBenchmarkProfile,
     crc_workers: Option<usize>,
 ) -> Result<BenchmarkResult> {
+    run_urma_child_profile_with_options(
+        case,
+        device,
+        eid_index,
+        parent,
+        destination,
+        profile,
+        crc_workers,
+        0,
+    )
+}
+
+pub fn run_urma_child_profile_with_options(
+    case: &BenchmarkCase,
+    device: impl Into<String>,
+    eid_index: u32,
+    parent: impl ToSocketAddrs,
+    destination: UrmaBenchmarkDestination,
+    profile: UrmaBenchmarkProfile,
+    crc_workers: Option<usize>,
+    warmup_messages: u32,
+) -> Result<BenchmarkResult> {
     destination.validate(case)?;
+    if warmup_messages != 0 && case.timing_mode != TimingMode::SteadyState {
+        return Err(invalid(
+            "URMA payload warmup requires timing-mode=steady-state",
+        ));
+    }
     let runtime_config = benchmark_runtime_config(case, device, eid_index, profile, true)?;
     let jetty_config = JettyConfig::default();
     let recv_depth = jetty_config.recv_depth as usize;
@@ -1368,8 +1472,13 @@ pub fn run_urma_child_profile_with_crc_workers(
     let sink =
         destination.create_sink(case.transfer_bytes, expected_crc32, case.completion_policy)?;
     let mut sink_pipeline = SinkPipeline::start(sink, sink_worker_count, profile.transport_only())?;
-    let remaining_messages = usize::try_from(case.chunk_count()? + 1)
-        .map_err(|_| invalid("receive message count exceeds usize"))?;
+    let remaining_messages = usize::try_from(
+        case.chunk_count()?
+            .checked_add(u64::from(warmup_messages))
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| invalid("receive message count overflow"))?,
+    )
+    .map_err(|_| invalid("receive message count exceeds usize"))?;
     let credit_target = receive_credit_target(
         case.window as usize,
         recv_depth.min(runtime_config.buffer_pool.rx_slot_count),
@@ -1384,8 +1493,25 @@ pub fn run_urma_child_profile_with_crc_workers(
     write_control(
         session.stream_mut(),
         READY,
-        &encode_ready(&case.case_id, initial_credit, profile)?,
+        &encode_ready(&case.case_id, initial_credit, profile, warmup_messages)?,
     )?;
+    let warmup_started = Instant::now();
+    if warmup_messages != 0 {
+        receive_warmup_payload(
+            &mut connection,
+            &mut credit,
+            &mut credit_return,
+            session.stream_mut(),
+            warmup_messages,
+            case.chunk_size_usize()?,
+        )?;
+        write_control(session.stream_mut(), WARMUP_DONE, case.case_id.as_bytes())?;
+    }
+    let warmup_elapsed_ns = if warmup_messages == 0 {
+        0
+    } else {
+        duration_ns(warmup_started.elapsed())
+    };
     expect_case_control(&mut session, START, &case.case_id)?;
     let payload_poll_start = PayloadPollStats::from_completion(connection.stats());
     let measurement = match setup_measurement {
@@ -1400,6 +1526,7 @@ pub fn run_urma_child_profile_with_crc_workers(
     let expected_data_messages = u32::try_from(case.chunk_count()?)
         .map_err(|_| Error::Protocol("URMA Data sequence count exceeds u32".into()))?;
     let mut received_data_messages = 0u32;
+    let payload_sequence_base = u64::from(warmup_messages);
     // A shared JFR may expose successful receive CQEs in a different order
     // from the order in which its WRs were posted.  The sequence attached to
     // each outstanding WR still identifies its position in the byte stream,
@@ -1438,13 +1565,13 @@ pub fn run_urma_child_profile_with_crc_workers(
             queue_recv_completion(
                 &mut reordered_completions,
                 completion,
-                u64::from(received_data_messages),
-                u64::from(expected_data_messages),
+                payload_sequence_base + u64::from(received_data_messages),
+                payload_sequence_base + u64::from(expected_data_messages),
             )?;
         }
 
-        while let Some(completion) =
-            reordered_completions.remove(&u64::from(received_data_messages))
+        while let Some(completion) = reordered_completions
+            .remove(&(payload_sequence_base + u64::from(received_data_messages)))
         {
             if received_data_messages < expected_data_messages {
                 bytes_received = bytes_received
@@ -1628,6 +1755,16 @@ pub fn run_urma_child_profile_with_crc_workers(
         "post_transport_verification_ns".into(),
         post_transport_verification_ns,
     );
+    result
+        .transport_stats
+        .insert("warmup_messages".into(), u64::from(warmup_messages));
+    result.transport_stats.insert(
+        "warmup_bytes".into(),
+        u64::from(warmup_messages).saturating_mul(case.chunk_size),
+    );
+    result
+        .transport_stats
+        .insert("warmup_elapsed_ns".into(), warmup_elapsed_ns);
     result.transport_stats.insert(
         "direct_file_pwrite".into(),
         u64::from(case.scenario == BenchmarkScenario::File),
@@ -1801,6 +1938,125 @@ fn send_fixed_payload(
             .ok_or_else(|| Error::Protocol("fixed TX sequence overflow".into()))?;
     }
     Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_warmup_payload(
+    payload: &[u8],
+    count: u32,
+    aliased_tx: bool,
+    connection: &mut UrmaConnection<'_>,
+    control: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
+    window: usize,
+    send_post_list: usize,
+) -> Result<()> {
+    let mut pipeline = PipelineTracker::new(window)?;
+    let mut sequence = 0u32;
+    let mut last_progress = Instant::now();
+    while sequence < count {
+        while !pipeline.can_post() {
+            let completed = poll_send_completions(connection, &mut pipeline)?;
+            if completed != 0 {
+                last_progress = Instant::now();
+            } else if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
+                log_parent_pipeline_timeout(connection, &pipeline, "warmup_capacity");
+                return Err(Error::Timeout {
+                    operation: "URMA payload warmup capacity",
+                });
+            }
+        }
+        let batch_count = usize::try_from(count - sequence)
+            .unwrap_or(usize::MAX)
+            .min(send_post_list)
+            .min(pipeline.configured_window() - pipeline.current());
+        wait_for_remote_credit_count(control, remote_credit, batch_count)?;
+        let prepared = if aliased_tx {
+            connection.prepare_aliased_tx_batch(payload.len(), batch_count)?
+        } else {
+            let lengths = vec![payload.len(); batch_count];
+            connection.prepare_filled_batch(&lengths, |registered| {
+                for slot in registered.chunks_exact_mut(payload.len()) {
+                    slot.copy_from_slice(payload);
+                }
+                Ok(())
+            })?
+        };
+        let first_sequence = WARMUP_SEQUENCE_BASE
+            .checked_add(u64::from(sequence))
+            .ok_or_else(|| Error::Protocol("warmup SEND sequence overflow".into()))?;
+        let posted = connection.post_prepared_batch_tracked_list_with_tail(
+            prepared,
+            first_sequence,
+            send_post_list,
+            sequence + batch_count as u32 == count,
+        )?;
+        for _ in 0..posted {
+            remote_credit.consume()?;
+            pipeline.posted()?;
+        }
+        sequence = sequence
+            .checked_add(
+                u32::try_from(posted)
+                    .map_err(|_| Error::Protocol("warmup SEND batch exceeds u32".into()))?,
+            )
+            .ok_or_else(|| Error::Protocol("warmup SEND count overflow".into()))?;
+    }
+    drain_pipeline(connection, &mut pipeline)
+}
+
+fn receive_warmup_payload(
+    connection: &mut UrmaConnection<'_>,
+    credit: &mut ReceiveCreditController,
+    credit_return: &mut RemoteCreditReturn,
+    control: &mut TcpStream,
+    count: u32,
+    expected_length: usize,
+) -> Result<()> {
+    let mut next = 0u64;
+    let end = u64::from(count - 1);
+    let mut pending = BTreeMap::<u64, CompletedRecv>::new();
+    let mut last_progress = Instant::now();
+    while next <= end {
+        let reposted = replenish_credit(connection, credit)?;
+        if let Some(returned) = credit_return.reposted(reposted)? {
+            write_credit(control, returned)?;
+        }
+        let completed = connection.poll_recv_leased()?;
+        if completed.is_empty() {
+            if idle_timeout_elapsed(last_progress, Instant::now(), TIMEOUT) {
+                log_child_receive_timeout(connection, credit);
+                return Err(Error::Timeout {
+                    operation: "URMA payload warmup receive",
+                });
+            }
+            continue;
+        }
+        last_progress = Instant::now();
+        for completion in completed {
+            credit.completed()?;
+            queue_recv_completion(&mut pending, completion, next, end)?;
+        }
+        while let Some(completion) = pending.remove(&next) {
+            if completion.length as usize != expected_length {
+                return Err(Error::Protocol(format!(
+                    "warmup receive length {}, expected {expected_length}",
+                    completion.length
+                )));
+            }
+            let lease = connection.lease_completed_recvs(std::slice::from_ref(&completion))?;
+            connection.recycle_recv_lease(lease)?;
+            next += 1;
+        }
+    }
+    let reposted = replenish_credit(connection, credit)?;
+    if let Some(returned) = credit_return.reposted(reposted)? {
+        write_credit(control, returned)?;
+    }
+    if let Some(returned) = credit_return.flush()? {
+        write_credit(control, returned)?;
+    }
+    Ok(())
 }
 
 fn tx_batch_lengths(remaining: u64, chunk_size: usize, max_chunks: usize) -> Result<Vec<usize>> {
@@ -2375,27 +2631,29 @@ fn encode_ready(
     case_id: &str,
     initial_credit: usize,
     profile: UrmaBenchmarkProfile,
+    warmup_messages: u32,
 ) -> Result<Vec<u8>> {
     let case = case_id.as_bytes();
     let case_len = u16::try_from(case.len()).map_err(|_| invalid("case_id too long"))?;
     let credit = u32::try_from(initial_credit)
         .map_err(|_| invalid("initial remote receive credit exceeds u32"))?;
-    let mut payload = Vec::with_capacity(2 + case.len() + 4 + 1);
+    let mut payload = Vec::with_capacity(2 + case.len() + 4 + 1 + 4);
     payload.extend_from_slice(&case_len.to_be_bytes());
     payload.extend_from_slice(case);
     payload.extend_from_slice(&credit.to_be_bytes());
     payload.push(profile.wire_id());
+    payload.extend_from_slice(&warmup_messages.to_be_bytes());
     Ok(payload)
 }
 
-fn decode_ready(payload: &[u8]) -> Result<(String, usize, u8)> {
-    if payload.len() < 7 {
+fn decode_ready(payload: &[u8]) -> Result<(String, usize, u8, u32)> {
+    if payload.len() < 11 {
         return Err(Error::Protocol("truncated URMA READY payload".into()));
     }
     let case_len = u16::from_be_bytes(payload[..2].try_into().expect("fixed slice")) as usize;
     let expected_len = 2usize
         .checked_add(case_len)
-        .and_then(|length| length.checked_add(5))
+        .and_then(|length| length.checked_add(9))
         .ok_or_else(|| Error::Protocol("URMA READY length overflow".into()))?;
     if payload.len() != expected_len {
         return Err(Error::Protocol("invalid URMA READY payload length".into()));
@@ -2403,17 +2661,21 @@ fn decode_ready(payload: &[u8]) -> Result<(String, usize, u8)> {
     let case_id = std::str::from_utf8(&payload[2..2 + case_len])
         .map_err(|_| Error::Protocol("URMA READY case_id is not UTF-8".into()))?
         .to_owned();
-    let credit = u32::from_be_bytes(
-        payload[2 + case_len..expected_len - 1]
-            .try_into()
-            .expect("fixed slice"),
-    ) as usize;
+    let fields = 2 + case_len;
+    let credit =
+        u32::from_be_bytes(payload[fields..fields + 4].try_into().expect("fixed slice")) as usize;
     if credit == 0 {
         return Err(Error::Protocol(
             "URMA READY advertised zero receive credit".into(),
         ));
     }
-    Ok((case_id, credit, payload[expected_len - 1]))
+    let profile = payload[fields + 4];
+    let warmup_messages = u32::from_be_bytes(
+        payload[fields + 5..fields + 9]
+            .try_into()
+            .expect("fixed slice"),
+    );
+    Ok((case_id, credit, profile, warmup_messages))
 }
 
 fn expect_ready(
@@ -2421,16 +2683,18 @@ fn expect_ready(
     case_id: &str,
     expected_credit: usize,
     profile: UrmaBenchmarkProfile,
+    expected_warmup_messages: u32,
 ) -> Result<usize> {
-    let (received_case_id, credit, received_profile) =
+    let (received_case_id, credit, received_profile, received_warmup_messages) =
         decode_ready(&read_control(session.stream_mut(), READY)?)?;
     if received_case_id != case_id
         || credit != expected_credit
         || received_profile != profile.wire_id()
+        || received_warmup_messages != expected_warmup_messages
     {
         return Err(Error::Protocol(format!(
-            "URMA READY mismatch: case_id={received_case_id:?}, credit={credit}, profile={received_profile}, expected case_id={case_id:?}, credit={expected_credit}, profile={}",
-            profile.wire_id()
+            "URMA READY mismatch: case_id={received_case_id:?}, credit={credit}, profile={received_profile}, warmup_messages={received_warmup_messages}, expected case_id={case_id:?}, credit={expected_credit}, profile={}, warmup_messages={expected_warmup_messages}",
+            profile.wire_id(),
         )));
     }
     Ok(credit)
@@ -2499,6 +2763,33 @@ fn read_done(stream: &mut TcpStream, remote_credit: &mut RemoteReceiveCredit) ->
             _ => {
                 return Err(Error::Protocol(format!(
                     "received control kind {kind} while waiting for DONE"
+                )))
+            }
+        }
+    }
+}
+
+fn wait_for_control_with_credit(
+    stream: &mut TcpStream,
+    remote_credit: &mut RemoteReceiveCredit,
+    expected_kind: u16,
+    expected_payload: &[u8],
+) -> Result<()> {
+    loop {
+        let (kind, payload) = read_control_frame(stream)?;
+        match kind {
+            CREDIT => remote_credit.grant(decode_credit(&payload)?)?,
+            kind if kind == expected_kind => {
+                if payload != expected_payload {
+                    return Err(Error::Protocol(
+                        "URMA warmup control case_id mismatch".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            _ => {
+                return Err(Error::Protocol(format!(
+                    "received control kind {kind} while waiting for {expected_kind}"
                 )))
             }
         }
@@ -3274,17 +3565,17 @@ mod tests {
     #[test]
     fn ready_control_round_trip_binds_case_and_posted_credit() {
         let profile = UrmaBenchmarkProfile::FixedTxTransportOnly;
-        let payload = encode_ready("credit-case", 512, profile).unwrap();
+        let payload = encode_ready("credit-case", 512, profile, 64).unwrap();
         assert_eq!(
             decode_ready(&payload).unwrap(),
-            ("credit-case".to_string(), 512, profile.wire_id())
+            ("credit-case".to_string(), 512, profile.wire_id(), 64)
         );
 
         let mut truncated = payload.clone();
         truncated.pop();
         assert!(decode_ready(&truncated).is_err());
 
-        let zero = encode_ready("credit-case", 0, profile).unwrap();
+        let zero = encode_ready("credit-case", 0, profile, 0).unwrap();
         assert!(decode_ready(&zero).is_err());
     }
 

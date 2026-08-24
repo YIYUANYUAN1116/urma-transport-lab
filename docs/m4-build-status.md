@@ -253,3 +253,25 @@ shutdown 路径都区分尚未被 provider 引用与已提交 WR，避免提前�
 校验。当前本地 mmap/fast-path 17 项单元测试、feature-off check 和 feature-on release
 build 通过；完整 lib test 仅有 3 项既有 TCP loopback 测试因 sandbox 禁止 bind 而失败。
 真实 UB provider 的吞吐与 shutdown 尚待复测。
+
+## 2026-08-24：可选 payload warmup 与 SEND 失败定位
+
+新增 `--warmup-messages N`，默认 `0`。非零时，Parent 在正式 `START` 和
+steady-state 计时之前，使用与正式传输相同的 chunk size、application window、CQ
+moderation 和 linked SEND post-list 发送 N 个真实 payload；Child 从已注册 RX ring
+接收并安全回收 lease，但不把 warmup 数据交给 CRC、文件 sink 或完整性状态机。
+warmup 完成后 Child 经 OOB 返回显式屏障，Parent 才开始正式 sample。
+
+READY 现在同时校验 profile、receive credit 和 warmup message count，控制协议版本升至
+6，因此两端必须部署同一版二进制。结果新增 `warmup_messages`、`warmup_bytes` 和
+`warmup_elapsed_ns`。为了保持计时边界明确，非零 warmup 仅允许
+`timing-mode=steady-state`。
+
+SEND outstanding 元数据新增 provider post call 序号、WR 在 linked list 中的零基下标和
+list 长度。失败 CQE 会输出符号化 status，以及 `sequence/post_call/post_index/post_count`；
+warmup SEND sequence 使用高位命名空间，能与正式 payload sequence 区分。buffer 仍只在
+completion frontier 后回收，warmup RX lease 也只在 completion 后复用。
+
+本地验证：feature-off `cargo check --all-targets` 通过；feature-on all-target compile
+通过；feature-off 85 项 lib 测试及 feature-on 106 项 lib 测试通过。真实 UB provider
+warmup=0/64 的冷启动对照尚待验证。
