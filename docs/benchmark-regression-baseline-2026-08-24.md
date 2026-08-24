@@ -47,6 +47,7 @@ output       = fresh inode，成功后可用 --cleanup-output 删除
 | `urma_perftest send_bw` | duration 10s | 64 KiB, eid 1 | 71187.55 MB/s，约 569.50 Gbit/s | 硬件参考 |
 | URMA memory fixed-TX | 16 GiB | window 64, post-list 16 | 537.90 Gbit/s | perftest 的约 94.5%，CRC 正确 |
 | URMA file-to-file | 8 GiB | window 64, post-list 16, CRC workers 4, warmup 64 | 平均 55.10 Gbit/s | 3轮 55.04/55.08/55.17，CV 约 0.12% |
+| URMA file-to-file（外部 CRC、未由 benchmark 预热） | 50 GiB | window 64, post-list 16, CRC workers 4, warmup 64 | 29.79 Gbit/s | `tx_fill` 占99.01%，Parent source-fill限制 |
 | TCP sendfile file-to-file | 8 GiB | 单连接、单线程 Child | 平均 19.98 Gbit/s | 2轮 19.95/20.01，5 次 sendfile/轮 |
 | TCP userspace file-to-file | 8 GiB | 64 KiB、单连接、单线程 Child | 平均 16.08 Gbit/s | 2轮 16.08/16.07 |
 
@@ -69,6 +70,32 @@ credit/CQ 不是当前 file 瓶颈。
 
 冷启动诊断中，`warmup-messages=0` 与 `64` 各连续运行 5 轮均未再复现 completion 错误。
 因此只能确认当前版本稳定，尚不能证明 warmup 与历史首轮失败之间存在因果关系。
+
+50 GiB file-to-file 单轮诊断：
+
+```text
+bytes                  = 53687091200
+expected/actual CRC32  = 4156382310
+elapsed                = 14.4175 s
+throughput             = 3551.23 MiB/s / 29.79 Gbit/s
+tx_fill_ns             = 14274.39 ms（wall time 的99.01%）
+Parent CPU             = 14366.99 ms（wall time 的99.65%）
+source fill            = 3.503 GiB/s（由bytes / tx_fill_ns推导）
+sink_pwrite_ns         = 2418.23 ms（worker累计）
+sink_crc_ns            = 5350.14 ms（worker累计）
+sink_drain_ns          = 629.94 us
+remote_credit_wait_ns  = 12.64 ms（wall time 的0.088%）
+sink_max_outstanding   = 1
+source_crc32_external  = 1
+sink_output_fresh      = 1
+cqe_error              = 0
+```
+
+这组数据不能与8 GiB结果直接解释为“规模导致transport回退”。外部CRC跳过了Parent
+全文件预扫描，也不再由benchmark隐式预热输入；最终吞吐与Parent source-fill速度基本
+一致，Child没有形成任务积压，说明瓶颈是源文件读页/mmap fault和registered TX copy。
+该数值冻结为当前50 GiB“未由benchmark预热”的长文件观测点。由于实验没有显式清理
+OS page cache，不能严格标记为完全cold-cache。
 
 ## 4. 外部 CRC32 与 page-cache 控制
 
