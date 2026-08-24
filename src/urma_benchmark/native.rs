@@ -1400,6 +1400,12 @@ pub fn run_urma_child_profile_with_crc_workers(
     let expected_data_messages = u32::try_from(case.chunk_count()?)
         .map_err(|_| Error::Protocol("URMA Data sequence count exceeds u32".into()))?;
     let mut received_data_messages = 0u32;
+    // A shared JFR may expose successful receive CQEs in a different order
+    // from the order in which its WRs were posted.  The sequence attached to
+    // each outstanding WR still identifies its position in the byte stream,
+    // so retain completed leases until every preceding sequence is present.
+    // The map is naturally bounded by the finite posted receive credit.
+    let mut reordered_completions = BTreeMap::<u64, CompletedRecv>::new();
     let mut pending_window = Vec::<CompletedRecv>::with_capacity(rx_window_chunks);
     let end_message = 'receive: loop {
         for lease in sink_pipeline.take_recycled()? {
@@ -1429,14 +1435,18 @@ pub fn run_urma_child_profile_with_crc_workers(
         let mut received_end = None;
         for completion in completed {
             credit.completed()?;
+            queue_recv_completion(
+                &mut reordered_completions,
+                completion,
+                u64::from(received_data_messages),
+                u64::from(expected_data_messages),
+            )?;
+        }
+
+        while let Some(completion) =
+            reordered_completions.remove(&u64::from(received_data_messages))
+        {
             if received_data_messages < expected_data_messages {
-                let expected_sequence = u64::from(received_data_messages);
-                if completion.sequence != Some(expected_sequence) {
-                    return Err(Error::Protocol(format!(
-                        "RX completion sequence {:?}, expected {expected_sequence}",
-                        completion.sequence
-                    )));
-                }
                 bytes_received = bytes_received
                     .checked_add(u64::from(completion.length))
                     .ok_or_else(|| Error::Protocol("received byte count overflow".into()))?;
@@ -1468,6 +1478,7 @@ pub fn run_urma_child_profile_with_crc_workers(
                 let message = IntegrationMessageV3::decode(lease.single_span_bytes()?)?;
                 connection.recycle_recv_lease(lease)?;
                 received_end = Some(message);
+                break;
             }
         }
 
@@ -2040,6 +2051,33 @@ fn poll_send_completions(
     }
     debug_assert_eq!(pipeline.current(), connection.outstanding_send());
     Ok(completed)
+}
+
+fn queue_recv_completion(
+    pending: &mut BTreeMap<u64, CompletedRecv>,
+    completion: CompletedRecv,
+    next_expected: u64,
+    end_sequence: u64,
+) -> Result<()> {
+    let sequence = completion
+        .sequence
+        .ok_or_else(|| Error::Protocol("tracked RX completion lacks a sequence".into()))?;
+    if sequence < next_expected {
+        return Err(Error::Protocol(format!(
+            "duplicate or stale RX completion sequence {sequence}, next expected {next_expected}"
+        )));
+    }
+    if sequence > end_sequence {
+        return Err(Error::Protocol(format!(
+            "RX completion sequence {sequence} exceeds End sequence {end_sequence}"
+        )));
+    }
+    if pending.insert(sequence, completion).is_some() {
+        return Err(Error::Protocol(format!(
+            "duplicate RX completion sequence {sequence}"
+        )));
+    }
+    Ok(())
 }
 
 fn replenish_credit(
@@ -2993,6 +3031,41 @@ mod tests {
             .map(|window| window.chunks()[0].sequence.unwrap())
             .collect::<Vec<_>>();
         assert_eq!(retired_sequences, vec![0, 1]);
+    }
+
+    #[test]
+    fn out_of_order_recv_cqes_are_buffered_until_sequence_gaps_close() {
+        let completion = |sequence| CompletedRecv {
+            sequence: Some(sequence),
+            slot: crate::SlotId::from_index(sequence as usize),
+            length: 64 * 1024,
+        };
+        let mut pending = BTreeMap::new();
+
+        queue_recv_completion(&mut pending, completion(2), 0, 3).unwrap();
+        queue_recv_completion(&mut pending, completion(0), 0, 3).unwrap();
+        queue_recv_completion(&mut pending, completion(1), 0, 3).unwrap();
+
+        let retired = (0..=2)
+            .map(|sequence| pending.remove(&sequence).unwrap().sequence.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(retired, vec![0, 1, 2]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn recv_cqe_reorder_buffer_rejects_duplicates_and_out_of_range_sequences() {
+        let completion = |sequence| CompletedRecv {
+            sequence: Some(sequence),
+            slot: crate::SlotId::from_index(sequence as usize),
+            length: 64 * 1024,
+        };
+        let mut pending = BTreeMap::new();
+
+        queue_recv_completion(&mut pending, completion(1), 0, 2).unwrap();
+        assert!(queue_recv_completion(&mut pending, completion(1), 0, 2).is_err());
+        assert!(queue_recv_completion(&mut pending, completion(3), 0, 2).is_err());
+        assert!(queue_recv_completion(&mut pending, completion(0), 1, 2).is_err());
     }
 
     #[test]
