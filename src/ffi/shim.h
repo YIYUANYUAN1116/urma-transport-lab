@@ -15,10 +15,14 @@ typedef struct urma_lab_jetty urma_lab_jetty_t;
 typedef struct urma_lab_descriptor urma_lab_descriptor_t;
 typedef struct urma_lab_wr urma_lab_wr_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 8U
+#define URMA_LAB_SHIM_ABI_VERSION 9U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
+
+/* Stable receive completion opcode values, checked against UMDK by shim.c. */
+#define URMA_LAB_CR_OPC_SEND 0U
+#define URMA_LAB_CR_OPC_SEND_WITH_IMM 1U
 
 /* Stable, integer-only fingerprint of the UMDK headers used to build shim.c. */
 typedef struct urma_lab_abi_baseline {
@@ -85,11 +89,12 @@ typedef struct urma_lab_completion {
     int32_t status;
     uint32_t opcode;
     uint64_t user_ctx;
+    uint64_t imm_data;
     uint32_t completion_len;
     uint8_t is_recv;
     uint8_t is_jetty;
     uint8_t user_ctx_valid;
-    uint8_t reserved;
+    uint8_t imm_data_valid;
 } urma_lab_completion_t;
 
 /* Pointer-free input used to build a linked WR list inside the C shim. */
@@ -192,6 +197,12 @@ int urma_lab_post_send(urma_lab_jetty_t *jetty,
                        uint32_t length, uint64_t user_ctx,
                        uint8_t complete_enable,
                        urma_lab_wr_t **out);
+/* Posts SEND_IMM. `imm_data` is delivered only by the remote receive CQE. */
+int urma_lab_post_send_imm(urma_lab_jetty_t *jetty,
+                           urma_lab_segment_t *segment, uint64_t offset,
+                           uint32_t length, uint64_t user_ctx,
+                           uint64_t imm_data, uint8_t complete_enable,
+                           urma_lab_wr_t **out);
 int urma_lab_post_recv(urma_lab_jetty_t *jetty,
                        urma_lab_segment_t *segment, uint64_t offset,
                        uint32_t length, uint64_t user_ctx,

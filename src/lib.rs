@@ -18,6 +18,7 @@ mod jfc;
 pub mod message;
 pub mod oob;
 pub mod runtime;
+pub mod send_imm_probe;
 pub mod tcp_benchmark;
 pub mod transfer;
 pub mod urma_benchmark;

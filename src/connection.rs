@@ -317,15 +317,21 @@ mod native {
 
         /// Post one encoded message without imposing a completion drain.
         pub fn send_frame(&mut self, bytes: &[u8]) -> Result<()> {
-            self.send_frame_with_sequence(bytes, None, true, None)
+            self.send_frame_with_sequence(bytes, None, None, true, None)
+        }
+
+        /// Post one SEND_WITH_IMM frame. The immediate value is sender-owned
+        /// semantic identity and is delivered only on the remote receive CQE.
+        pub fn send_frame_imm(&mut self, bytes: &[u8], imm_data: u64) -> Result<()> {
+            self.send_frame_with_sequence(bytes, None, Some(imm_data), true, None)
         }
 
         pub fn send_frame_tracked(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
-            self.send_frame_with_sequence(bytes, Some(sequence), false, None)
+            self.send_frame_with_sequence(bytes, Some(sequence), None, false, None)
         }
 
         pub fn send_frame_tracked_tail(&mut self, bytes: &[u8], sequence: u64) -> Result<()> {
-            self.send_frame_with_sequence(bytes, Some(sequence), true, None)
+            self.send_frame_with_sequence(bytes, Some(sequence), None, true, None)
         }
 
         pub fn prepare_aliased_tx(&mut self, bytes: &[u8]) -> Result<()> {
@@ -339,7 +345,7 @@ mod native {
             sequence: u64,
             is_tail: bool,
         ) -> Result<()> {
-            self.send_frame_with_sequence(&[], Some(sequence), is_tail, Some(length))
+            self.send_frame_with_sequence(&[], Some(sequence), None, is_tail, Some(length))
         }
 
         pub(crate) fn prepare_aliased_tx_batch(
@@ -568,6 +574,7 @@ mod native {
             &mut self,
             bytes: &[u8],
             sequence: Option<u64>,
+            imm_data: Option<u64>,
             force_completion: bool,
             prepared_length: Option<usize>,
         ) -> Result<()> {
@@ -591,7 +598,7 @@ mod native {
                     return Err(error);
                 }
             };
-            self.post_allocated_send(slot, offset, length, sequence, complete_enable)
+            self.post_allocated_send(slot, offset, length, sequence, imm_data, complete_enable)
         }
 
         fn post_allocated_send(
@@ -600,6 +607,7 @@ mod native {
             offset: u64,
             length: u32,
             sequence: Option<u64>,
+            imm_data: Option<u64>,
             complete_enable: bool,
         ) -> Result<()> {
             let token = WrToken {
@@ -620,10 +628,20 @@ mod native {
                 return Err(error);
             }
             let result = match self.buffer_pool.segment_handle() {
-                Ok(segment) => {
-                    self.jetty
-                        .post_send(segment, offset, length, user_ctx, complete_enable)
-                }
+                Ok(segment) => match imm_data {
+                    Some(imm_data) => self.jetty.post_send_imm(
+                        segment,
+                        offset,
+                        length,
+                        user_ctx,
+                        imm_data,
+                        complete_enable,
+                    ),
+                    None => {
+                        self.jetty
+                            .post_send(segment, offset, length, user_ctx, complete_enable)
+                    }
+                },
                 Err(error) => {
                     self.buffer_pool.rollback_post(slot, SlotKind::Tx)?;
                     self.buffer_pool.release(slot)?;

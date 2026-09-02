@@ -221,6 +221,20 @@ mod native {
                 .map_err(|error| map_ffi_error("post_jetty_send_wr", error))
         }
 
+        pub(crate) fn post_send_imm(
+            &mut self,
+            segment: &ffi::SegmentHandle,
+            offset: u64,
+            length: u32,
+            user_ctx: u64,
+            imm_data: u64,
+            complete_enable: bool,
+        ) -> Result<ffi::WrHandle> {
+            self.handle
+                .post_send_imm(segment, offset, length, user_ctx, imm_data, complete_enable)
+                .map_err(|error| map_ffi_error("post_jetty_send_imm_wr", error))
+        }
+
         pub(crate) fn post_recv(
             &mut self,
             segment: &ffi::SegmentHandle,

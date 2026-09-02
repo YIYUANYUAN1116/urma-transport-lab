@@ -9,6 +9,11 @@
 
 #include <urma_api.h>
 
+_Static_assert(URMA_CR_OPC_SEND == URMA_LAB_CR_OPC_SEND,
+               "URMA SEND completion opcode changed");
+_Static_assert(URMA_CR_OPC_SEND_WITH_IMM == URMA_LAB_CR_OPC_SEND_WITH_IMM,
+               "URMA SEND_WITH_IMM completion opcode changed");
+
 struct urma_lab_runtime {
     urma_device_t *device;
     urma_context_t *context;
@@ -925,11 +930,13 @@ static void urma_lab_wr_posted(urma_lab_wr_t *wr)
     wr->jetty->outstanding_wr_count++;
 }
 
-int urma_lab_post_send(urma_lab_jetty_t *jetty,
-                       urma_lab_segment_t *segment, uint64_t offset,
-                       uint32_t length, uint64_t user_ctx,
-                       uint8_t complete_enable,
-                       urma_lab_wr_t **out)
+static int urma_lab_post_send_common(urma_lab_jetty_t *jetty,
+                                     urma_lab_segment_t *segment,
+                                     uint64_t offset, uint32_t length,
+                                     uint64_t user_ctx, uint64_t imm_data,
+                                     uint8_t complete_enable,
+                                     uint8_t with_imm,
+                                     urma_lab_wr_t **out)
 {
     urma_lab_wr_t *wr;
     urma_jfs_wr_t *bad_wr = NULL;
@@ -943,14 +950,14 @@ int urma_lab_post_send(urma_lab_jetty_t *jetty,
     if (create_status != 0) {
         return create_status;
     }
-    wr->send_wr.opcode = URMA_OPC_SEND;
+    wr->send_wr.opcode = with_imm != 0 ? URMA_OPC_SEND_IMM : URMA_OPC_SEND;
     wr->send_wr.flag.value = 0;
     wr->send_wr.flag.bs.complete_enable = complete_enable != 0;
     wr->send_wr.tjetty = jetty->target;
     wr->send_wr.user_ctx = user_ctx;
     wr->send_wr.send.src.sge = &wr->sge;
     wr->send_wr.send.src.num_sge = 1;
-    wr->send_wr.send.imm_data = 0;
+    wr->send_wr.send.imm_data = imm_data;
     wr->send_wr.next = NULL;
     status = urma_post_jetty_send_wr(jetty->jetty, &wr->send_wr, &bad_wr);
     if (status != URMA_SUCCESS) {
@@ -960,6 +967,26 @@ int urma_lab_post_send(urma_lab_jetty_t *jetty,
     urma_lab_wr_posted(wr);
     *out = wr;
     return 0;
+}
+
+int urma_lab_post_send(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *segment, uint64_t offset,
+                       uint32_t length, uint64_t user_ctx,
+                       uint8_t complete_enable,
+                       urma_lab_wr_t **out)
+{
+    return urma_lab_post_send_common(jetty, segment, offset, length, user_ctx,
+                                     0, complete_enable, 0, out);
+}
+
+int urma_lab_post_send_imm(urma_lab_jetty_t *jetty,
+                           urma_lab_segment_t *segment, uint64_t offset,
+                           uint32_t length, uint64_t user_ctx,
+                           uint64_t imm_data, uint8_t complete_enable,
+                           urma_lab_wr_t **out)
+{
+    return urma_lab_post_send_common(jetty, segment, offset, length, user_ctx,
+                                     imm_data, complete_enable, 1, out);
 }
 
 int urma_lab_post_recv(urma_lab_jetty_t *jetty,
@@ -1162,12 +1189,16 @@ int urma_lab_jfc_poll(urma_lab_jfc_t *jfc, uint32_t capacity,
         out[i].status = (int32_t)cr[i].status;
         out[i].opcode = (uint32_t)cr[i].opcode;
         out[i].user_ctx = cr[i].user_ctx;
+        out[i].imm_data = cr[i].imm_data;
         out[i].completion_len = cr[i].completion_len;
         out[i].is_recv = cr[i].flag.bs.s_r;
         out[i].is_jetty = cr[i].flag.bs.jetty;
         out[i].user_ctx_valid =
             (cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
              cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
+        out[i].imm_data_valid =
+            (cr[i].flag.bs.s_r != 0 &&
+             cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM);
     }
     return count;
 }

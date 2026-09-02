@@ -28,3 +28,6 @@ M0 implementation and verification status is recorded in
 
 The current implementation and real-provider validation gaps are recorded in
 `docs/current-status.md`.
+
+The RC `SEND_IMM` 64-bit correctness probe and two-node commands are documented
+in `docs/send-imm-validation.md`.

@@ -14,6 +14,9 @@ mod sys {
     include!(concat!(env!("OUT_DIR"), "/urma_bindings.rs"));
 }
 
+pub(crate) const CR_OPCODE_SEND: u32 = sys::URMA_LAB_CR_OPC_SEND;
+pub(crate) const CR_OPCODE_SEND_WITH_IMM: u32 = sys::URMA_LAB_CR_OPC_SEND_WITH_IMM;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AbiBaseline {
     pub shim_abi_version: u32,
@@ -74,10 +77,12 @@ pub(crate) struct CompletionRecord {
     pub status: i32,
     pub opcode: u32,
     pub user_ctx: u64,
+    pub imm_data: u64,
     pub completion_len: u32,
     pub is_recv: bool,
     pub is_jetty: bool,
     pub user_ctx_valid: bool,
+    pub imm_data_valid: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -388,10 +393,12 @@ impl JfcHandle {
                 status: record.status,
                 opcode: record.opcode,
                 user_ctx: record.user_ctx,
+                imm_data: record.imm_data,
                 completion_len: record.completion_len,
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
+                imm_data_valid: record.imm_data_valid != 0,
             };
         }
         Ok(count)
@@ -672,6 +679,41 @@ impl JettyHandle {
         complete_enable: bool,
     ) -> Result<WrHandle, FfiError> {
         self.post(segment, offset, length, user_ctx, true, complete_enable)
+    }
+
+    pub(crate) fn post_send_imm(
+        &mut self,
+        segment: &SegmentHandle,
+        offset: u64,
+        length: u32,
+        user_ctx: u64,
+        imm_data: u64,
+        complete_enable: bool,
+    ) -> Result<WrHandle, FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let segment = segment.raw.ok_or(FfiError::Contract("Segment is closed"))?;
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: Jetty and Segment are live, the shim repeats range
+        // validation, and `raw` is a valid out pointer.
+        let status = unsafe {
+            sys::urma_lab_post_send_imm(
+                jetty.as_ptr(),
+                segment.as_ptr(),
+                offset,
+                length,
+                user_ctx,
+                imm_data,
+                u8::from(complete_enable),
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        Ok(WrHandle {
+            raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
+            _not_send_sync: PhantomData,
+        })
     }
 
     pub(crate) fn post_recv(

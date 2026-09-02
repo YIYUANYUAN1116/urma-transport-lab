@@ -203,7 +203,29 @@ mod native {
             &mut self.stream
         }
 
-        /// M2 carries no post-handshake messages. Parent waits until child closes.
+        /// Narrow post-handshake barrier used by the SEND_IMM probe so the
+        /// sender cannot outrun the receiver's additional posted WRs.
+        pub fn send_probe_ready(&mut self) -> Result<()> {
+            self.stream
+                .write_all(&[0xa5])
+                .map_err(|error| io_error("send SEND_IMM probe ready", error))
+        }
+
+        pub fn wait_probe_ready(&mut self) -> Result<()> {
+            let mut marker = [0u8; 1];
+            self.stream
+                .read_exact(&mut marker)
+                .map_err(|error| io_error("wait for SEND_IMM probe ready", error))?;
+            if marker[0] != 0xa5 {
+                return Err(Error::Protocol(format!(
+                    "invalid SEND_IMM probe ready marker 0x{:02x}",
+                    marker[0]
+                )));
+            }
+            Ok(())
+        }
+
+        /// Outside the optional probe barrier, Parent waits until Child closes.
         pub fn wait_for_peer_close(mut self) -> Result<()> {
             let mut byte = [0u8; 1];
             match self.stream.read(&mut byte) {

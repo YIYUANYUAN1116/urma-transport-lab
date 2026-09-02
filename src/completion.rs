@@ -56,8 +56,15 @@ fn duration_ns_saturating(duration: Duration) -> u64 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompletionEvent {
-    SendCompleted { slot: SlotId },
-    RecvCompleted { slot: SlotId, bytes: Vec<u8> },
+    SendCompleted {
+        slot: SlotId,
+    },
+    RecvCompleted {
+        slot: SlotId,
+        bytes: Vec<u8>,
+        /// Sender-provided identity carried by a SEND_WITH_IMM receive CQE.
+        imm_data: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,7 +406,7 @@ mod native {
                 pool.release(token.slot)?;
                 return Err(error);
             }
-            if record.opcode != 0 {
+            if record.opcode != ffi::CR_OPCODE_SEND || record.imm_data_valid {
                 self.stats.cqe_error += 1;
                 pool.complete_error(token.slot, OperationType::Recv)?;
                 pool.release(token.slot)?;
@@ -461,7 +468,7 @@ mod native {
                 pool.release(token.slot)?;
                 return Err(error);
             }
-            if record.opcode != 0 {
+            if record.opcode != ffi::CR_OPCODE_SEND || record.imm_data_valid {
                 self.stats.cqe_error += 1;
                 pool.complete_error(token.slot, OperationType::Recv)?;
                 pool.release(token.slot)?;
@@ -602,17 +609,22 @@ mod native {
                         pool.release(token.slot)?;
                         return Err(error);
                     }
-                    // URMA documents opcode only for receive CRs; M3 accepts
-                    // only the SEND opcode value (zero).
-                    if record.opcode != 0 {
-                        self.stats.cqe_error += 1;
-                        pool.complete_error(token.slot, token.operation)?;
-                        pool.release(token.slot)?;
-                        return Err(Error::Protocol(format!(
-                            "unexpected receive CQE opcode {}",
-                            record.opcode
-                        )));
-                    }
+                    // Immediate data is valid only on a receive CR whose
+                    // opcode is SEND_WITH_IMM. Fail closed if the C shim's
+                    // validity bit and the provider opcode disagree.
+                    let imm_data = match (record.opcode, record.imm_data_valid) {
+                        (ffi::CR_OPCODE_SEND, false) => None,
+                        (ffi::CR_OPCODE_SEND_WITH_IMM, true) => Some(record.imm_data),
+                        _ => {
+                            self.stats.cqe_error += 1;
+                            pool.complete_error(token.slot, token.operation)?;
+                            pool.release(token.slot)?;
+                            return Err(Error::Protocol(format!(
+                                "receive CQE opcode {} disagrees with imm_data_valid={}",
+                                record.opcode, record.imm_data_valid
+                            )));
+                        }
+                    };
                     let bytes = pool.complete_recv(token.slot, record.completion_len)?;
                     pool.release(token.slot)?;
                     self.stats.recv_cqe += 1;
@@ -622,6 +634,7 @@ mod native {
                     Ok(vec![CompletionEvent::RecvCompleted {
                         slot: token.slot,
                         bytes,
+                        imm_data,
                     }])
                 }
             }
