@@ -14,8 +14,10 @@ typedef struct urma_lab_segment urma_lab_segment_t;
 typedef struct urma_lab_jetty urma_lab_jetty_t;
 typedef struct urma_lab_descriptor urma_lab_descriptor_t;
 typedef struct urma_lab_wr urma_lab_wr_t;
+typedef struct urma_lab_read_source urma_lab_read_source_t;
+typedef struct urma_lab_read_segment urma_lab_read_segment_t;
 
-#define URMA_LAB_SHIM_ABI_VERSION 9U
+#define URMA_LAB_SHIM_ABI_VERSION 10U
 #define URMA_LAB_DEVICE_NAME_BYTES 64U
 #define URMA_LAB_EID_STORAGE_BYTES 32U
 #define URMA_LAB_MAX_EIDS 256U
@@ -64,6 +66,8 @@ typedef struct urma_lab_device_capability {
     uint32_t max_jfs_rsge;
     uint32_t max_jfr_sge;
     uint64_t max_msg_size;
+    uint32_t max_read_size;
+    uint32_t max_write_size;
     uint16_t transport_modes;
     uint16_t reserved;
     uint64_t page_size_cap;
@@ -91,11 +95,36 @@ typedef struct urma_lab_completion {
     uint64_t user_ctx;
     uint64_t imm_data;
     uint32_t completion_len;
+    uint32_t local_id;
+    uint8_t remote_eid[16];
+    uint32_t remote_uasid;
+    uint32_t remote_jetty_id;
     uint8_t is_recv;
     uint8_t is_jetty;
     uint8_t user_ctx_valid;
     uint8_t imm_data_valid;
+    uint8_t remote_id_valid;
+    uint8_t event_kind;
+    uint8_t reserved[2];
 } urma_lab_completion_t;
+
+#define URMA_LAB_COMPLETION_WR 0U
+#define URMA_LAB_COMPLETION_WR_SUSPEND_DONE 1U
+#define URMA_LAB_COMPLETION_WR_FLUSH_ERR_DONE 2U
+
+#define URMA_LAB_READ_DESCRIPTOR_VERSION 1U
+#define URMA_LAB_READ_ACCESS 2U
+#define URMA_LAB_READ_TOKEN_PLAIN 1U
+typedef struct urma_lab_read_descriptor {
+    uint32_t version;
+    uint8_t eid[16];
+    uint32_t uasid;
+    uint64_t va;
+    uint64_t length;
+    uint32_t token_id;
+    uint32_t access;
+    uint32_t token_policy;
+} urma_lab_read_descriptor_t;
 
 /* Pointer-free input used to build a linked WR list inside the C shim. */
 typedef struct urma_lab_wr_desc {
@@ -161,12 +190,29 @@ int urma_lab_segment_get_mut(urma_lab_segment_t *segment,
                              uint64_t offset, uint32_t length,
                              uint8_t **out);
 
+/* Registers caller-owned immutable memory for remote READ with a plain token. */
+int urma_lab_read_source_register(urma_lab_runtime_t *runtime,
+                                  const uint8_t *data, uint64_t length,
+                                  uint32_t token,
+                                  urma_lab_read_source_t **out);
+int urma_lab_read_source_descriptor(urma_lab_read_source_t *source,
+                                    urma_lab_read_descriptor_t *out);
+int urma_lab_read_source_unregister(urma_lab_read_source_t *source);
+/* Call only after the probe peer has confirmed unimport and completion drain. */
+int urma_lab_read_source_release(urma_lab_read_source_t *source);
+
 /* Creates one RC duplex Jetty backed by an owned shared JFR. */
 int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
                           urma_lab_jfc_t *send_jfc,
                           urma_lab_jfc_t *recv_jfc,
                           const urma_lab_jetty_config_t *config,
                           urma_lab_jetty_t **out);
+/* Creates the same shared-JFR shape in RM/RTP mode for the READ probe. */
+int urma_lab_rm_jetty_create(urma_lab_runtime_t *runtime,
+                             urma_lab_jfc_t *send_jfc,
+                             urma_lab_jfc_t *recv_jfc,
+                             const urma_lab_jetty_config_t *config,
+                             urma_lab_jetty_t **out);
 
 /* Optional M2/M3 shutdown transition; no CQ drain is performed here. */
 int urma_lab_jetty_mark_error(urma_lab_jetty_t *jetty);
@@ -183,6 +229,10 @@ int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
                           const urma_lab_jetty_descriptor_meta_t *meta,
                           const uint8_t *opaque_data, uint32_t opaque_len,
                           uint32_t token);
+int urma_lab_rm_jetty_import(urma_lab_jetty_t *jetty,
+                             const urma_lab_jetty_descriptor_meta_t *meta,
+                             const uint8_t *opaque_data, uint32_t opaque_len,
+                             uint32_t token);
 int urma_lab_jetty_bind(urma_lab_jetty_t *jetty);
 int urma_lab_jetty_unbind(urma_lab_jetty_t *jetty);
 int urma_lab_jetty_unimport(urma_lab_jetty_t *jetty);
@@ -223,6 +273,19 @@ int urma_lab_post_recv_batch(urma_lab_jetty_t *jetty,
                              const urma_lab_wr_desc_t *descs,
                              uint32_t count, urma_lab_wr_t **out_wrs,
                              uint32_t *out_posted);
+
+int urma_lab_read_segment_import(urma_lab_jetty_t *jetty,
+                                 const urma_lab_read_descriptor_t *descriptor,
+                                 uint32_t token, uint32_t max_read_size,
+                                 urma_lab_read_segment_t **out);
+/* Returns -EBUSY until every READ owner referencing this import is retired. */
+int urma_lab_read_segment_unimport(urma_lab_read_segment_t *segment);
+int urma_lab_post_read(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *local,
+                       urma_lab_read_segment_t *remote,
+                       uint64_t local_offset, uint64_t remote_offset,
+                       uint32_t length, uint64_t user_ctx,
+                       urma_lab_wr_t **out);
 void urma_lab_wr_complete(urma_lab_wr_t *wr);
 
 /* Non-blocking poll. Returns a count in [0, capacity], or a negative error. */

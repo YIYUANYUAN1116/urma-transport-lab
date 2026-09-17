@@ -57,12 +57,35 @@ struct urma_lab_jetty {
     urma_lab_wr_t *wr_arena;
     urma_lab_wr_t *free_wr;
     uint32_t wr_capacity;
+    uint32_t read_segment_count;
+    urma_transport_mode_t transport_mode;
+    urma_tp_type_t tp_type;
+};
+
+struct urma_lab_read_source {
+    urma_lab_runtime_t *runtime;
+    urma_target_seg_t *segment;
+    urma_token_id_t *token_id;
+    uint64_t va;
+    uint64_t length;
+    int closing;
+};
+
+struct urma_lab_read_segment {
+    urma_lab_jetty_t *jetty;
+    urma_target_seg_t *segment;
+    uint64_t va;
+    uint64_t length;
+    uint32_t max_read_size;
+    uint32_t outstanding_wr_count;
 };
 
 struct urma_lab_wr {
     urma_lab_runtime_t *runtime;
     urma_lab_segment_t *segment;
     urma_lab_jetty_t *jetty;
+    urma_lab_read_segment_t *read_segment;
+    urma_sge_t remote_sge;
     urma_sge_t sge;
     urma_jfs_wr_t send_wr;
     urma_jfr_wr_t recv_wr;
@@ -247,6 +270,8 @@ int urma_lab_runtime_query_device(urma_lab_runtime_t *runtime,
     out->max_jfs_rsge = attr.dev_cap.max_jfs_rsge;
     out->max_jfr_sge = attr.dev_cap.max_jfr_sge;
     out->max_msg_size = attr.dev_cap.max_msg_size;
+    out->max_read_size = attr.dev_cap.max_read_size;
+    out->max_write_size = attr.dev_cap.max_write_size;
     out->transport_modes = attr.dev_cap.trans_mode;
     out->page_size_cap = attr.dev_cap.page_size_cap;
     return 0;
@@ -569,11 +594,140 @@ int urma_lab_segment_get_mut(urma_lab_segment_t *segment,
     return 0;
 }
 
-int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
-                          urma_lab_jfc_t *send_jfc,
-                          urma_lab_jfc_t *recv_jfc,
-                          const urma_lab_jetty_config_t *config,
-                          urma_lab_jetty_t **out)
+int urma_lab_read_source_register(urma_lab_runtime_t *runtime,
+                                  const uint8_t *data, uint64_t length,
+                                  uint32_t token,
+                                  urma_lab_read_source_t **out)
+{
+    urma_lab_read_source_t *source;
+    urma_seg_cfg_t cfg = {0};
+    int error;
+
+    if (runtime == NULL || runtime->context == NULL || data == NULL ||
+        length == 0 || length > PTRDIFF_MAX || out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    source = calloc(1, sizeof(*source));
+    if (source == NULL) {
+        return -ENOMEM;
+    }
+    errno = 0;
+    source->token_id = urma_alloc_token_id(runtime->context);
+    if (source->token_id == NULL) {
+        error = urma_lab_pointer_error(-EIO);
+        free(source);
+        return error;
+    }
+    source->runtime = runtime;
+    source->va = (uint64_t)(uintptr_t)data;
+    source->length = length;
+    cfg.va = source->va;
+    cfg.len = length;
+    cfg.token_id = source->token_id;
+    cfg.token_value.token = token;
+    cfg.flag.value = 0;
+    cfg.flag.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    cfg.flag.bs.access = URMA_ACCESS_READ;
+    cfg.flag.bs.cacheable = URMA_NON_CACHEABLE;
+    cfg.flag.bs.token_id_valid = URMA_TOKEN_ID_VALID;
+    errno = 0;
+    source->segment = urma_register_seg(runtime->context, &cfg);
+    cfg.token_value.token = 0;
+    if (source->segment == NULL) {
+        error = urma_lab_pointer_error(-EIO);
+        (void)urma_free_token_id(source->token_id);
+        free(source);
+        return error;
+    }
+    runtime->segment_count++;
+    *out = source;
+    return 0;
+}
+
+int urma_lab_read_source_descriptor(urma_lab_read_source_t *source,
+                                    urma_lab_read_descriptor_t *out)
+{
+    urma_seg_t *seg = NULL;
+    uint32_t size = 0;
+    urma_status_t status;
+    int result = 0;
+
+    if (source == NULL || source->segment == NULL || source->closing || out == NULL) {
+        return -EINVAL;
+    }
+    (void)memset(out, 0, sizeof(*out));
+    status = urma_get_seg_ctx(source->segment, &seg, &size);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    if (seg == NULL || size != sizeof(*seg) ||
+        seg->attr.bs.access != URMA_ACCESS_READ ||
+        seg->attr.bs.token_policy != URMA_TOKEN_PLAIN_TEXT ||
+        seg->ubva.va != source->va || seg->len != source->length ||
+        seg->ubva.uasid > 0xffffffU) {
+        result = -EPROTO;
+    } else {
+        out->version = URMA_LAB_READ_DESCRIPTOR_VERSION;
+        (void)memcpy(out->eid, seg->ubva.eid.raw, sizeof(out->eid));
+        out->uasid = seg->ubva.uasid;
+        out->va = seg->ubva.va;
+        out->length = seg->len;
+        out->token_id = seg->token_id;
+        out->access = URMA_LAB_READ_ACCESS;
+        out->token_policy = URMA_LAB_READ_TOKEN_PLAIN;
+    }
+    if (seg != NULL) {
+        urma_put_seg_ctx(seg);
+    }
+    return result;
+}
+
+int urma_lab_read_source_unregister(urma_lab_read_source_t *source)
+{
+    urma_status_t status;
+    if (source == NULL) {
+        return -EINVAL;
+    }
+    source->closing = 1;
+    if (source->segment == NULL) {
+        return 0;
+    }
+    status = urma_unregister_seg(source->segment);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    source->segment = NULL;
+    return 0;
+}
+
+int urma_lab_read_source_release(urma_lab_read_source_t *source)
+{
+    urma_status_t status;
+    if (source == NULL || source->runtime == NULL || source->token_id == NULL) {
+        return -EINVAL;
+    }
+    if (source->segment != NULL) {
+        return -EBUSY;
+    }
+    status = urma_free_token_id(source->token_id);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    if (source->runtime->segment_count > 0) {
+        source->runtime->segment_count--;
+    }
+    source->token_id = NULL;
+    free(source);
+    return 0;
+}
+
+static int urma_lab_jetty_create_common(urma_lab_runtime_t *runtime,
+                                        urma_lab_jfc_t *send_jfc,
+                                        urma_lab_jfc_t *recv_jfc,
+                                        const urma_lab_jetty_config_t *config,
+                                        urma_transport_mode_t transport_mode,
+                                        urma_lab_jetty_t **out)
 {
     urma_jfs_cfg_t jfs_cfg = {0};
     urma_jfr_cfg_t jfr_cfg = {0};
@@ -618,7 +772,7 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
     }
 
     jfs_cfg.depth = config->send_depth;
-    jfs_cfg.trans_mode = URMA_TM_RC;
+    jfs_cfg.trans_mode = transport_mode;
     jfs_cfg.priority = rtp_priority;
     jfs_cfg.max_sge = (uint8_t)config->max_send_sge;
     jfs_cfg.max_rsge = 1;
@@ -630,7 +784,7 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
     jfr_cfg.depth = config->recv_depth;
     jfr_cfg.flag.value = 0;
     jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    jfr_cfg.trans_mode = URMA_TM_RC;
+    jfr_cfg.trans_mode = transport_mode;
     jfr_cfg.max_sge = (uint8_t)config->max_recv_sge;
     jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
     jfr_cfg.jfc = recv_jfc->jfc;
@@ -663,9 +817,31 @@ int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
     }
 
     jetty->runtime = runtime;
+    jetty->transport_mode = transport_mode;
+    jetty->tp_type = URMA_RTP;
     runtime->jetty_count++;
     *out = jetty;
     return 0;
+}
+
+int urma_lab_jetty_create(urma_lab_runtime_t *runtime,
+                          urma_lab_jfc_t *send_jfc,
+                          urma_lab_jfc_t *recv_jfc,
+                          const urma_lab_jetty_config_t *config,
+                          urma_lab_jetty_t **out)
+{
+    return urma_lab_jetty_create_common(runtime, send_jfc, recv_jfc, config,
+                                        URMA_TM_RC, out);
+}
+
+int urma_lab_rm_jetty_create(urma_lab_runtime_t *runtime,
+                             urma_lab_jfc_t *send_jfc,
+                             urma_lab_jfc_t *recv_jfc,
+                             const urma_lab_jetty_config_t *config,
+                             urma_lab_jetty_t **out)
+{
+    return urma_lab_jetty_create_common(runtime, send_jfc, recv_jfc, config,
+                                        URMA_TM_RM, out);
 }
 
 int urma_lab_jetty_mark_error(urma_lab_jetty_t *jetty)
@@ -749,10 +925,11 @@ void urma_lab_descriptor_free(urma_lab_descriptor_t *descriptor)
     free(descriptor);
 }
 
-int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
-                          const urma_lab_jetty_descriptor_meta_t *meta,
-                          const uint8_t *opaque_data, uint32_t opaque_len,
-                          uint32_t token)
+static int urma_lab_jetty_import_common(urma_lab_jetty_t *jetty,
+                                        const urma_lab_jetty_descriptor_meta_t *meta,
+                                        const uint8_t *opaque_data,
+                                        uint32_t opaque_len, uint32_t token,
+                                        urma_transport_mode_t transport_mode)
 {
     urma_rjetty_t *rjetty;
     urma_token_t token_value = {0};
@@ -760,7 +937,7 @@ int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
     if (jetty == NULL || jetty->runtime == NULL || jetty->jetty == NULL ||
         meta == NULL || opaque_data == NULL || opaque_len == 0 ||
         opaque_len != meta->opaque_len || opaque_len < sizeof(urma_rjetty_t) ||
-        jetty->target != NULL ||
+        jetty->target != NULL || jetty->transport_mode != transport_mode ||
         meta->transport_type != (uint32_t)jetty->runtime->device->type) {
         return -EINVAL;
     }
@@ -771,11 +948,14 @@ int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
     }
     (void)memcpy(rjetty, opaque_data, opaque_len);
     if (rjetty->jetty_id.id != meta->jetty_id ||
-        rjetty->trans_mode != URMA_TM_RC || rjetty->type != URMA_JETTY) {
+        rjetty->trans_mode != transport_mode || rjetty->type != URMA_JETTY) {
         free(rjetty);
         return -EPROTO;
     }
 
+    if (transport_mode == URMA_TM_RM) {
+        rjetty->tp_type = jetty->tp_type;
+    }
     token_value.token = token;
     errno = 0;
     jetty->target = urma_import_jetty(jetty->runtime->context, rjetty,
@@ -785,6 +965,24 @@ int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
         return urma_lab_pointer_error(-EIO);
     }
     return 0;
+}
+
+int urma_lab_jetty_import(urma_lab_jetty_t *jetty,
+                          const urma_lab_jetty_descriptor_meta_t *meta,
+                          const uint8_t *opaque_data, uint32_t opaque_len,
+                          uint32_t token)
+{
+    return urma_lab_jetty_import_common(jetty, meta, opaque_data, opaque_len,
+                                        token, URMA_TM_RC);
+}
+
+int urma_lab_rm_jetty_import(urma_lab_jetty_t *jetty,
+                             const urma_lab_jetty_descriptor_meta_t *meta,
+                             const uint8_t *opaque_data, uint32_t opaque_len,
+                             uint32_t token)
+{
+    return urma_lab_jetty_import_common(jetty, meta, opaque_data, opaque_len,
+                                        token, URMA_TM_RM);
 }
 
 int urma_lab_jetty_bind(urma_lab_jetty_t *jetty)
@@ -833,7 +1031,7 @@ int urma_lab_jetty_unimport(urma_lab_jetty_t *jetty)
     if (jetty == NULL || jetty->jetty == NULL) {
         return -EINVAL;
     }
-    if (jetty->bound != 0) {
+    if (jetty->bound != 0 || jetty->read_segment_count != 0) {
         return -EBUSY;
     }
     if (jetty->target == NULL) {
@@ -928,6 +1126,156 @@ static void urma_lab_wr_posted(urma_lab_wr_t *wr)
     wr->runtime->outstanding_wr_count++;
     wr->segment->outstanding_wr_count++;
     wr->jetty->outstanding_wr_count++;
+    if (wr->read_segment != NULL) {
+        wr->read_segment->outstanding_wr_count++;
+    }
+}
+
+int urma_lab_read_segment_import(urma_lab_jetty_t *jetty,
+                                 const urma_lab_read_descriptor_t *descriptor,
+                                 uint32_t token, uint32_t max_read_size,
+                                 urma_lab_read_segment_t **out)
+{
+    urma_seg_t seg = {0};
+    urma_import_seg_flag_t flag = {0};
+    urma_token_t token_value = {.token = token};
+    urma_lab_device_capability_t capability;
+    urma_lab_read_segment_t *remote;
+    int status;
+
+    if (jetty == NULL || jetty->runtime == NULL || jetty->target == NULL ||
+        jetty->transport_mode != URMA_TM_RM || descriptor == NULL || out == NULL ||
+        descriptor->version != URMA_LAB_READ_DESCRIPTOR_VERSION ||
+        descriptor->access != URMA_LAB_READ_ACCESS ||
+        descriptor->token_policy != URMA_LAB_READ_TOKEN_PLAIN ||
+        descriptor->uasid > 0xffffffU || descriptor->va == 0 ||
+        descriptor->length == 0 || max_read_size == 0) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    if ((descriptor->length > UINT64_MAX - descriptor->va) ||
+        memcmp(descriptor->eid, jetty->target->id.eid.raw,
+               sizeof(descriptor->eid)) != 0 ||
+        descriptor->uasid != jetty->target->id.uasid) {
+        return -EACCES;
+    }
+    status = urma_lab_runtime_query_device(jetty->runtime, &capability);
+    if (status != 0) {
+        return status;
+    }
+    if ((capability.transport_modes & URMA_TM_RM) == 0 ||
+        capability.max_read_size == 0 || capability.max_jfs_sge == 0 ||
+        capability.max_jfs_rsge == 0) {
+        return -EOPNOTSUPP;
+    }
+    remote = calloc(1, sizeof(*remote));
+    if (remote == NULL) {
+        return -ENOMEM;
+    }
+    (void)memcpy(seg.ubva.eid.raw, descriptor->eid, sizeof(descriptor->eid));
+    seg.ubva.uasid = descriptor->uasid;
+    seg.ubva.va = descriptor->va;
+    seg.len = descriptor->length;
+    seg.token_id = descriptor->token_id;
+    seg.attr.bs.access = URMA_ACCESS_READ;
+    seg.attr.bs.token_policy = URMA_TOKEN_PLAIN_TEXT;
+    seg.attr.bs.cacheable = URMA_NON_CACHEABLE;
+    flag.bs.access = URMA_ACCESS_READ;
+    flag.bs.mapping = URMA_SEG_NOMAP;
+    errno = 0;
+    remote->segment = urma_import_seg(jetty->runtime->context, &seg,
+                                      &token_value, 0, flag);
+    token_value.token = 0;
+    if (remote->segment == NULL) {
+        status = urma_lab_pointer_error(-EIO);
+        free(remote);
+        return status;
+    }
+    remote->jetty = jetty;
+    remote->va = descriptor->va;
+    remote->length = descriptor->length;
+    remote->max_read_size = max_read_size < capability.max_read_size ?
+        max_read_size : capability.max_read_size;
+    jetty->read_segment_count++;
+    jetty->runtime->segment_count++;
+    *out = remote;
+    return 0;
+}
+
+int urma_lab_read_segment_unimport(urma_lab_read_segment_t *remote)
+{
+    urma_status_t status;
+    if (remote == NULL || remote->segment == NULL || remote->jetty == NULL) {
+        return -EINVAL;
+    }
+    if (remote->outstanding_wr_count != 0) {
+        return -EBUSY;
+    }
+    status = urma_unimport_seg(remote->segment);
+    if (status != URMA_SUCCESS) {
+        return (int)status;
+    }
+    if (remote->jetty->runtime->segment_count > 0) {
+        remote->jetty->runtime->segment_count--;
+    }
+    if (remote->jetty->read_segment_count > 0) {
+        remote->jetty->read_segment_count--;
+    }
+    remote->segment = NULL;
+    free(remote);
+    return 0;
+}
+
+int urma_lab_post_read(urma_lab_jetty_t *jetty,
+                       urma_lab_segment_t *local,
+                       urma_lab_read_segment_t *remote,
+                       uint64_t local_offset, uint64_t remote_offset,
+                       uint32_t length, uint64_t user_ctx,
+                       urma_lab_wr_t **out)
+{
+    urma_lab_wr_t *wr;
+    urma_jfs_wr_t *bad_wr = NULL;
+    urma_status_t status;
+    int result;
+
+    if (out == NULL) {
+        return -EINVAL;
+    }
+    *out = NULL;
+    if (jetty == NULL || jetty->target == NULL ||
+        jetty->transport_mode != URMA_TM_RM || remote == NULL ||
+        remote->segment == NULL || remote->jetty != jetty || length == 0 ||
+        length > remote->max_read_size || remote_offset > remote->length ||
+        (uint64_t)length > remote->length - remote_offset) {
+        return -EINVAL;
+    }
+    result = urma_lab_wr_acquire(jetty, local, local_offset, length, &wr);
+    if (result != 0) {
+        return result;
+    }
+    wr->read_segment = remote;
+    wr->remote_sge.addr = remote->va + remote_offset;
+    wr->remote_sge.len = length;
+    wr->remote_sge.tseg = remote->segment;
+    wr->remote_sge.user_tseg = NULL;
+    wr->send_wr.opcode = URMA_OPC_READ;
+    wr->send_wr.flag.value = 0;
+    wr->send_wr.flag.bs.complete_enable = 1;
+    wr->send_wr.tjetty = jetty->target;
+    wr->send_wr.user_ctx = user_ctx;
+    wr->send_wr.rw.src.sge = &wr->remote_sge;
+    wr->send_wr.rw.src.num_sge = 1;
+    wr->send_wr.rw.dst.sge = &wr->sge;
+    wr->send_wr.rw.dst.num_sge = 1;
+    wr->send_wr.next = NULL;
+    status = urma_post_jetty_send_wr(jetty->jetty, &wr->send_wr, &bad_wr);
+    if (status != URMA_SUCCESS && bad_wr == &wr->send_wr) {
+        urma_lab_wr_return(wr);
+        return (int)status;
+    }
+    urma_lab_wr_posted(wr);
+    *out = wr;
+    return (int)status;
 }
 
 static int urma_lab_post_send_common(urma_lab_jetty_t *jetty,
@@ -1167,6 +1515,9 @@ void urma_lab_wr_complete(urma_lab_wr_t *wr)
     if (wr->jetty->outstanding_wr_count > 0) {
         wr->jetty->outstanding_wr_count--;
     }
+    if (wr->read_segment != NULL && wr->read_segment->outstanding_wr_count > 0) {
+        wr->read_segment->outstanding_wr_count--;
+    }
     urma_lab_wr_return(wr);
 }
 
@@ -1186,19 +1537,34 @@ int urma_lab_jfc_poll(urma_lab_jfc_t *jfc, uint32_t capacity,
         return count;
     }
     for (i = 0; i < (uint32_t)count; ++i) {
+        (void)memset(&out[i], 0, sizeof(out[i]));
         out[i].status = (int32_t)cr[i].status;
         out[i].opcode = (uint32_t)cr[i].opcode;
         out[i].user_ctx = cr[i].user_ctx;
         out[i].imm_data = cr[i].imm_data;
         out[i].completion_len = cr[i].completion_len;
+        out[i].local_id = cr[i].local_id;
+        (void)memcpy(out[i].remote_eid, cr[i].remote_id.eid.raw,
+                     sizeof(out[i].remote_eid));
+        out[i].remote_uasid = cr[i].remote_id.uasid;
+        out[i].remote_jetty_id = cr[i].remote_id.id;
         out[i].is_recv = cr[i].flag.bs.s_r;
         out[i].is_jetty = cr[i].flag.bs.jetty;
         out[i].user_ctx_valid =
             (cr[i].status != URMA_CR_WR_SUSPEND_DONE &&
              cr[i].status != URMA_CR_WR_FLUSH_ERR_DONE);
         out[i].imm_data_valid =
-            (cr[i].flag.bs.s_r != 0 &&
+            (cr[i].status == URMA_SUCCESS && cr[i].flag.bs.s_r != 0 &&
              cr[i].opcode == URMA_CR_OPC_SEND_WITH_IMM);
+        out[i].remote_id_valid =
+            (cr[i].status == URMA_SUCCESS && cr[i].flag.bs.s_r != 0);
+        if (cr[i].status == URMA_CR_WR_SUSPEND_DONE) {
+            out[i].event_kind = URMA_LAB_COMPLETION_WR_SUSPEND_DONE;
+        } else if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) {
+            out[i].event_kind = URMA_LAB_COMPLETION_WR_FLUSH_ERR_DONE;
+        } else {
+            out[i].event_kind = URMA_LAB_COMPLETION_WR;
+        }
     }
     return count;
 }

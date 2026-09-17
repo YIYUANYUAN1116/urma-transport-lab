@@ -61,6 +61,8 @@ pub struct UrmaDeviceCapability {
     pub max_jfs_rsge: u32,
     pub max_jfr_sge: u32,
     pub max_msg_size: u64,
+    pub max_read_size: u32,
+    pub max_write_size: u32,
     pub transport_modes: u16,
     pub page_size_cap: u64,
 }
@@ -536,6 +538,8 @@ mod native {
             max_jfs_rsge: raw.max_jfs_rsge,
             max_jfr_sge: raw.max_jfr_sge,
             max_msg_size: raw.max_msg_size,
+            max_read_size: raw.max_read_size,
+            max_write_size: raw.max_write_size,
             transport_modes: raw.transport_modes,
             page_size_cap: raw.page_size_cap,
         }

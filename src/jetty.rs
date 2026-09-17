@@ -89,7 +89,7 @@ impl JettyDescriptor {
     }
 
     #[cfg(feature = "urma")]
-    fn to_ffi(&self) -> Result<crate::ffi::JettyDescriptorData> {
+    pub(crate) fn to_ffi(&self) -> Result<crate::ffi::JettyDescriptorData> {
         self.validate()?;
         Ok(crate::ffi::JettyDescriptorData {
             transport_type: self.transport_type,

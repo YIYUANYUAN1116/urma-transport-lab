@@ -53,6 +53,8 @@ pub(crate) struct DeviceCapability {
     pub max_jfs_rsge: u32,
     pub max_jfr_sge: u32,
     pub max_msg_size: u64,
+    pub max_read_size: u32,
+    pub max_write_size: u32,
     pub transport_modes: u16,
     pub page_size_cap: u64,
 }
@@ -79,10 +81,28 @@ pub(crate) struct CompletionRecord {
     pub user_ctx: u64,
     pub imm_data: u64,
     pub completion_len: u32,
+    pub local_id: u32,
+    pub remote_eid: [u8; 16],
+    pub remote_uasid: u32,
+    pub remote_jetty_id: u32,
     pub is_recv: bool,
     pub is_jetty: bool,
     pub user_ctx_valid: bool,
     pub imm_data_valid: bool,
+    pub remote_id_valid: bool,
+    pub event_kind: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReadDescriptorData {
+    pub version: u32,
+    pub eid: [u8; 16],
+    pub uasid: u32,
+    pub va: u64,
+    pub length: u64,
+    pub token_id: u32,
+    pub access: u32,
+    pub token_policy: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +226,8 @@ impl NativeRuntime {
             max_jfs_rsge: raw.max_jfs_rsge,
             max_jfr_sge: raw.max_jfr_sge,
             max_msg_size: raw.max_msg_size,
+            max_read_size: raw.max_read_size,
+            max_write_size: raw.max_write_size,
             transport_modes: raw.transport_modes,
             page_size_cap: raw.page_size_cap,
         })
@@ -395,10 +417,16 @@ impl JfcHandle {
                 user_ctx: record.user_ctx,
                 imm_data: record.imm_data,
                 completion_len: record.completion_len,
+                local_id: record.local_id,
+                remote_eid: record.remote_eid,
+                remote_uasid: record.remote_uasid,
+                remote_jetty_id: record.remote_jetty_id,
                 is_recv: record.is_recv != 0,
                 is_jetty: record.is_jetty != 0,
                 user_ctx_valid: record.user_ctx_valid != 0,
                 imm_data_valid: record.imm_data_valid != 0,
+                remote_id_valid: record.remote_id_valid != 0,
+                event_kind: record.event_kind,
             };
         }
         Ok(count)
@@ -555,6 +583,142 @@ impl Drop for SegmentHandle {
     }
 }
 
+pub(crate) struct ReadSourceHandle {
+    raw: Option<NonNull<sys::urma_lab_read_source_t>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl ReadSourceHandle {
+    pub(crate) fn register(
+        runtime: &mut NativeRuntime,
+        data: &[u8],
+        token: u32,
+    ) -> Result<Self, FfiError> {
+        if data.is_empty() {
+            return Err(FfiError::Contract("READ source cannot be empty"));
+        }
+        let runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
+        let mut raw = std::ptr::null_mut();
+        let length = u64::try_from(data.len())
+            .map_err(|_| FfiError::Contract("READ source length exceeds u64"))?;
+        // SAFETY: The caller keeps `data` immovable and alive until this handle
+        // is unregistered and released; the shim validates all other inputs.
+        let status = unsafe {
+            sys::urma_lab_read_source_register(
+                runtime.as_ptr(),
+                data.as_ptr(),
+                length,
+                token,
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        Ok(Self {
+            raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    pub(crate) fn descriptor(&self) -> Result<ReadDescriptorData, FfiError> {
+        let raw = self
+            .raw
+            .ok_or(FfiError::Contract("READ source is closed"))?;
+        let mut descriptor = std::mem::MaybeUninit::<sys::urma_lab_read_descriptor_t>::uninit();
+        // SAFETY: Both handles are live and the shim initializes the DTO on success.
+        status_result(unsafe {
+            sys::urma_lab_read_source_descriptor(raw.as_ptr(), descriptor.as_mut_ptr())
+        })?;
+        // SAFETY: A zero status initializes every field.
+        let descriptor = unsafe { descriptor.assume_init() };
+        Ok(ReadDescriptorData {
+            version: descriptor.version,
+            eid: descriptor.eid,
+            uasid: descriptor.uasid,
+            va: descriptor.va,
+            length: descriptor.length,
+            token_id: descriptor.token_id,
+            access: descriptor.access,
+            token_policy: descriptor.token_policy,
+        })
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), FfiError> {
+        let Some(raw) = self.raw else {
+            return Ok(());
+        };
+        status_result(unsafe { sys::urma_lab_read_source_unregister(raw.as_ptr()) })?;
+        status_result(unsafe { sys::urma_lab_read_source_release(raw.as_ptr()) })?;
+        self.raw = None;
+        Ok(())
+    }
+}
+
+impl Drop for ReadSourceHandle {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+pub(crate) struct ReadSegmentHandle {
+    raw: Option<NonNull<sys::urma_lab_read_segment_t>>,
+    _not_send_sync: PhantomData<Rc<()>>,
+}
+
+impl ReadSegmentHandle {
+    pub(crate) fn import(
+        jetty: &mut JettyHandle,
+        descriptor: &ReadDescriptorData,
+        token: u32,
+        max_read_size: u32,
+    ) -> Result<Self, FfiError> {
+        let jetty = jetty.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let raw_descriptor = sys::urma_lab_read_descriptor_t {
+            version: descriptor.version,
+            eid: descriptor.eid,
+            uasid: descriptor.uasid,
+            va: descriptor.va,
+            length: descriptor.length,
+            token_id: descriptor.token_id,
+            access: descriptor.access,
+            token_policy: descriptor.token_policy,
+        };
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            sys::urma_lab_read_segment_import(
+                jetty.as_ptr(),
+                &raw_descriptor,
+                token,
+                max_read_size,
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(FfiError::Status(status));
+        }
+        Ok(Self {
+            raw: Some(NonNull::new(raw).ok_or(FfiError::NullHandle)?),
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    pub(crate) fn close(&mut self) -> Result<(), FfiError> {
+        let Some(raw) = self.raw else {
+            return Ok(());
+        };
+        status_result(unsafe { sys::urma_lab_read_segment_unimport(raw.as_ptr()) })?;
+        self.raw = None;
+        Ok(())
+    }
+}
+
+impl Drop for ReadSegmentHandle {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 pub(crate) struct JettyHandle {
     raw: Option<NonNull<sys::urma_lab_jetty_t>>,
     _not_send_sync: PhantomData<Rc<()>>,
@@ -566,6 +730,25 @@ impl JettyHandle {
         send_jfc: &JfcHandle,
         recv_jfc: &JfcHandle,
         config: &JettyConfig,
+    ) -> Result<Self, FfiError> {
+        Self::create_with_mode(runtime, send_jfc, recv_jfc, config, false)
+    }
+
+    pub(crate) fn create_rm(
+        runtime: &mut NativeRuntime,
+        send_jfc: &JfcHandle,
+        recv_jfc: &JfcHandle,
+        config: &JettyConfig,
+    ) -> Result<Self, FfiError> {
+        Self::create_with_mode(runtime, send_jfc, recv_jfc, config, true)
+    }
+
+    fn create_with_mode(
+        runtime: &mut NativeRuntime,
+        send_jfc: &JfcHandle,
+        recv_jfc: &JfcHandle,
+        config: &JettyConfig,
+        rm: bool,
     ) -> Result<Self, FfiError> {
         let runtime = runtime.raw.ok_or(FfiError::Contract("runtime is closed"))?;
         let send_jfc = send_jfc
@@ -584,13 +767,23 @@ impl JettyHandle {
         let mut raw = std::ptr::null_mut();
         // SAFETY: All three owners are live and `raw` is a valid out pointer.
         let status = unsafe {
-            sys::urma_lab_jetty_create(
-                runtime.as_ptr(),
-                send_jfc.as_ptr(),
-                recv_jfc.as_ptr(),
-                &raw_config,
-                &mut raw,
-            )
+            if rm {
+                sys::urma_lab_rm_jetty_create(
+                    runtime.as_ptr(),
+                    send_jfc.as_ptr(),
+                    recv_jfc.as_ptr(),
+                    &raw_config,
+                    &mut raw,
+                )
+            } else {
+                sys::urma_lab_jetty_create(
+                    runtime.as_ptr(),
+                    send_jfc.as_ptr(),
+                    recv_jfc.as_ptr(),
+                    &raw_config,
+                    &mut raw,
+                )
+            }
         };
         if status != 0 {
             return Err(FfiError::Status(status));
@@ -623,6 +816,23 @@ impl JettyHandle {
         descriptor: &JettyDescriptorData,
         token: u32,
     ) -> Result<(), FfiError> {
+        self.import_with_mode(descriptor, token, false)
+    }
+
+    pub(crate) fn import_rm(
+        &mut self,
+        descriptor: &JettyDescriptorData,
+        token: u32,
+    ) -> Result<(), FfiError> {
+        self.import_with_mode(descriptor, token, true)
+    }
+
+    fn import_with_mode(
+        &mut self,
+        descriptor: &JettyDescriptorData,
+        token: u32,
+        rm: bool,
+    ) -> Result<(), FfiError> {
         let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
         let opaque_len = u32::try_from(descriptor.opaque_data.len())
             .map_err(|_| FfiError::Contract("descriptor length exceeds u32"))?;
@@ -635,13 +845,23 @@ impl JettyHandle {
         // SAFETY: Descriptor bytes are validated by the safe wire layer and
         // remain live for the synchronous shim import call.
         let status = unsafe {
-            sys::urma_lab_jetty_import(
-                jetty.as_ptr(),
-                &meta,
-                descriptor.opaque_data.as_ptr(),
-                opaque_len,
-                token,
-            )
+            if rm {
+                sys::urma_lab_rm_jetty_import(
+                    jetty.as_ptr(),
+                    &meta,
+                    descriptor.opaque_data.as_ptr(),
+                    opaque_len,
+                    token,
+                )
+            } else {
+                sys::urma_lab_jetty_import(
+                    jetty.as_ptr(),
+                    &meta,
+                    descriptor.opaque_data.as_ptr(),
+                    opaque_len,
+                    token,
+                )
+            }
         };
         status_result(status)
     }
@@ -724,6 +944,45 @@ impl JettyHandle {
         user_ctx: u64,
     ) -> Result<WrHandle, FfiError> {
         self.post(segment, offset, length, user_ctx, false, true)
+    }
+
+    pub(crate) fn post_read(
+        &mut self,
+        local: &SegmentHandle,
+        remote: &ReadSegmentHandle,
+        local_offset: u64,
+        remote_offset: u64,
+        length: u32,
+        user_ctx: u64,
+    ) -> Result<PostRead, FfiError> {
+        let jetty = self.raw.ok_or(FfiError::Contract("Jetty is closed"))?;
+        let local = local
+            .raw
+            .ok_or(FfiError::Contract("local Segment is closed"))?;
+        let remote = remote
+            .raw
+            .ok_or(FfiError::Contract("remote Segment is closed"))?;
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            sys::urma_lab_post_read(
+                jetty.as_ptr(),
+                local.as_ptr(),
+                remote.as_ptr(),
+                local_offset,
+                remote_offset,
+                length,
+                user_ctx,
+                &mut raw,
+            )
+        };
+        let handle = NonNull::new(raw).map(|raw| WrHandle {
+            raw: Some(raw),
+            _not_send_sync: PhantomData,
+        });
+        if status != 0 && handle.is_none() {
+            return Err(FfiError::Status(status));
+        }
+        Ok(PostRead { status, handle })
     }
 
     pub(crate) fn post_send_batch(
@@ -886,6 +1145,11 @@ pub(crate) struct WrDescriptor {
 pub(crate) struct PostBatch {
     pub(crate) status: i32,
     pub(crate) handles: Vec<WrHandle>,
+}
+
+pub(crate) struct PostRead {
+    pub(crate) status: i32,
+    pub(crate) handle: Option<WrHandle>,
 }
 
 impl WrHandle {

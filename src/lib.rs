@@ -17,6 +17,7 @@ pub mod jetty;
 mod jfc;
 pub mod message;
 pub mod oob;
+pub mod rm_read_probe;
 pub mod runtime;
 pub mod send_imm_probe;
 pub mod tcp_benchmark;
