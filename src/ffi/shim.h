@@ -190,7 +190,7 @@ int urma_lab_segment_get_mut(urma_lab_segment_t *segment,
                              uint64_t offset, uint32_t length,
                              uint8_t **out);
 
-/* Registers caller-owned immutable memory for remote READ with a plain token. */
+/* Copies data into owned 4-KiB-aligned memory and registers it for remote READ. */
 int urma_lab_read_source_register(urma_lab_runtime_t *runtime,
                                   const uint8_t *data, uint64_t length,
                                   uint32_t token,

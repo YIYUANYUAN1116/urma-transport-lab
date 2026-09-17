@@ -12,8 +12,9 @@ maximum READ-size boundary. Existing `urma_perftest` evidence already covers
 those decisions. Its job is to establish the lifecycle and CQE facts needed by
 the Dragonfly owner loop:
 
-- parent exports an RM/RTP Jetty and a pinned, non-cacheable, plain-token,
-  READ-only Segment;
+- parent copies the deterministic source into a 4 KiB-aligned allocation, then
+  exports an RM/RTP Jetty and a pinned, non-cacheable, plain-token, READ-only
+  Segment;
 - child imports both objects without RC bind and posts one signaled READ per
   chunk;
 - `user_ctx` routes each raw send-side CQE to exactly one retained WR owner;

@@ -66,6 +66,7 @@ struct urma_lab_read_source {
     urma_lab_runtime_t *runtime;
     urma_target_seg_t *segment;
     urma_token_id_t *token_id;
+    void *memory;
     uint64_t va;
     uint64_t length;
     int closing;
@@ -601,6 +602,7 @@ int urma_lab_read_source_register(urma_lab_runtime_t *runtime,
 {
     urma_lab_read_source_t *source;
     urma_seg_cfg_t cfg = {0};
+    int alloc_status;
     int error;
 
     if (runtime == NULL || runtime->context == NULL || data == NULL ||
@@ -612,15 +614,22 @@ int urma_lab_read_source_register(urma_lab_runtime_t *runtime,
     if (source == NULL) {
         return -ENOMEM;
     }
+    alloc_status = posix_memalign(&source->memory, 4096, (size_t)length);
+    if (alloc_status != 0) {
+        free(source);
+        return -alloc_status;
+    }
+    (void)memcpy(source->memory, data, (size_t)length);
     errno = 0;
     source->token_id = urma_alloc_token_id(runtime->context);
     if (source->token_id == NULL) {
         error = urma_lab_pointer_error(-EIO);
+        free(source->memory);
         free(source);
         return error;
     }
     source->runtime = runtime;
-    source->va = (uint64_t)(uintptr_t)data;
+    source->va = (uint64_t)(uintptr_t)source->memory;
     source->length = length;
     cfg.va = source->va;
     cfg.len = length;
@@ -637,6 +646,7 @@ int urma_lab_read_source_register(urma_lab_runtime_t *runtime,
     if (source->segment == NULL) {
         error = urma_lab_pointer_error(-EIO);
         (void)urma_free_token_id(source->token_id);
+        free(source->memory);
         free(source);
         return error;
     }
@@ -718,6 +728,8 @@ int urma_lab_read_source_release(urma_lab_read_source_t *source)
         source->runtime->segment_count--;
     }
     source->token_id = NULL;
+    free(source->memory);
+    source->memory = NULL;
     free(source);
     return 0;
 }

@@ -601,8 +601,8 @@ impl ReadSourceHandle {
         let mut raw = std::ptr::null_mut();
         let length = u64::try_from(data.len())
             .map_err(|_| FfiError::Contract("READ source length exceeds u64"))?;
-        // SAFETY: The caller keeps `data` immovable and alive until this handle
-        // is unregistered and released; the shim validates all other inputs.
+        // SAFETY: `data` is readable for this synchronous copy. The shim owns
+        // the aligned registered allocation until unregister and release.
         let status = unsafe {
             sys::urma_lab_read_source_register(
                 runtime.as_ptr(),
